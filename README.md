@@ -60,18 +60,6 @@ As shown, HPKV maintains **exceptionally low read latencies** even as the datase
 4. **Scalability**: Efficiently handles datasets from thousands to millions of records.
 5. **Linux Integration**: Tightly integrated with the Linux kernel for optimal resource utilization.
 
-## Comparison with Other KV Stores
-
-| Feature | HPKV | Traditional KV Stores |
-|---------|------|------------------------|
-| Operation Space | Kernel | User |
-| Read Latency | Extremely Low | Low to Moderate |
-| Write Performance | High | Moderate to High |
-| Persistence | Yes | Varies |
-| Scalability | Up to ~1M records | Often Higher |
-| Transactional Support | Limited | Often Comprehensive |
-| Cross-platform | Linux Only | Often Multi-platform |
-
 ## Scalability and Performance
 
 HPKV is designed to **excel in environments requiring low-latency access to medium-sized datasets**. Its performance shines particularly for read-heavy workloads, making it ideal for caching layers and real-time data retrieval scenarios.
@@ -96,7 +84,7 @@ HPKV's **scalability is demonstrated by its ability to handle datasets of varyin
 1. Clone the repository:
    ```
    git clone https://github.com/mehrantsi/kernel-high-performance-kv-store.git
-   cd kernel-high-performance-kv-store
+   cd kernel-high-performance-kv-store/kernel
    ```
 
 2. Compile the module:
