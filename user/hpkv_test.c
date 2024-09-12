@@ -88,7 +88,7 @@ int main() {
         return 1;
     }
 
-    printf("DBMS Kernel Module Feature Showcase\n");
+    printf("HPKV Kernel Module Feature Showcase\n");
     printf("===================================\n\n");
 
     // 1. Insert records
