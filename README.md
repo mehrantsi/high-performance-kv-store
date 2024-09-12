@@ -205,4 +205,4 @@ We welcome contributions!
 
 ## License
 
-HPKV is released under the GNU General Public License v2.0 (GPLv2).
+HPKV is released under the GNU General Public License v2.0 (GPLv2). See [License](LICENSE) for more details.
