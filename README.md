@@ -79,6 +79,10 @@ HPKV's **scalability is demonstrated by its ability to handle datasets of varyin
 - Make
 - Root access (for loading the module and creating the device node)
 
+> [!WARNING]
+> 
+> HPKV performs low-level disk operations and does not use traditional filesystems. Make sure you're attaching a dedicated, unformatted disk to HPKV.
+
 ### Compilation and Installation
 
 1. Clone the repository:
@@ -119,7 +123,7 @@ HPKV's **scalability is demonstrated by its ability to handle datasets of varyin
    ```
    sudo insmod hpkv.ko mount_path="/dev/sdb"
    ```
-
+     
 6. Verify that the module is loaded:
    ```
    lsmod | grep hpkv
