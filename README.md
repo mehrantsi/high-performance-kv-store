@@ -87,13 +87,31 @@ HPKV's **scalability is demonstrated by its ability to handle datasets of varyin
    cd kernel-high-performance-kv-store/kernel
    ```
 
-2. Compile the module:
+2. Install Essential Packages:
+   First, you need to install the necessary development tools and kernel headers. On Ubuntu or Debian-based systems, you can do this with:
+   ```
+   sudo apt-get update
+   sudo apt-get install build-essential linux-headers-$(uname -r)
+   ```
+   On Red Hat-based systems (like CentOS or Fedora), use:
+   ```
+   sudo yum groupinstall "Development Tools"
+   sudo yum install kernel-devel kernel-headers
+   ```
+   
+3. Verify Kernel Headers:
+   Ensure that the kernel headers are installed for your current kernel version:
+   ```
+   ls /lib/modules/$(uname -r)/build
+   ```
+   
+4. Compile the module:
    ```
    make
    ```
    This will compile the `hpkv_module.c` file and create the kernel module `hpkv.ko`.
 
-3. Load the module:
+5. Load the module:
    ```
    sudo insmod hpkv.ko
    ```
@@ -102,12 +120,12 @@ HPKV's **scalability is demonstrated by its ability to handle datasets of varyin
    sudo insmod hpkv.ko mount_path="/dev/sdb"
    ```
 
-4. Verify that the module is loaded:
+6. Verify that the module is loaded:
    ```
    lsmod | grep hpkv
    ```
 
-5. Create a device node:
+7. Create a device node:
    First, check the major number assigned to the module:
    ```
    dmesg | grep "hpkv: registered with major number"
@@ -120,13 +138,13 @@ HPKV's **scalability is demonstrated by its ability to handle datasets of varyin
    ```
    Replace <major_number> with the number you found in the previous step.
 
-6. Set appropriate permissions for the device node:
+8. Set appropriate permissions for the device node:
    ```
    sudo chmod 666 /dev/hpkv
    ```
    This allows read and write access for all users. Adjust the permissions as needed for your security requirements.
 
-7. To unload the module:
+9. To unload the module:
    ```
    sudo rmmod hpkv
    ```
