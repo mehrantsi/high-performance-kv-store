@@ -12,6 +12,7 @@
 #define MAX_VALUE_SIZE 1000
 
 #define IOCTL_GET 0
+#define IOCTL_PURGE 3
 
 #define NANO_TO_MILLI 1000000.0
 
@@ -136,6 +137,13 @@ void run_test(int fd, int num_records) {
     free(write_latencies.data);
     free(read_latencies.data);
 }
+void purge_data(int fd) {
+    if (ioctl(fd, IOCTL_PURGE, 0) == 0) {
+        printf("Successfully purged all data\n");
+    } else {
+        printf("Failed to purge data\n");
+    }
+}
 
 int main() {
     int fd = open(DEVICE_FILE, O_RDWR);
@@ -150,6 +158,8 @@ int main() {
     for (int i = 0; i < num_samples; i++) {
         run_test(fd, sample_sizes[i]);
     }
+    
+    purge_data(fd);
     
     close(fd);
     return 0;
