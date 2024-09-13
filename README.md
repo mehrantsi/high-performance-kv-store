@@ -81,7 +81,7 @@ HPKV's **scalability is demonstrated by its ability to handle datasets of varyin
 
 > [!WARNING]
 > 
-> HPKV performs low-level disk operations and does not use traditional filesystems. Make sure you're attaching a dedicated, unformatted disk to HPKV.
+> HPKV performs low-level disk operations and does not use traditional filesystems. it automatically checks for a valid HPKV signature on the disk and can also initialize the disk if it is empty. Make sure you're attaching a dedicated, unformatted disk to HPKV.
 
 ### Compilation and Installation
 
@@ -122,6 +122,10 @@ HPKV's **scalability is demonstrated by its ability to handle datasets of varyin
    You can specify the mount path for the block device by adding a parameter:
    ```
    sudo insmod hpkv.ko mount_path="/dev/sdb"
+   ```
+   You can also specify initialize_if_empty flag to not initialize the disk if it is empty (default is 1):
+   ```
+   sudo insmod hpkv.ko mount_path="/dev/sdb" initialize_if_empty=0
    ```
      
 6. Verify that the module is loaded:
