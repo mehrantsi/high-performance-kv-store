@@ -91,6 +91,38 @@ MODULE_PARM_DESC(initialize_if_empty, "Initialize the device if it's empty (defa
 static struct workqueue_struct *compact_wq;
 static struct delayed_work compact_work;
 
+#define HPKV_LOG_EMERG   0
+#define HPKV_LOG_ALERT   1
+#define HPKV_LOG_CRIT    2
+#define HPKV_LOG_ERR     3
+#define HPKV_LOG_WARNING 4
+#define HPKV_LOG_NOTICE  5
+#define HPKV_LOG_INFO    6
+#define HPKV_LOG_DEBUG   7
+
+static int log_level = HPKV_LOG_WARNING;
+module_param(log_level, int, 0644);
+MODULE_PARM_DESC(log_level, "Logging level (0-7, default: 4)");
+
+#define hpkv_log(level, fmt, ...) \
+    do { \
+        if (level <= log_level) { \
+            const char *kern_level; \
+            switch (level) { \
+                case HPKV_LOG_EMERG:   kern_level = KERN_EMERG; break; \
+                case HPKV_LOG_ALERT:   kern_level = KERN_ALERT; break; \
+                case HPKV_LOG_CRIT:    kern_level = KERN_CRIT; break; \
+                case HPKV_LOG_ERR:     kern_level = KERN_ERR; break; \
+                case HPKV_LOG_WARNING: kern_level = KERN_WARNING; break; \
+                case HPKV_LOG_NOTICE:  kern_level = KERN_NOTICE; break; \
+                case HPKV_LOG_INFO:    kern_level = KERN_INFO; break; \
+                case HPKV_LOG_DEBUG:   kern_level = KERN_DEBUG; break; \
+                default:               kern_level = KERN_DEFAULT; break; \
+            } \
+            printk("%sHPKV: " fmt, kern_level, ##__VA_ARGS__); \
+        } \
+    } while (0)
+
 static u32 djb2_hash(const char *str, size_t len)
 {
     u32 hash = 5381;
@@ -316,7 +348,7 @@ static int update_metadata(void)
 
     bh = __bread(bdev, HPKV_METADATA_BLOCK, BLOCK_SIZE);
     if (!bh) {
-        printk(KERN_ERR "HPKV: Failed to read metadata block for update\n");
+        hpkv_log(HPKV_LOG_ERR, "Failed to read metadata block for update\n");
         return -EIO;
     }
 
@@ -332,7 +364,7 @@ static int update_metadata(void)
     sync_dirty_buffer(bh);
     brelse(bh);
 
-    printk(KERN_INFO "HPKV: Updated metadata - Total records: %llu, Total size: %llu bytes\n",
+    hpkv_log(HPKV_LOG_INFO, "Updated metadata - Total records: %llu, Total size: %llu bytes\n",
            metadata.total_records, metadata.total_size);
 
     return 0;
@@ -442,7 +474,7 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
 
     ret = update_metadata();
     if (ret < 0) {
-        printk(KERN_ERR "HPKV: Failed to update metadata after insert/update\n");
+        hpkv_log(HPKV_LOG_ERR, "Failed to update metadata after insert/update\n");
     }
 
 out:
@@ -504,7 +536,7 @@ static int delete_record(const char *key)
 
     ret = update_metadata();
     if (ret < 0) {
-        printk(KERN_ERR "HPKV: Failed to update metadata after deletion\n");
+        hpkv_log(HPKV_LOG_ERR, "Failed to update metadata after deletion\n");
     }
 
 out:
@@ -524,23 +556,23 @@ static void compact_disk(void)
     mutex_lock(&write_mutex);
 
     total_sectors = i_size_read(bdev->bd_inode) / BLOCK_SIZE;
-    printk(KERN_INFO "HPKV: Starting disk compaction. Total sectors: %llu\n", (unsigned long long)total_sectors);
+    hpkv_log(HPKV_LOG_INFO, "Starting disk compaction. Total sectors: %llu\n", (unsigned long long)total_sectors);
 
     buffer = vmalloc(BLOCK_SIZE);
     if (!buffer) {
-        printk(KERN_ERR "HPKV: Failed to allocate memory for disk compaction\n");
+        hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for disk compaction\n");
         goto out;
     }
 
     while (read_sector < total_sectors) {
         if (read_sector >= total_sectors) {
-            printk(KERN_WARNING "HPKV: Reached end of device during compaction at sector %llu\n", (unsigned long long)read_sector);
+            hpkv_log(HPKV_LOG_WARNING, "Reached end of device during compaction at sector %llu\n", (unsigned long long)read_sector);
             break;
         }
 
         read_bh = __bread(bdev, read_sector, BLOCK_SIZE);
         if (!read_bh) {
-            printk(KERN_ERR "HPKV: Failed to read sector %llu during compaction\n", (unsigned long long)read_sector);
+            hpkv_log(HPKV_LOG_ERR, "Failed to read sector %llu during compaction\n", (unsigned long long)read_sector);
             read_sector++;
             continue;
         }
@@ -550,14 +582,14 @@ static void compact_disk(void)
             // Record is not deleted, so we need to keep it
             if (read_sector != write_sector) {
                 if (write_sector >= total_sectors) {
-                    printk(KERN_ERR "HPKV: Cannot write beyond device size during compaction\n");
+                    hpkv_log(HPKV_LOG_ERR, "Cannot write beyond device size during compaction\n");
                     brelse(read_bh);
                     break;
                 }
 
                 write_bh = __getblk(bdev, write_sector, BLOCK_SIZE);
                 if (!write_bh) {
-                    printk(KERN_ERR "HPKV: Failed to get block for writing during compaction\n");
+                    hpkv_log(HPKV_LOG_ERR, "Failed to get block for writing during compaction\n");
                     brelse(read_bh);
                     read_sector++;
                     continue;
@@ -587,12 +619,12 @@ static void compact_disk(void)
     // Update the device size if we've compacted
     if (write_sector < total_sectors) {
         i_size_write(bdev->bd_inode, write_sector * BLOCK_SIZE);
-        printk(KERN_INFO "HPKV: Updated device size after compaction: %llu sectors\n", (unsigned long long)write_sector);
+        hpkv_log(HPKV_LOG_INFO, "Updated device size after compaction: %llu sectors\n", (unsigned long long)write_sector);
     }
 
     vfree(buffer);
 
-    printk(KERN_INFO "HPKV: Disk compaction completed. New size: %llu sectors\n", (unsigned long long)write_sector);
+    hpkv_log(HPKV_LOG_INFO, "Disk compaction completed. New size: %llu sectors\n", (unsigned long long)write_sector);
 
 out:
     mutex_unlock(&write_mutex);
@@ -623,7 +655,7 @@ static int calculate_fragmentation(void)
         next_expected_sector = current_sector + record_sectors;
 
         if (next_expected_sector > total_sectors) {
-            printk(KERN_WARNING "HPKV: Record extends beyond device size at sector %llu\n", (unsigned long long)current_sector);
+            hpkv_log(HPKV_LOG_WARNING, "Record extends beyond device size at sector %llu\n", (unsigned long long)current_sector);
             next_expected_sector = total_sectors;
             break;
         }
@@ -640,7 +672,7 @@ static int calculate_fragmentation(void)
     // Update total_disk_usage if it's inconsistent
     long current_disk_usage = atomic_long_read(&total_disk_usage);
     if (total_used_space != current_disk_usage) {
-        printk(KERN_WARNING "HPKV: Inconsistency detected in disk usage. Calculated: %ld, Stored: %ld. Updating.\n", 
+        hpkv_log(HPKV_LOG_WARNING, "Inconsistency detected in disk usage. Calculated: %ld, Stored: %ld. Updating.\n", 
                total_used_space, current_disk_usage);
         atomic_long_set(&total_disk_usage, total_used_space);
     }
@@ -651,7 +683,7 @@ static int calculate_fragmentation(void)
         fragmentation_percentage = (int)((total_empty_space * 100LL) / total_space);
     }
 
-    printk(KERN_INFO "HPKV: Fragmentation: %d%% (Empty: %ld bytes, Used: %ld bytes, Total: %ld bytes)\n", 
+    hpkv_log(HPKV_LOG_INFO, "Fragmentation: %d%% (Empty: %ld bytes, Used: %ld bytes, Total: %ld bytes)\n", 
            fragmentation_percentage, total_empty_space, total_used_space, total_space);
 
     return fragmentation_percentage;
@@ -663,11 +695,11 @@ static void compact_work_handler(struct work_struct *work)
     long disk_usage = atomic_long_read(&total_disk_usage);
     long device_size = i_size_read(bdev->bd_inode);
 
-    printk(KERN_INFO "HPKV: Current fragmentation: %d%% (total used: %ld bytes, device size: %ld bytes)\n", 
+    hpkv_log(HPKV_LOG_INFO, "Current fragmentation: %d%% (total used: %ld bytes, device size: %ld bytes)\n", 
            fragmentation, disk_usage, device_size);
 
     if (fragmentation > 30) {  // If more than 30% of the total space is empty (fragmented)
-        printk(KERN_INFO "HPKV: Starting disk compaction. Fragmentation: %d%%\n", fragmentation);
+        hpkv_log(HPKV_LOG_INFO, "Starting disk compaction. Fragmentation: %d%%\n", fragmentation);
         compact_disk();
     }
 
@@ -793,11 +825,11 @@ static int purge_data(void)
     char *empty_buffer;
     int ret = 0;
 
-    printk(KERN_INFO "HPKV: Purging all data from block device\n");
+    hpkv_log(HPKV_LOG_INFO, "Purging all data from block device\n");
 
     empty_buffer = kzalloc(BLOCK_SIZE, GFP_KERNEL);
     if (!empty_buffer) {
-        printk(KERN_ERR "HPKV: Failed to allocate memory for purge operation\n");
+        hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for purge operation\n");
         return -ENOMEM;
     }
 
@@ -806,7 +838,7 @@ static int purge_data(void)
     while (sector * BLOCK_SIZE < i_size_read(bdev->bd_inode)) {
         bh = __getblk(bdev, sector, BLOCK_SIZE);
         if (!bh) {
-            printk(KERN_ERR "HPKV: Failed to get block for purging at sector %llu\n", (unsigned long long)sector);
+            hpkv_log(HPKV_LOG_ERR, "Failed to get block for purging at sector %llu\n", (unsigned long long)sector);
             ret = -EIO;
             goto out;
         }
@@ -852,12 +884,12 @@ static int purge_data(void)
 out:
     ret = update_metadata();
     if (ret < 0) {
-        printk(KERN_ERR "HPKV: Failed to update metadata after purge\n");
+        hpkv_log(HPKV_LOG_ERR, "Failed to update metadata after purge\n");
     }
     
     mutex_unlock(&write_mutex);
     kfree(empty_buffer);
-    printk(KERN_INFO "HPKV: Purge operation completed with status %d\n", ret);
+    hpkv_log(HPKV_LOG_INFO, "Purge operation completed with status %d\n", ret);
     return ret;
 }
 
@@ -871,12 +903,12 @@ static int load_indexes(void)
     bool corruption_detected = false;
     int ret = 0;
 
-    printk(KERN_INFO "HPKV: Loading indexes\n");
+    hpkv_log(HPKV_LOG_INFO, "Loading indexes\n");
 
     // Read the metadata block (sector 0)
     bh = __bread(bdev, HPKV_METADATA_BLOCK, BLOCK_SIZE);
     if (!bh) {
-        printk(KERN_ERR "HPKV: Failed to read metadata block\n");
+        hpkv_log(HPKV_LOG_ERR, "Failed to read metadata block\n");
         return -EIO;
     }
 
@@ -884,29 +916,29 @@ static int load_indexes(void)
     brelse(bh);
 
     if (memcmp(metadata.signature, HPKV_SIGNATURE, HPKV_SIGNATURE_SIZE) != 0) {
-        printk(KERN_WARNING "HPKV: Invalid signature found. This disk is not formatted for HPKV use.\n");
+        hpkv_log(HPKV_LOG_WARNING, "Invalid signature found. This disk is not formatted for HPKV use.\n");
         return -EINVAL;
     }
 
-    printk(KERN_INFO "HPKV: Valid signature found. Loading existing data.\n");
-    printk(KERN_INFO "HPKV: Total records: %llu, Total size: %llu bytes\n", 
+    hpkv_log(HPKV_LOG_INFO, "Valid signature found. Loading existing data.\n");
+    hpkv_log(HPKV_LOG_INFO, "Total records: %llu, Total size: %llu bytes\n", 
            metadata.total_records, metadata.total_size);
 
     device_size = i_size_read(bdev->bd_inode);
-    printk(KERN_INFO "HPKV: Device size: %lld bytes\n", device_size);
+    hpkv_log(HPKV_LOG_INFO, "Device size: %lld bytes\n", device_size);
 
     buffer = vmalloc(BLOCK_SIZE);
     if (!buffer) {
-        printk(KERN_ERR "HPKV: Failed to allocate buffer for load_indexes\n");
+        hpkv_log(HPKV_LOG_ERR, "Failed to allocate buffer for load_indexes\n");
         return -ENOMEM;
     }
 
     while (sector * BLOCK_SIZE < device_size) {
-        printk(KERN_INFO "HPKV: Reading sector %llu\n", (unsigned long long)sector);
+        hpkv_log(HPKV_LOG_INFO, "Reading sector %llu\n", (unsigned long long)sector);
         
         bh = __bread(bdev, sector, BLOCK_SIZE);
         if (!bh) {
-            printk(KERN_ERR "HPKV: Failed to read block at sector %llu\n", (unsigned long long)sector);
+            hpkv_log(HPKV_LOG_ERR, "Failed to read block at sector %llu\n", (unsigned long long)sector);
             sector++;
             continue;
         }
@@ -918,7 +950,7 @@ static int load_indexes(void)
         memcpy(key, buffer, sizeof(key));
         memcpy(&value_len, buffer + sizeof(key), sizeof(size_t));
 
-        printk(KERN_INFO "HPKV: Processing key: %s, value length: %zu\n", key, value_len);
+        hpkv_log(HPKV_LOG_INFO, "Processing key: %s, value length: %zu\n", key, value_len);
 
         if (key[0] != '\0' && value_len > 0 && value_len <= MAX_VALUE_SIZE) {
             struct record *record = kmem_cache_alloc(record_cache, GFP_KERNEL);
@@ -937,19 +969,19 @@ static int load_indexes(void)
                     atomic_long_add(value_len, &total_disk_usage);
                     atomic_inc(&record_count);
                 
-                    printk(KERN_INFO "HPKV: Added record for key: %s\n", key);
+                    hpkv_log(HPKV_LOG_INFO, "Added record for key: %s\n", key);
                 } else {
-                    printk(KERN_ERR "HPKV: Failed to allocate memory for record value\n");
+                    hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for record value\n");
                     kmem_cache_free(record_cache, record);
                 }
             } else {
-                printk(KERN_ERR "HPKV: Failed to allocate memory for record\n");
+                hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for record\n");
             }
         } else if (key[0] == '\0') {
             // This is a deleted or empty record, skip it
-            printk(KERN_INFO "HPKV: Skipping deleted or empty record at sector %llu\n", (unsigned long long)sector);
+            hpkv_log(HPKV_LOG_INFO, "Skipping deleted or empty record at sector %llu\n", (unsigned long long)sector);
         } else {
-            printk(KERN_WARNING "HPKV: Invalid record found at sector %llu. Key: %s, Value length: %zu\n", 
+            hpkv_log(HPKV_LOG_WARNING, "Invalid record found at sector %llu. Key: %s, Value length: %zu\n", 
                    (unsigned long long)sector, key, value_len);
             corruption_detected = true;
             break;  // Stop processing further to avoid potential issues with corrupted data
@@ -962,15 +994,15 @@ static int load_indexes(void)
     vfree(buffer);
 
     if (corruption_detected) {
-        printk(KERN_WARNING "HPKV: Corruption detected. Consider running a repair operation.\n");
+        hpkv_log(HPKV_LOG_WARNING, "Corruption detected. Consider running a repair operation.\n");
         ret = -EUCLEAN;  // File system requires cleaning
     } else {
-        printk(KERN_INFO "HPKV: Finished loading indexes. Processed %llu sectors\n", (unsigned long long)sector);
+        hpkv_log(HPKV_LOG_INFO, "Finished loading indexes. Processed %llu sectors\n", (unsigned long long)sector);
         
         // Verify loaded data against metadata
         if (atomic_read(&record_count) != metadata.total_records ||
             atomic_long_read(&total_disk_usage) != metadata.total_size) {
-            printk(KERN_WARNING "HPKV: Mismatch between loaded data and metadata. "
+            hpkv_log(HPKV_LOG_WARNING, "Mismatch between loaded data and metadata. "
                    "Loaded records: %d, Metadata records: %llu, "
                    "Loaded size: %ld, Metadata size: %llu\n",
                    atomic_read(&record_count), metadata.total_records,
@@ -978,10 +1010,10 @@ static int load_indexes(void)
 
             ret = update_metadata();
             if (ret < 0) {
-                printk(KERN_ERR "HPKV: Failed to update metadata after detected mismatch\n");
+                hpkv_log(HPKV_LOG_ERR, "Failed to update metadata after detected mismatch\n");
             }
             else{
-                printk(KERN_INFO "HPKV: Metadata updated successfully after detected mismatch\n");
+                hpkv_log(HPKV_LOG_INFO, "Metadata updated successfully after detected mismatch\n");
             }
         }
     }
@@ -1072,11 +1104,11 @@ static int initialize_empty_device(void)
     struct hpkv_metadata metadata;
     int ret = 0;
 
-    printk(KERN_INFO "HPKV: Initializing empty device\n");
+    hpkv_log(HPKV_LOG_INFO, "Initializing empty device\n");
 
     bh = __getblk(bdev, HPKV_METADATA_BLOCK, BLOCK_SIZE);
     if (!bh) {
-        printk(KERN_ERR "HPKV: Failed to get block for initialization\n");
+        hpkv_log(HPKV_LOG_ERR, "Failed to get block for initialization\n");
         return -EIO;
     }
 
@@ -1120,7 +1152,7 @@ static bool is_disk_empty(struct block_device *bdev)
     for (i = 0; i < 10; i++) {
         bh = __bread(bdev, i, BLOCK_SIZE);
         if (!bh) {
-            printk(KERN_ERR "HPKV: Failed to read block %d while checking if disk is empty\n", i);
+            hpkv_log(HPKV_LOG_ERR, "Failed to read block %d while checking if disk is empty\n", i);
             return false;  // Assume not empty if we can't read
         }
 
@@ -1140,38 +1172,38 @@ static int __init hpkv_init(void)
 {
     int ret;
 
-    printk(KERN_INFO "HPKV: Initializing module\n");
-    printk(KERN_INFO "HPKV: Mount path received: %s\n", mount_path);
+    hpkv_log(HPKV_LOG_INFO, "Initializing module\n");
+    hpkv_log(HPKV_LOG_INFO, "Mount path received: %s\n", mount_path);
 
     major_num = register_chrdev(0, DEVICE_NAME, &fops);
     if (major_num < 0) {
-        printk(KERN_ALERT "HPKV: Failed to register a major number\n");
+        hpkv_log(HPKV_LOG_ALERT, "Failed to register a major number\n");
         return major_num;
     }
 
     record_cache = kmem_cache_create("hpkv_record", sizeof(struct record), 0, SLAB_HWCACHE_ALIGN, NULL);
     if (!record_cache) {
-        printk(KERN_ALERT "HPKV: Failed to create record cache\n");
+        hpkv_log(HPKV_LOG_ALERT, "Failed to create record cache\n");
         ret = -ENOMEM;
         goto error_unregister_chrdev;
     }
-    printk(KERN_INFO "HPKV: Record cache created successfully\n");
+    hpkv_log(HPKV_LOG_INFO, "Record cache created successfully\n");
 
     hash_init(kv_store);
-    printk(KERN_INFO "HPKV: Hash table initialized\n");
+    hpkv_log(HPKV_LOG_INFO, "Hash table initialized\n");
 
-    printk(KERN_INFO "HPKV: Attempting to open block device: %s\n", mount_path);
+    hpkv_log(HPKV_LOG_INFO, "Attempting to open block device: %s\n", mount_path);
     bdev = blkdev_get_by_path(mount_path, FMODE_READ | FMODE_WRITE, THIS_MODULE);
     if (IS_ERR(bdev)) {
-        printk(KERN_ALERT "HPKV: Failed to open block device, error %ld\n", PTR_ERR(bdev));
+        hpkv_log(HPKV_LOG_ALERT, "Failed to open block device, error %ld\n", PTR_ERR(bdev));
         ret = PTR_ERR(bdev);
         goto error_destroy_cache;
     }
-    printk(KERN_INFO "HPKV: Block device opened successfully\n");
+    hpkv_log(HPKV_LOG_INFO, "Block device opened successfully\n");
 
     // Check if the device is valid and get its size
     if (!bdev->bd_disk) {
-        printk(KERN_ALERT "HPKV: Invalid block device\n");
+        hpkv_log(HPKV_LOG_ALERT, "Invalid block device\n");
         ret = -EINVAL;
         goto error_put_device;
     }
@@ -1180,37 +1212,37 @@ static int __init hpkv_init(void)
     if (ret == -EINVAL) {
         if (initialize_if_empty) {
             if (is_disk_empty(bdev)) {
-                printk(KERN_INFO "HPKV: Device is empty. Initializing for HPKV use.\n");
+                hpkv_log(HPKV_LOG_INFO, "Device is empty. Initializing for HPKV use.\n");
                 ret = initialize_empty_device();
                 if (ret < 0) {
-                    printk(KERN_ERR "HPKV: Failed to initialize empty device\n");
+                    hpkv_log(HPKV_LOG_ERR, "Failed to initialize empty device\n");
                     goto error_put_device;
                 }
             } else {
-                printk(KERN_ERR "HPKV: Device contains data but is not HPKV formatted. Refusing to initialize.\n");
+                hpkv_log(HPKV_LOG_ERR, "Device contains data but is not HPKV formatted. Refusing to initialize.\n");
                 ret = -ENOTEMPTY;
                 goto error_put_device;
             }
         } else {
-            printk(KERN_ERR "HPKV: Device is not formatted for HPKV use and initialize_if_empty is not set\n");
+            hpkv_log(HPKV_LOG_ERR, "Device is not formatted for HPKV use and initialize_if_empty is not set\n");
             ret = -ENODEV;
             goto error_put_device;
         }
     } else if (ret == -EUCLEAN) {
-        printk(KERN_WARNING "HPKV: Device requires cleaning or repair. Consider running a repair operation.\n");
+        hpkv_log(HPKV_LOG_WARNING, "Device requires cleaning or repair. Consider running a repair operation.\n");
         // For now, we'll continue loading but with a warning
         // TODO: Trigger a repair operation here
     } else if (ret < 0) {
-        printk(KERN_ERR "HPKV: Failed to load indexes\n");
+        hpkv_log(HPKV_LOG_ERR, "Failed to load indexes\n");
         goto error_put_device;
     }
 
-    printk(KERN_INFO "HPKV: Creating proc entry\n");
+    hpkv_log(HPKV_LOG_INFO, "Creating proc entry\n");
     proc_create(PROC_ENTRY, 0, NULL, &hpkv_proc_fops);
 
     compact_wq = create_singlethread_workqueue("hpkv_compact");
     if (!compact_wq) {
-        printk(KERN_ALERT "HPKV: Failed to create compaction workqueue\n");
+        hpkv_log(HPKV_LOG_ALERT, "Failed to create compaction workqueue\n");
         ret = -ENOMEM;
         goto error_remove_proc;
     }
@@ -1218,8 +1250,8 @@ static int __init hpkv_init(void)
     INIT_DELAYED_WORK(&compact_work, compact_work_handler);
     queue_delayed_work(compact_wq, &compact_work, COMPACT_INTERVAL);
 
-    printk(KERN_INFO "HPKV: Module loaded successfully\n");
-    printk(KERN_INFO "HPKV: Registered with major number %d\n", major_num);
+    hpkv_log(HPKV_LOG_INFO, "Module loaded successfully\n");
+    hpkv_log(HPKV_LOG_INFO, "Registered with major number %d\n", major_num);
     return 0;
 
 error_remove_proc:
@@ -1271,7 +1303,7 @@ static void __exit hpkv_exit(void)
     remove_proc_entry(PROC_ENTRY, NULL);
     kmem_cache_destroy(record_cache);
     unregister_chrdev(major_num, DEVICE_NAME);
-    printk(KERN_INFO "HPKV: Module unloaded\n");
+    hpkv_log(HPKV_LOG_INFO, "Module unloaded\n");
 }
 
 module_init(hpkv_init);
