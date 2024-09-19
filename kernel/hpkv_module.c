@@ -9,7 +9,6 @@
 #include <linux/string.h>
 #include <linux/rwsem.h>
 #include <linux/mutex.h>
-#include <linux/rcupdate.h>
 #include <linux/sched.h>
 #include <linux/mm.h>
 #include <linux/blkdev.h>
@@ -20,16 +19,19 @@
 #include <linux/rbtree.h>
 #include <linux/workqueue.h>
 #include <linux/jiffies.h>
+#include <linux/percpu-rwsem.h>
+#include <linux/percpu.h>
+#include <linux/rculist.h>
 
 #define DEVICE_NAME "hpkv"
 #define MAX_KEY_SIZE 256
 #define MAX_VALUE_SIZE 1000
 #define HPKV_HASH_BITS (20) // 2^20 = 1,048,576 buckets
-#define MAX_DISK_USAGE (1UL << 30) // 1 GB max disk usage
+#define MAX_DISK_USAGE (1UL << 32) // 4 GB max disk usage
 #define BLOCK_SIZE 4096
 #define PROC_ENTRY "hpkv_stats"
 #define CACHE_SIZE 1000
-#define COMPACT_INTERVAL (60 * HZ) // Run compaction every 60 seconds
+#define COMPACT_INTERVAL (300 * HZ) // Run compaction every 300 seconds
 #define HPKV_SIGNATURE "HPKV_V1"
 #define HPKV_SIGNATURE_SIZE 8
 #define HPKV_METADATA_BLOCK 0
@@ -41,8 +43,8 @@ MODULE_VERSION("1.0");
 
 static int major_num;
 static struct kmem_cache *record_cache;
-static DEFINE_RWLOCK(rw_lock);
-static DEFINE_MUTEX(write_mutex);
+static DEFINE_PER_CPU(struct llist_head, record_free_list);
+static struct percpu_rw_semaphore rw_sem;
 
 struct hpkv_metadata {
     char signature[HPKV_SIGNATURE_SIZE];
@@ -58,7 +60,9 @@ struct record {
     struct hlist_node hash_node;
     struct rb_node tree_node;
     struct rcu_head rcu;
+    struct llist_node list_node;
     sector_t sector;
+    atomic_t refcount;
 };
 
 struct cached_record {
@@ -284,22 +288,72 @@ static int load_record_from_disk(const char *key, char **value, size_t *value_le
     return ret;
 }
 
+static void record_free_rcu(struct rcu_head *head)
+{
+    struct record *record = container_of(head, struct record, rcu);
+    llist_add(&record->list_node, &get_cpu_var(record_free_list));
+    put_cpu_var(record_free_list);
+}
+
+static void free_old_records(void)
+{
+    struct llist_node *node;
+    struct record *record;
+    int cpu;
+
+    for_each_possible_cpu(cpu) {
+        node = llist_del_all(&per_cpu(record_free_list, cpu));
+        while (node) {
+            record = llist_entry(node, struct record, list_node);
+            node = node->next;
+            kfree(record->value);
+            kmem_cache_free(record_cache, record);
+        }
+    }
+}
+
+static struct record *record_find_rcu(const char *key)
+{
+    struct record *record;
+    u32 hash = djb2_hash(key, strlen(key));
+
+    hash_for_each_possible_rcu(kv_store, record, hash_node, hash) {
+        if (strcmp(record->key, key) == 0)
+            return record;
+    }
+    return NULL;
+}
+
 static int search_record(const char *key, char **value, size_t *value_len)
 {
-    struct cached_record *cached = cache_get(key);
-    if (cached) {
-        *value = kmalloc(cached->value_len, GFP_KERNEL);
+    struct record *record;
+    int ret = -ENOENT;
+
+    percpu_down_read(&rw_sem);
+    rcu_read_lock();
+    record = record_find_rcu(key);
+    if (record) {
+        *value = kmalloc(record->value_len, GFP_ATOMIC);
         if (*value) {
-            memcpy(*value, cached->value, cached->value_len);
-            *value_len = cached->value_len;
-            return 0;
+            memcpy(*value, record->value, record->value_len);
+            *value_len = record->value_len;
+            ret = 0;
+        } else {
+            ret = -ENOMEM;
+        }
+    }
+    rcu_read_unlock();
+    percpu_up_read(&rw_sem);
+
+    if (ret == 0) {
+        cache_put(key, *value, *value_len, record->sector);
+    } else {
+        ret = load_record_from_disk(key, value, value_len);
+        if (ret == 0) {
+            cache_put(key, *value, *value_len, 0);
         }
     }
 
-    int ret = load_record_from_disk(key, value, value_len);
-    if (ret == 0) {
-        cache_put(key, *value, *value_len, 0);  // We don't have the sector information here
-    }
     return ret;
 }
 
@@ -343,9 +397,6 @@ static int update_metadata(void)
     struct buffer_head *bh;
     struct hpkv_metadata metadata;
 
-    // Assert that we're holding the write_mutex
-    WARN_ON(!mutex_is_locked(&write_mutex));
-
     bh = __bread(bdev, HPKV_METADATA_BLOCK, BLOCK_SIZE);
     if (!bh) {
         hpkv_log(HPKV_LOG_ERR, "Failed to read metadata block for update\n");
@@ -372,121 +423,130 @@ static int update_metadata(void)
 
 static int insert_or_update_record(const char *key, const char *value, size_t value_len, bool is_partial_update)
 {
-    struct record *record;
+    struct record *old_record, *new_record;
     u32 hash = djb2_hash(key, strlen(key));
     int ret = 0;
     struct buffer_head *bh;
     loff_t device_size;
 
-    mutex_lock(&write_mutex);
+    new_record = kmem_cache_alloc(record_cache, GFP_KERNEL);
+    if (!new_record)
+        return -ENOMEM;
+
+    strncpy(new_record->key, key, MAX_KEY_SIZE);
+    new_record->key[MAX_KEY_SIZE - 1] = '\0';
+
+    percpu_down_write(&rw_sem);
 
     device_size = i_size_read(bdev->bd_inode);
 
-    record = search_record_in_memory(key);
-    if (record) {
-        // Update existing record
+    rcu_read_lock();
+    old_record = record_find_rcu(key);
+    if (old_record) {
         if (is_partial_update) {
-            // Partial update
-            size_t new_len = record->value_len + value_len - 1; // -1 to account for null terminator
-            char *new_value = krealloc(record->value, new_len, GFP_KERNEL);
-            if (!new_value) {
+            size_t new_len = old_record->value_len + value_len;
+            new_record->value = kmalloc(new_len, GFP_ATOMIC);
+            if (!new_record->value) {
                 ret = -ENOMEM;
-                goto out;
+                goto out_unlock;
             }
-            strcat(new_value, value);
-            new_value[new_len - 1] = '\0';
-            record->value = new_value;
-            record->value_len = new_len;
+            memcpy(new_record->value, old_record->value, old_record->value_len - 1);  // Copy without null terminator
+            memcpy(new_record->value + old_record->value_len - 1, value, value_len);  // Append new value
+            new_record->value_len = new_len;
         } else {
-            // Full update
-            char *new_value = krealloc(record->value, value_len + 1, GFP_KERNEL);
-            if (!new_value) {
+            new_record->value = kmalloc(value_len, GFP_ATOMIC);
+            if (!new_record->value) {
                 ret = -ENOMEM;
-                goto out;
+                goto out_unlock;
             }
-            memcpy(new_value, value, value_len);
-            new_value[value_len] = '\0';
-            record->value = new_value;
-            record->value_len = value_len + 1; // Include null terminator in length
+            memcpy(new_record->value, value, value_len);
+            new_record->value_len = value_len;
         }
     } else {
-        // Insert new record
         if (atomic_long_read(&total_disk_usage) + value_len > MAX_DISK_USAGE) {
             ret = -ENOSPC;
-            goto out;
+            goto out_unlock;
         }
-
-        record = kmem_cache_alloc(record_cache, GFP_KERNEL);
-        if (!record) {
+        new_record->value = kmalloc(value_len, GFP_ATOMIC);
+        if (!new_record->value) {
             ret = -ENOMEM;
-            goto out;
+            goto out_unlock;
         }
+        memcpy(new_record->value, value, value_len);
+        new_record->value_len = value_len;
+    }
 
-        strncpy(record->key, key, MAX_KEY_SIZE);
-        record->key[MAX_KEY_SIZE - 1] = '\0';
-        record->value = kmalloc(value_len + 1, GFP_KERNEL);
-        if (!record->value) {
-            kmem_cache_free(record_cache, record);
-            ret = -ENOMEM;
-            goto out;
-        }
-        memcpy(record->value, value, value_len);
-        record->value[value_len] = '\0';
-        record->value_len = value_len + 1;
-
-        hash_add_rcu(kv_store, &record->hash_node, hash);
-        insert_rb_tree(record);
-        atomic_long_add(value_len + 1, &total_disk_usage);
-        atomic_inc(&record_count);
-
-        // Find a free sector to write the new record
-        sector_t free_sector = find_free_sector();
-        if (free_sector == -1) {
-            ret = -ENOSPC;
-            goto out;
-        }
-
-        record->sector = free_sector;
+    // Find a free sector to write the new record
+    new_record->sector = find_free_sector();
+    if (new_record->sector == -1) {
+        ret = -ENOSPC;
+        goto out_unlock;
     }
 
     // Ensure we're not writing beyond the device size
-    if ((record->sector + 1) * BLOCK_SIZE > device_size) {
+    if ((new_record->sector + 1) * BLOCK_SIZE > device_size) {
         // Extend the device size if necessary
-        i_size_write(bdev->bd_inode, (record->sector + 1) * BLOCK_SIZE);
+        i_size_write(bdev->bd_inode, (new_record->sector + 1) * BLOCK_SIZE);
     }
 
     // Write to disk
-    bh = __getblk(bdev, record->sector, BLOCK_SIZE);
+    bh = __getblk(bdev, new_record->sector, BLOCK_SIZE);
     if (!bh) {
         ret = -EIO;
-        goto out;
+        goto out_unlock;
     }
 
-    memcpy(bh->b_data, record->key, MAX_KEY_SIZE);
-    memcpy(bh->b_data + MAX_KEY_SIZE, &record->value_len, sizeof(size_t));
-    memcpy(bh->b_data + MAX_KEY_SIZE + sizeof(size_t), record->value, record->value_len);
-
+    lock_buffer(bh);
+    memcpy(bh->b_data, new_record->key, MAX_KEY_SIZE);
+    memcpy(bh->b_data + MAX_KEY_SIZE, &new_record->value_len, sizeof(size_t));
+    memcpy(bh->b_data + MAX_KEY_SIZE + sizeof(size_t), new_record->value, new_record->value_len);
+    set_buffer_uptodate(bh);
     mark_buffer_dirty(bh);
-    sync_dirty_buffer(bh);
+    unlock_buffer(bh);
+    
+    // Use sync_dirty_buffer instead of sync_dirty_buffer
+    if (sync_dirty_buffer(bh) < 0) {
+        brelse(bh);
+        ret = -EIO;
+        goto out_unlock;
+    }
+    
     brelse(bh);
 
-    cache_put(key, record->value, record->value_len, record->sector);
+    if (old_record) {
+        rcu_assign_pointer(new_record->hash_node.next, old_record->hash_node.next);
+        hash_del_rcu(&old_record->hash_node);
+        rb_replace_node_rcu(&old_record->tree_node, &new_record->tree_node, &records_tree);
+        atomic_long_sub(old_record->value_len, &total_disk_usage);
+        atomic_long_add(new_record->value_len, &total_disk_usage);
+    } else {
+        hash_add_rcu(kv_store, &new_record->hash_node, hash);
+        rb_link_node_rcu(&new_record->tree_node, NULL, &records_tree.rb_node);
+        rb_insert_color(&new_record->tree_node, &records_tree);
+        atomic_long_add(new_record->value_len, &total_disk_usage);
+        atomic_inc(&record_count);
+    }
+
+    cache_put(key, new_record->value, new_record->value_len, new_record->sector);
 
     ret = update_metadata();
     if (ret < 0) {
         hpkv_log(HPKV_LOG_ERR, "Failed to update metadata after insert/update\n");
     }
 
-out:
-    mutex_unlock(&write_mutex);
-    return ret;
-}
+out_unlock:
+    if (old_record) {
+        call_rcu(&old_record->rcu, record_free_rcu);
+    }
+    rcu_read_unlock();
+    percpu_up_write(&rw_sem);
 
-static void free_record(struct rcu_head *rcu)
-{
-    struct record *record = container_of(rcu, struct record, rcu);
-    kfree(record->value);
-    kmem_cache_free(record_cache, record);
+    if (ret < 0) {
+        kfree(new_record->value);
+        kmem_cache_free(record_cache, new_record);
+    }
+
+    return ret;
 }
 
 static int delete_record(const char *key)
@@ -496,12 +556,13 @@ static int delete_record(const char *key)
     int ret = 0;
     struct buffer_head *bh;
 
-    mutex_lock(&write_mutex);
+    percpu_down_write(&rw_sem);
 
-    record = search_record_in_memory(key);
+    rcu_read_lock();
+    record = record_find_rcu(key);
     if (!record) {
         ret = -ENOENT;
-        goto out;
+        goto out_unlock;
     }
 
     hash_del_rcu(&record->hash_node);
@@ -518,7 +579,7 @@ static int delete_record(const char *key)
         brelse(bh);
     }
 
-    call_rcu(&record->rcu, free_record);
+    call_rcu(&record->rcu, record_free_rcu);
 
     // Remove from cache
     spin_lock(&cache_lock);
@@ -539,8 +600,9 @@ static int delete_record(const char *key)
         hpkv_log(HPKV_LOG_ERR, "Failed to update metadata after deletion\n");
     }
 
-out:
-    mutex_unlock(&write_mutex);
+out_unlock:
+    rcu_read_unlock();
+    percpu_up_write(&rw_sem);
     return ret;
 }
 
@@ -553,7 +615,7 @@ static void compact_disk(void)
     struct buffer_head *read_bh, *write_bh;
     sector_t total_sectors;
 
-    mutex_lock(&write_mutex);
+    percpu_down_write(&rw_sem);
 
     total_sectors = i_size_read(bdev->bd_inode) / BLOCK_SIZE;
     hpkv_log(HPKV_LOG_INFO, "Starting disk compaction. Total sectors: %llu\n", (unsigned long long)total_sectors);
@@ -627,7 +689,7 @@ static void compact_disk(void)
     hpkv_log(HPKV_LOG_INFO, "Disk compaction completed. New size: %llu sectors\n", (unsigned long long)write_sector);
 
 out:
-    mutex_unlock(&write_mutex);
+    percpu_up_write(&rw_sem);
 }
 
 static int calculate_fragmentation(void)
@@ -723,11 +785,13 @@ static ssize_t device_read(struct file *file, char __user *user_buffer, size_t s
     char *temp_buffer;
     loff_t pos = 0;
 
-    read_lock(&rw_lock);
+    percpu_down_read(&rw_sem);
+    rcu_read_lock();
 
     temp_buffer = kmalloc(MAX_KEY_SIZE + MAX_VALUE_SIZE + 2, GFP_KERNEL);
     if (!temp_buffer) {
-        read_unlock(&rw_lock);
+        rcu_read_unlock();
+        percpu_up_read(&rw_sem);
         return -ENOMEM;
     }
 
@@ -745,13 +809,15 @@ static ssize_t device_read(struct file *file, char __user *user_buffer, size_t s
             len -= offset_in_record;
             if (copy_to_user(user_buffer + bytes_read, temp_buffer + offset_in_record, len)) {
                 kfree(temp_buffer);
-                read_unlock(&rw_lock);
+                rcu_read_unlock();
+                percpu_up_read(&rw_sem);
                 return -EFAULT;
             }
         } else {
             if (copy_to_user(user_buffer + bytes_read, temp_buffer, len)) {
                 kfree(temp_buffer);
-                read_unlock(&rw_lock);
+                rcu_read_unlock();
+                percpu_up_read(&rw_sem);
                 return -EFAULT;
             }
         }
@@ -764,7 +830,8 @@ static ssize_t device_read(struct file *file, char __user *user_buffer, size_t s
     }
 
     kfree(temp_buffer);
-    read_unlock(&rw_lock);
+    rcu_read_unlock();
+    percpu_up_read(&rw_sem);
     *offset = pos;
     return bytes_read;
 }
@@ -825,15 +892,16 @@ static int purge_data(void)
     char *empty_buffer;
     int ret = 0;
 
+    percpu_down_write(&rw_sem);
+
     hpkv_log(HPKV_LOG_INFO, "Purging all data from block device\n");
 
     empty_buffer = kzalloc(BLOCK_SIZE, GFP_KERNEL);
     if (!empty_buffer) {
         hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for purge operation\n");
-        return -ENOMEM;
+        ret = -ENOMEM;
+        goto out;
     }
-
-    mutex_lock(&write_mutex);
 
     while (sector * BLOCK_SIZE < i_size_read(bdev->bd_inode)) {
         bh = __getblk(bdev, sector, BLOCK_SIZE);
@@ -862,7 +930,7 @@ static int purge_data(void)
         record = rb_entry(node, struct record, tree_node);
         rb_erase(node, &records_tree);
         hash_del_rcu(&record->hash_node);
-        call_rcu(&record->rcu, free_record);
+        call_rcu(&record->rcu, record_free_rcu);
     }
     hash_init(kv_store);
     atomic_long_set(&total_disk_usage, 0);
@@ -887,7 +955,7 @@ out:
         hpkv_log(HPKV_LOG_ERR, "Failed to update metadata after purge\n");
     }
     
-    mutex_unlock(&write_mutex);
+    percpu_up_write(&rw_sem);
     kfree(empty_buffer);
     hpkv_log(HPKV_LOG_INFO, "Purge operation completed with status %d\n", ret);
     return ret;
@@ -903,21 +971,24 @@ static int load_indexes(void)
     bool corruption_detected = false;
     int ret = 0;
 
+    percpu_down_write(&rw_sem);
+
     hpkv_log(HPKV_LOG_INFO, "Loading indexes\n");
 
     // Read the metadata block (sector 0)
     bh = __bread(bdev, HPKV_METADATA_BLOCK, BLOCK_SIZE);
     if (!bh) {
         hpkv_log(HPKV_LOG_ERR, "Failed to read metadata block\n");
-        return -EIO;
+        ret = -EIO;
+        goto out;
     }
 
     memcpy(&metadata, bh->b_data, sizeof(struct hpkv_metadata));
     brelse(bh);
-
     if (memcmp(metadata.signature, HPKV_SIGNATURE, HPKV_SIGNATURE_SIZE) != 0) {
         hpkv_log(HPKV_LOG_WARNING, "Invalid signature found. This disk is not formatted for HPKV use.\n");
-        return -EINVAL;
+        ret = -EINVAL;
+        goto out;
     }
 
     hpkv_log(HPKV_LOG_INFO, "Valid signature found. Loading existing data.\n");
@@ -930,7 +1001,8 @@ static int load_indexes(void)
     buffer = vmalloc(BLOCK_SIZE);
     if (!buffer) {
         hpkv_log(HPKV_LOG_ERR, "Failed to allocate buffer for load_indexes\n");
-        return -ENOMEM;
+        ret = -ENOMEM;
+        goto out;
     }
 
     while (sector * BLOCK_SIZE < device_size) {
@@ -1018,6 +1090,8 @@ static int load_indexes(void)
         }
     }
 
+out:
+    percpu_up_write(&rw_sem);
     return ret;
 }
 
@@ -1192,12 +1266,19 @@ static int __init hpkv_init(void)
     hash_init(kv_store);
     hpkv_log(HPKV_LOG_INFO, "Hash table initialized\n");
 
+    // Initialize rw_sem before opening the block device
+    ret = percpu_init_rwsem(&rw_sem);
+    if (ret) {
+        hpkv_log(HPKV_LOG_ALERT, "Failed to initialize percpu_rw_semaphore\n");
+        goto error_destroy_cache;
+    }
+
     hpkv_log(HPKV_LOG_INFO, "Attempting to open block device: %s\n", mount_path);
     bdev = blkdev_get_by_path(mount_path, FMODE_READ | FMODE_WRITE, THIS_MODULE);
     if (IS_ERR(bdev)) {
         hpkv_log(HPKV_LOG_ALERT, "Failed to open block device, error %ld\n", PTR_ERR(bdev));
         ret = PTR_ERR(bdev);
-        goto error_destroy_cache;
+        goto error_free_rwsem;
     }
     hpkv_log(HPKV_LOG_INFO, "Block device opened successfully\n");
 
@@ -1256,13 +1337,12 @@ static int __init hpkv_init(void)
 
 error_remove_proc:
     remove_proc_entry(PROC_ENTRY, NULL);
-
 error_put_device:
     blkdev_put(bdev, FMODE_READ | FMODE_WRITE);
-
+error_free_rwsem:
+    percpu_free_rwsem(&rw_sem);
 error_destroy_cache:
     kmem_cache_destroy(record_cache);
-
 error_unregister_chrdev:
     unregister_chrdev(major_num, DEVICE_NAME);
 
@@ -1281,7 +1361,7 @@ static void __exit hpkv_exit(void)
         record = rb_entry(node, struct record, tree_node);
         rb_erase(node, &records_tree);
         hash_del(&record->hash_node);
-        free_record(&record->rcu);
+        call_rcu(&record->rcu, record_free_rcu);
     }
 
     if (bdev) {
@@ -1303,8 +1383,11 @@ static void __exit hpkv_exit(void)
     remove_proc_entry(PROC_ENTRY, NULL);
     kmem_cache_destroy(record_cache);
     unregister_chrdev(major_num, DEVICE_NAME);
+    free_old_records();
+    percpu_free_rwsem(&rw_sem);
     hpkv_log(HPKV_LOG_INFO, "Module unloaded\n");
 }
 
 module_init(hpkv_init);
 module_exit(hpkv_exit);
+
