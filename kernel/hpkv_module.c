@@ -22,6 +22,8 @@
 #include <linux/percpu-rwsem.h>
 #include <linux/percpu.h>
 #include <linux/rculist.h>
+#include <linux/delay.h>
+#include <linux/kthread.h>
 
 #define DEVICE_NAME "hpkv"
 #define MAX_KEY_SIZE 256
@@ -35,11 +37,48 @@
 #define HPKV_SIGNATURE "HPKV_V1"
 #define HPKV_SIGNATURE_SIZE 8
 #define HPKV_METADATA_BLOCK 0
+#define WRITE_BUFFER_SIZE 1024
+#define WRITE_BUFFER_FLUSH_INTERVAL (HZ * 5) // 5 seconds
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Mehran Toosi");
 MODULE_DESCRIPTION("High performance KV store kernel module, with advanced features");
 MODULE_VERSION("1.0");
+
+// Function prototypes
+static u32 djb2_hash(const char *str, size_t len);
+static struct record *search_record_in_memory(const char *key);
+static void insert_rb_tree(struct record *record);
+static struct cached_record *cache_get(const char *key);
+static void cache_put(const char *key, const char *value, size_t value_len, sector_t sector);
+static int load_record_from_disk(const char *key, char **value, size_t *value_len);
+static void record_free_rcu(struct rcu_head *head);
+static void free_old_records(void);
+static struct record *record_find_rcu(const char *key);
+static struct record *find_record_in_write_buffer(const char *key);
+static int search_record(const char *key, char **value, size_t *value_len);
+static int write_buffer_size(void);
+static sector_t find_free_sector(void);
+static int update_metadata(void);
+static int insert_or_update_record(const char *key, const char *value, size_t value_len, bool is_partial_update);
+static int delete_record(const char *key);
+static int write_buffer_worker(void *data);
+static void compact_disk(void);
+static int calculate_fragmentation(void);
+static void compact_work_handler(struct work_struct *work);
+static int device_open(struct inode *inode, struct file *file);
+static int device_release(struct inode *inode, struct file *file);
+static ssize_t device_read(struct file *file, char __user *user_buffer, size_t size, loff_t *offset);
+static ssize_t device_write(struct file *file, const char __user *user_buffer, size_t size, loff_t *offset);
+static int purge_data(void);
+static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
+static int hpkv_proc_show(struct seq_file *m, void *v);
+static int hpkv_proc_open(struct inode *inode, struct file *file);
+static int initialize_empty_device(void);
+static bool is_zero_buffer(const void *buf, size_t size);
+static bool is_disk_empty(struct block_device *bdev);
+static void flush_write_buffer(void);
+static void write_record_to_disk(struct record *record);
 
 static int major_num;
 static struct kmem_cache *record_cache;
@@ -72,6 +111,17 @@ struct cached_record {
     sector_t sector;
     struct hlist_node node;
 };
+
+struct write_buffer_entry {
+    struct record *record;
+    struct list_head list;
+};
+
+static LIST_HEAD(write_buffer);
+static DEFINE_SPINLOCK(write_buffer_lock);
+static struct task_struct *write_buffer_thread;
+static wait_queue_head_t write_buffer_wait;
+static bool write_buffer_exit = false;
 
 static DEFINE_HASHTABLE(kv_store, HPKV_HASH_BITS);
 static struct rb_root records_tree = RB_ROOT;
@@ -324,23 +374,58 @@ static struct record *record_find_rcu(const char *key)
     return NULL;
 }
 
+static struct record *find_record_in_write_buffer(const char *key)
+{
+    struct write_buffer_entry *entry;
+
+    spin_lock(&write_buffer_lock);
+    list_for_each_entry(entry, &write_buffer, list) {
+        if (strcmp(entry->record->key, key) == 0) {
+            spin_unlock(&write_buffer_lock);
+            return entry->record;
+        }
+    }
+    spin_unlock(&write_buffer_lock);
+    return NULL;
+}
+
 static int search_record(const char *key, char **value, size_t *value_len)
 {
     struct record *record;
+    struct write_buffer_entry *entry;
     int ret = -ENOENT;
 
+    // First, check the write buffer
+    spin_lock(&write_buffer_lock);
+    list_for_each_entry(entry, &write_buffer, list) {
+        if (strcmp(entry->record->key, key) == 0) {
+            *value = kmalloc(entry->record->value_len, GFP_ATOMIC);
+            if (!*value) {
+                spin_unlock(&write_buffer_lock);
+                return -ENOMEM;
+            }
+            memcpy(*value, entry->record->value, entry->record->value_len);
+            *value_len = entry->record->value_len;
+            spin_unlock(&write_buffer_lock);
+            return 0;
+        }
+    }
+    spin_unlock(&write_buffer_lock);
+
+    // If not found in write buffer, proceed with existing search logic
     percpu_down_read(&rw_sem);
     rcu_read_lock();
     record = record_find_rcu(key);
     if (record) {
         *value = kmalloc(record->value_len, GFP_ATOMIC);
-        if (*value) {
-            memcpy(*value, record->value, record->value_len);
-            *value_len = record->value_len;
-            ret = 0;
-        } else {
-            ret = -ENOMEM;
+        if (!*value) {
+            rcu_read_unlock();
+            percpu_up_read(&rw_sem);
+            return -ENOMEM;
         }
+        memcpy(*value, record->value, record->value_len);
+        *value_len = record->value_len;
+        ret = 0;
     }
     rcu_read_unlock();
     percpu_up_read(&rw_sem);
@@ -348,6 +433,7 @@ static int search_record(const char *key, char **value, size_t *value_len)
     if (ret == 0) {
         cache_put(key, *value, *value_len, record->sector);
     } else {
+        // If not found in memory, attempt to load from disk
         ret = load_record_from_disk(key, value, value_len);
         if (ret == 0) {
             cache_put(key, *value, *value_len, 0);
@@ -355,6 +441,20 @@ static int search_record(const char *key, char **value, size_t *value_len)
     }
 
     return ret;
+}
+
+static int write_buffer_size(void)
+{
+    int count = 0;
+    struct write_buffer_entry *entry;
+
+    spin_lock(&write_buffer_lock);
+    list_for_each_entry(entry, &write_buffer, list) {
+        count++;
+    }
+    spin_unlock(&write_buffer_lock);
+
+    return count;
 }
 
 static sector_t find_free_sector(void)
@@ -423,11 +523,9 @@ static int update_metadata(void)
 
 static int insert_or_update_record(const char *key, const char *value, size_t value_len, bool is_partial_update)
 {
-    struct record *old_record, *new_record;
-    u32 hash = djb2_hash(key, strlen(key));
+    struct record *new_record;
+    struct write_buffer_entry *wb_entry;
     int ret = 0;
-    struct buffer_head *bh;
-    loff_t device_size;
 
     new_record = kmem_cache_alloc(record_cache, GFP_KERNEL);
     if (!new_record)
@@ -436,118 +534,52 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
     strncpy(new_record->key, key, MAX_KEY_SIZE);
     new_record->key[MAX_KEY_SIZE - 1] = '\0';
 
+    new_record->value = kmalloc(value_len, GFP_KERNEL);
+    if (!new_record->value) {
+        kmem_cache_free(record_cache, new_record);
+        return -ENOMEM;
+    }
+
+    memcpy(new_record->value, value, value_len);
+    new_record->value_len = value_len;
+
+    wb_entry = kmalloc(sizeof(*wb_entry), GFP_KERNEL);
+    if (!wb_entry) {
+        kfree(new_record->value);
+        kmem_cache_free(record_cache, new_record);
+        return -ENOMEM;
+    }
+
+    wb_entry->record = new_record;
+
+    spin_lock(&write_buffer_lock);
+    list_add_tail(&wb_entry->list, &write_buffer);
+    spin_unlock(&write_buffer_lock);
+
+    wake_up(&write_buffer_wait);
+
+    // Update in-memory data structures
     percpu_down_write(&rw_sem);
-
-    device_size = i_size_read(bdev->bd_inode);
-
-    rcu_read_lock();
-    old_record = record_find_rcu(key);
-    if (old_record) {
-        if (is_partial_update) {
-            size_t old_len = old_record->value_len;
-            if (old_len > 0 && old_record->value[old_len - 1] == '\0') {
-                old_len--; // Exclude null terminator from old value
-            }
-            size_t new_len = old_len + value_len + 1; // +1 for new null terminator
-            new_record->value = kmalloc(new_len, GFP_ATOMIC);
-            if (!new_record->value) {
-                ret = -ENOMEM;
-                goto out_unlock;
-            }
-            memcpy(new_record->value, old_record->value, old_len);
-            memcpy(new_record->value + old_len, value, value_len);
-            new_record->value[new_len - 1] = '\0'; // Ensure null termination
-            new_record->value_len = new_len;
-        } else {
-            new_record->value = kmalloc(value_len, GFP_ATOMIC);
-            if (!new_record->value) {
-                ret = -ENOMEM;
-                goto out_unlock;
-            }
-            memcpy(new_record->value, value, value_len);
-            new_record->value_len = value_len;
-        }
-    } else {
-        if (atomic_long_read(&total_disk_usage) + value_len > MAX_DISK_USAGE) {
-            ret = -ENOSPC;
-            goto out_unlock;
-        }
-        new_record->value = kmalloc(value_len, GFP_ATOMIC);
-        if (!new_record->value) {
-            ret = -ENOMEM;
-            goto out_unlock;
-        }
-        memcpy(new_record->value, value, value_len);
-        new_record->value_len = value_len;
-    }
-
-    // Find a free sector to write the new record
-    new_record->sector = find_free_sector();
-    if (new_record->sector == -1) {
-        ret = -ENOSPC;
-        goto out_unlock;
-    }
-
-    // Ensure we're not writing beyond the device size
-    if ((new_record->sector + 1) * BLOCK_SIZE > device_size) {
-        // Extend the device size if necessary
-        i_size_write(bdev->bd_inode, (new_record->sector + 1) * BLOCK_SIZE);
-    }
-
-    // Write to disk
-    bh = __getblk(bdev, new_record->sector, BLOCK_SIZE);
-    if (!bh) {
-        ret = -EIO;
-        goto out_unlock;
-    }
-
-    lock_buffer(bh);
-    memcpy(bh->b_data, new_record->key, MAX_KEY_SIZE);
-    memcpy(bh->b_data + MAX_KEY_SIZE, &new_record->value_len, sizeof(size_t));
-    memcpy(bh->b_data + MAX_KEY_SIZE + sizeof(size_t), new_record->value, new_record->value_len);
-    set_buffer_uptodate(bh);
-    mark_buffer_dirty(bh);
-    unlock_buffer(bh);
-    
-    if (sync_dirty_buffer(bh) < 0) {
-        brelse(bh);
-        ret = -EIO;
-        goto out_unlock;
-    }
-    
-    brelse(bh);
-
+    struct record *old_record = record_find_rcu(key);
     if (old_record) {
         hash_del_rcu(&old_record->hash_node);
         rb_erase(&old_record->tree_node, &records_tree);
         atomic_long_sub(old_record->value_len, &total_disk_usage);
         call_rcu(&old_record->rcu, record_free_rcu);
-    }
-
-    hash_add_rcu(kv_store, &new_record->hash_node, hash);
-    insert_rb_tree(new_record);
-    atomic_long_add(new_record->value_len, &total_disk_usage);
-    if (!old_record) {
+    } else {
         atomic_inc(&record_count);
     }
 
-    cache_put(key, new_record->value, new_record->value_len, new_record->sector);
+    hash_add_rcu(kv_store, &new_record->hash_node, djb2_hash(key, strlen(key)));
+    insert_rb_tree(new_record);
+    atomic_long_add(new_record->value_len, &total_disk_usage);
+    percpu_up_write(&rw_sem);
+
+    cache_put(key, new_record->value, new_record->value_len, 0);
 
     ret = update_metadata();
     if (ret < 0) {
         hpkv_log(HPKV_LOG_ERR, "Failed to update metadata after insert/update\n");
-    }
-
-    hpkv_log(HPKV_LOG_DEBUG, "Record %s: Key: %s, Value length: %zu, Partial update: %d\n", 
-             old_record ? "updated" : "inserted", key, new_record->value_len, is_partial_update);
-
-out_unlock:
-    rcu_read_unlock();
-    percpu_up_write(&rw_sem);
-
-    if (ret < 0) {
-        kfree(new_record->value);
-        kmem_cache_free(record_cache, new_record);
     }
 
     return ret;
@@ -559,7 +591,39 @@ static int delete_record(const char *key)
     u32 hash = djb2_hash(key, strlen(key));
     int ret = 0;
     struct buffer_head *bh;
+    struct write_buffer_entry *entry, *temp;
 
+    // First, check if the record is in the write buffer
+    spin_lock(&write_buffer_lock);
+    list_for_each_entry_safe(entry, temp, &write_buffer, list) {
+        if (strcmp(entry->record->key, key) == 0) {
+            // Remove from write buffer
+            list_del(&entry->list);
+            // Free the record
+            kfree(entry->record->value);
+            kmem_cache_free(record_cache, entry->record);
+            kfree(entry);
+            spin_unlock(&write_buffer_lock);
+
+            // Update in-memory structures
+            percpu_down_write(&rw_sem);
+            hash_del_rcu(&entry->record->hash_node);
+            rb_erase(&entry->record->tree_node, &records_tree);
+            atomic_long_sub(entry->record->value_len, &total_disk_usage);
+            atomic_dec(&record_count);
+            percpu_up_write(&rw_sem);
+
+            ret = update_metadata();
+            if (ret < 0) {
+                hpkv_log(HPKV_LOG_ERR, "Failed to update metadata after deletion\n");
+            }
+
+            return ret;
+        }
+    }
+    spin_unlock(&write_buffer_lock);
+
+    // Proceed with existing delete logic
     percpu_down_write(&rw_sem);
 
     rcu_read_lock();
@@ -610,8 +674,110 @@ out_unlock:
     return ret;
 }
 
+static void write_record_to_disk(struct record *record)
+{
+    struct buffer_head *bh;
+    loff_t device_size;
+
+    device_size = i_size_read(bdev->bd_inode);
+
+    // Find a free sector (ensure thread safety)
+    record->sector = find_free_sector();
+    if (record->sector == -1) {
+        hpkv_log(HPKV_LOG_ERR, "No free sector available for writing\n");
+        return;
+    }
+
+    if ((record->sector + 1) * BLOCK_SIZE > device_size) {
+        // Extend the device size if necessary
+        i_size_write(bdev->bd_inode, (record->sector + 1) * BLOCK_SIZE);
+    }
+
+    // Write to disk
+    bh = __getblk(bdev, record->sector, BLOCK_SIZE);
+    if (!bh) {
+        hpkv_log(HPKV_LOG_ERR, "Failed to allocate buffer head for writing\n");
+        return;
+    }
+
+    lock_buffer(bh);
+    memcpy(bh->b_data, record->key, MAX_KEY_SIZE);
+    memcpy(bh->b_data + MAX_KEY_SIZE, &record->value_len, sizeof(size_t));
+    memcpy(bh->b_data + MAX_KEY_SIZE + sizeof(size_t), record->value, record->value_len);
+    set_buffer_uptodate(bh);
+    mark_buffer_dirty(bh);
+    unlock_buffer(bh);
+
+    if (sync_dirty_buffer(bh) < 0) {
+        hpkv_log(HPKV_LOG_ERR, "Failed to sync buffer to disk\n");
+    }
+
+    brelse(bh);
+}
+
+static void flush_write_buffer(void)
+{
+    struct write_buffer_entry *entry, *tmp;
+
+    spin_lock(&write_buffer_lock);
+    list_for_each_entry_safe(entry, tmp, &write_buffer, list) {
+        list_del(&entry->list);
+        spin_unlock(&write_buffer_lock);
+
+        // Write the record to disk
+        write_record_to_disk(entry->record);
+
+        // Free the entry
+        kmem_cache_free(record_cache, entry->record);
+        kfree(entry);
+
+        spin_lock(&write_buffer_lock);
+    }
+    spin_unlock(&write_buffer_lock);
+}
+
+static int write_buffer_worker(void *data)
+{
+    struct write_buffer_entry *entry, *tmp;
+    unsigned long next_flush = jiffies + WRITE_BUFFER_FLUSH_INTERVAL;
+
+    while (!kthread_should_stop()) {
+        if (time_after(jiffies, next_flush) || write_buffer_size() >= WRITE_BUFFER_SIZE) {
+            spin_lock(&write_buffer_lock);
+            list_for_each_entry_safe(entry, tmp, &write_buffer, list) {
+                list_del(&entry->list);
+                spin_unlock(&write_buffer_lock);
+
+                // Write the record to disk
+                write_record_to_disk(entry->record);
+
+                // Free the entry
+                kmem_cache_free(record_cache, entry->record);
+                kfree(entry);
+
+                spin_lock(&write_buffer_lock);
+            }
+            spin_unlock(&write_buffer_lock);
+
+            next_flush = jiffies + WRITE_BUFFER_FLUSH_INTERVAL;
+        }
+
+        wait_event_interruptible_timeout(write_buffer_wait, 
+                                         write_buffer_exit || write_buffer_size() >= WRITE_BUFFER_SIZE,
+                                         WRITE_BUFFER_FLUSH_INTERVAL);
+
+        if (write_buffer_exit && list_empty(&write_buffer))
+            break;
+    }
+
+    return 0;
+}
+
 static void compact_disk(void)
 {
+    // Flush write buffer before compaction
+    flush_write_buffer();
+
     struct record *record;
     struct rb_node *node;
     sector_t read_sector = 1, write_sector = 1;
@@ -900,6 +1066,9 @@ static int purge_data(void)
 
     hpkv_log(HPKV_LOG_INFO, "Purging all data from block device\n");
 
+    // Clear the write buffer
+    flush_write_buffer();
+
     empty_buffer = kzalloc(BLOCK_SIZE, GFP_KERNEL);
     if (!empty_buffer) {
         hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for purge operation\n");
@@ -1068,6 +1237,22 @@ static int load_indexes(void)
     }
 
     vfree(buffer);
+
+    // After loading all records from disk, process any pending write buffer entries
+    struct write_buffer_entry *entry, *tmp;
+    spin_lock(&write_buffer_lock);
+    list_for_each_entry_safe(entry, tmp, &write_buffer, list) {
+        // Update in-memory structures with the buffered record
+        hash_add_rcu(kv_store, &entry->record->hash_node, djb2_hash(entry->record->key, strlen(entry->record->key)));
+        insert_rb_tree(entry->record);
+        atomic_long_add(entry->record->value_len, &total_disk_usage);
+        atomic_inc(&record_count);
+
+        // Remove from write buffer
+        list_del(&entry->list);
+        kfree(entry);
+    }
+    spin_unlock(&write_buffer_lock);
 
     if (corruption_detected) {
         hpkv_log(HPKV_LOG_WARNING, "Corruption detected. Consider running a repair operation.\n");
@@ -1293,6 +1478,19 @@ static int __init hpkv_init(void)
         goto error_put_device;
     }
 
+    // Initialize the write buffer
+    INIT_LIST_HEAD(&write_buffer);
+    spin_lock_init(&write_buffer_lock);
+    init_waitqueue_head(&write_buffer_wait);
+
+    // Start the write buffer thread
+    write_buffer_thread = kthread_run(write_buffer_worker, NULL, "hpkv_write_buffer");
+    if (IS_ERR(write_buffer_thread)) {
+        hpkv_log(HPKV_LOG_ALERT, "Failed to create write buffer thread\n");
+        ret = PTR_ERR(write_buffer_thread);
+        goto error_put_device;
+    }
+
     ret = load_indexes();
     if (ret == -EINVAL) {
         if (initialize_if_empty) {
@@ -1371,6 +1569,12 @@ static void __exit hpkv_exit(void)
     if (bdev) {
         blkdev_put(bdev, FMODE_READ | FMODE_WRITE);
     }
+
+    // Stop the write buffer thread and flush remaining entries
+    if (write_buffer_thread) {
+        kthread_stop(write_buffer_thread);
+    }
+    flush_write_buffer();
 
     // Clear cache
     spin_lock(&cache_lock);
