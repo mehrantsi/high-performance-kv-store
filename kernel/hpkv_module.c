@@ -31,7 +31,7 @@
 #define BLOCK_SIZE 4096
 #define PROC_ENTRY "hpkv_stats"
 #define CACHE_SIZE 1000
-#define COMPACT_INTERVAL (300 * HZ) // Run compaction every 300 seconds
+#define COMPACT_INTERVAL (120 * HZ) // Run compaction every 120 seconds
 #define HPKV_SIGNATURE "HPKV_V1"
 #define HPKV_SIGNATURE_SIZE 8
 #define HPKV_METADATA_BLOCK 0
