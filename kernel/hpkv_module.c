@@ -444,14 +444,19 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
     old_record = record_find_rcu(key);
     if (old_record) {
         if (is_partial_update) {
-            size_t new_len = old_record->value_len + value_len;
+            size_t old_len = old_record->value_len;
+            if (old_len > 0 && old_record->value[old_len - 1] == '\0') {
+                old_len--; // Exclude null terminator from old value
+            }
+            size_t new_len = old_len + value_len + 1; // +1 for new null terminator
             new_record->value = kmalloc(new_len, GFP_ATOMIC);
             if (!new_record->value) {
                 ret = -ENOMEM;
                 goto out_unlock;
             }
-            memcpy(new_record->value, old_record->value, old_record->value_len - 1);  // Copy without null terminator
-            memcpy(new_record->value + old_record->value_len - 1, value, value_len);  // Append new value
+            memcpy(new_record->value, old_record->value, old_len);
+            memcpy(new_record->value + old_len, value, value_len);
+            new_record->value[new_len - 1] = '\0'; // Ensure null termination
             new_record->value_len = new_len;
         } else {
             new_record->value = kmalloc(value_len, GFP_ATOMIC);
@@ -504,7 +509,6 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
     mark_buffer_dirty(bh);
     unlock_buffer(bh);
     
-    // Use sync_dirty_buffer instead of sync_dirty_buffer
     if (sync_dirty_buffer(bh) < 0) {
         brelse(bh);
         ret = -EIO;
@@ -514,16 +518,16 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
     brelse(bh);
 
     if (old_record) {
-        rcu_assign_pointer(new_record->hash_node.next, old_record->hash_node.next);
         hash_del_rcu(&old_record->hash_node);
-        rb_replace_node_rcu(&old_record->tree_node, &new_record->tree_node, &records_tree);
+        rb_erase(&old_record->tree_node, &records_tree);
         atomic_long_sub(old_record->value_len, &total_disk_usage);
-        atomic_long_add(new_record->value_len, &total_disk_usage);
-    } else {
-        hash_add_rcu(kv_store, &new_record->hash_node, hash);
-        rb_link_node_rcu(&new_record->tree_node, NULL, &records_tree.rb_node);
-        rb_insert_color(&new_record->tree_node, &records_tree);
-        atomic_long_add(new_record->value_len, &total_disk_usage);
+        call_rcu(&old_record->rcu, record_free_rcu);
+    }
+
+    hash_add_rcu(kv_store, &new_record->hash_node, hash);
+    insert_rb_tree(new_record);
+    atomic_long_add(new_record->value_len, &total_disk_usage);
+    if (!old_record) {
         atomic_inc(&record_count);
     }
 
@@ -534,10 +538,10 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
         hpkv_log(HPKV_LOG_ERR, "Failed to update metadata after insert/update\n");
     }
 
+    hpkv_log(HPKV_LOG_DEBUG, "Record %s: Key: %s, Value length: %zu, Partial update: %d\n", 
+             old_record ? "updated" : "inserted", key, new_record->value_len, is_partial_update);
+
 out_unlock:
-    if (old_record) {
-        call_rcu(&old_record->rcu, record_free_rcu);
-    }
     rcu_read_unlock();
     percpu_up_write(&rw_sem);
 
