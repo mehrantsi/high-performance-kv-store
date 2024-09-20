@@ -1071,6 +1071,8 @@ static int purge_data(void)
     struct buffer_head *bh;
     char *empty_buffer;
     int ret = 0;
+    struct record *record, *tmp;
+    struct rb_node *node;
 
     percpu_down_write(&rw_sem);
 
@@ -1091,7 +1093,7 @@ static int purge_data(void)
         if (!bh) {
             hpkv_log(HPKV_LOG_ERR, "Failed to get block for purging at sector %llu\n", (unsigned long long)sector);
             ret = -EIO;
-            goto out;
+            goto out_free_buffer;
         }
 
         lock_buffer(bh);
@@ -1106,27 +1108,39 @@ static int purge_data(void)
     }
 
     // Clear in-memory data structures
-    struct record *record;
-    struct rb_node *node, *next;
-    for (node = rb_first(&records_tree); node; node = next) {
-        next = rb_next(node);
+    rcu_read_lock();
+    for (node = rb_first(&records_tree); node; node = rb_next(node)) {
         record = rb_entry(node, struct record, tree_node);
-        rb_erase(node, &records_tree);
+        rb_erase(&record->tree_node, &records_tree);
         hash_del_rcu(&record->hash_node);
-        synchronize_rcu();
-        kfree(record->value);
+    }
+    rcu_read_unlock();
+
+    // Free the records after RCU grace period
+    synchronize_rcu();
+    rbtree_postorder_for_each_entry_safe(record, tmp, &records_tree, tree_node) {
+        if (record->value) {
+            kfree(record->value);
+            record->value = NULL;
+        }
         kmem_cache_free(record_cache, record);
     }
+
+    // Reset the tree root
+    records_tree = RB_ROOT;
+
+    // Clear hash table
     hash_init(kv_store);
+
     atomic_long_set(&total_disk_usage, 0);
     atomic_set(&record_count, 0);
 
     // Clear cache
     spin_lock(&cache_lock);
     struct cached_record *cached;
-    struct hlist_node *tmp;
+    struct hlist_node *tmp_node;
     int bkt;
-    hash_for_each_safe(cache, bkt, tmp, cached, node) {
+    hash_for_each_safe(cache, bkt, tmp_node, cached, node) {
         hash_del(&cached->node);
         kfree(cached->value);
         kfree(cached);
@@ -1134,13 +1148,14 @@ static int purge_data(void)
     cache_count = 0;
     spin_unlock(&cache_lock);
 
-out:
     ret = update_metadata();
     if (ret < 0) {
         hpkv_log(HPKV_LOG_ERR, "Failed to update metadata after purge\n");
     }
-    
+
+out_free_buffer:
     kfree(empty_buffer);
+out:
     percpu_up_write(&rw_sem);
     hpkv_log(HPKV_LOG_INFO, "Purge operation completed with status %d\n", ret);
     return ret;
