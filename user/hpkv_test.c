@@ -57,22 +57,6 @@ void partial_update(int fd, const char *key, const char *partial_value) {
     }
 }
 
-void read_all_records(int fd) {
-    char buffer[4096];
-    ssize_t bytes_read;
-    off_t offset = 0;
-    printf("All records in the database:\n");
-    while ((bytes_read = pread(fd, buffer, sizeof(buffer) - 1, offset)) > 0) {
-        buffer[bytes_read] = '\0';
-        printf("%s", buffer);
-        offset += bytes_read;
-    }
-    if (bytes_read < 0) {
-        perror("Failed to read records");
-    }
-    printf("\n");
-}
-
 void purge_data(int fd) {
     if (ioctl(fd, IOCTL_PURGE, 0) == 0) {
         printf("Successfully purged all data\n");
@@ -123,22 +107,23 @@ int main() {
     retrieve_record(fd, "key3");
     printf("\n");
 
-    // 6. Read all records
-    printf("6. Reading all records\n");
-    read_all_records(fd);
+    // 6. Read individual records (replace the previous step 6)
+    printf("6. Reading individual records\n");
+    retrieve_record(fd, "key1");
+    retrieve_record(fd, "key2");
     printf("\n");
 
     // 7. Purge all data
-     printf("7. Purging all data\n");
-     purge_data(fd);
-     read_all_records(fd);
-     printf("\n");
+    printf("7. Purging all data\n");
+    purge_data(fd);
+    printf("\n");
 
     // 8. Insert new records after purge
     printf("8. Inserting new records after purge\n");
     insert_record(fd, "new_key1", "new_value1");
     insert_record(fd, "new_key2", "new_value2");
-    read_all_records(fd);
+    retrieve_record(fd, "new_key1");
+    retrieve_record(fd, "new_key2");
     printf("\n");
 
     close(fd);

@@ -93,6 +93,14 @@ void retrieve_record(int fd, const char* key, Latencies* read_latencies) {
     }
 }
 
+void purge_data(int fd) {
+    if (ioctl(fd, IOCTL_PURGE, 0) == 0) {
+        printf("Successfully purged all data\n");
+    } else {
+        printf("Failed to purge data\n");
+    }
+}
+
 void run_test(int fd, int num_records) {
     Latencies write_latencies = {malloc(num_records * sizeof(double)), 0};
     Latencies read_latencies = {malloc(num_records * sizeof(double)), 0};
@@ -109,7 +117,7 @@ void run_test(int fd, int num_records) {
         insert_record(fd, key, value, &write_latencies);
     }
     
-    // Read records
+    // Read individual records
     for (int i = 0; i < num_records; i++) {
         snprintf(key, sizeof(key), "key_%d_%d", num_records, i);
         retrieve_record(fd, key, &read_latencies);
@@ -131,18 +139,11 @@ void run_test(int fd, int num_records) {
     double read_std_dev = calculate_std_dev(&read_latencies, read_std_dev);
     
     printf("Results for %d records:\n", num_records);
-    printf("Write - Median Latency: %.3f ms, Std Dev: %.3f ms\n", write_median, write_std_dev);
-    printf("Read  - Median Latency: %.3f ms, Std Dev: %.3f ms\n\n", read_median, read_std_dev);
+    printf("Write         - Median Latency: %.3f ms, Std Dev: %.3f ms\n", write_median, write_std_dev);
+    printf("Read          - Median Latency: %.3f ms, Std Dev: %.3f ms\n", read_median, read_std_dev);
     
     free(write_latencies.data);
     free(read_latencies.data);
-}
-void purge_data(int fd) {
-    if (ioctl(fd, IOCTL_PURGE, 0) == 0) {
-        printf("Successfully purged all data\n");
-    } else {
-        printf("Failed to purge data\n");
-    }
 }
 
 int main() {
