@@ -40,7 +40,7 @@
 #define WRITE_BUFFER_SIZE 1024
 #define WRITE_BUFFER_FLUSH_INTERVAL (HZ * 30) // 30 seconds
 #define MAX_DEVICE_SIZE (1ULL << 32)  // 4 GB, adjust as needed
-#define EXTENSION_SIZE (256 * 1024)  // Extend by 128KB at a time
+#define EXTENSION_SIZE (256 * 1024)  // Extend by 256KB at a time
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Mehran Toosi");
@@ -1442,6 +1442,12 @@ static int purge_data(void)
         return -EBUSY;
     }
 
+    // Set purge_in_progress flag
+    if (atomic_cmpxchg(&purge_in_progress, 0, 1) != 0) {
+        hpkv_log(HPKV_LOG_WARNING, "Purge operation already in progress\n");
+        return -EBUSY;
+    }
+
     sector_t sector = 1;
     struct buffer_head *bh;
     int ret = 0;
@@ -1449,6 +1455,7 @@ static int purge_data(void)
     unsigned long flags;
     struct rb_node *node, *next;
     struct record *record;
+    struct write_buffer_entry *wb_entry, *wb_tmp;
 
     hpkv_log(HPKV_LOG_INFO, "Starting purge operation\n");
 
@@ -1461,13 +1468,20 @@ static int purge_data(void)
     }
     memcpy(empty_buffer, "\0DELETED", 8);  // Mark as deleted
 
-    // Wait for write buffer to be flushed
-    flush_write_buffer();
-    // Set purge_in_progress flag
-    if (atomic_cmpxchg(&purge_in_progress, 0, 1) != 0) {
-        hpkv_log(HPKV_LOG_WARNING, "Purge operation already in progress\n");
-        return -EBUSY;
+    // Clean up any remaining entries in the write buffer
+    spin_lock(&write_buffer_lock);
+    list_for_each_entry_safe(wb_entry, wb_tmp, &write_buffer, list) {
+        list_del(&wb_entry->list);
+        if (wb_entry->record) {
+            if (wb_entry->record->value) {
+                kfree(wb_entry->record->value);
+                wb_entry->record->value = NULL;
+            }
+            kmem_cache_free(record_cache, wb_entry->record);
+        }
+        kfree(wb_entry);
     }
+    spin_unlock(&write_buffer_lock);
 
     // Use a write lock for the entire operation to prevent concurrent access
     percpu_down_write(&rw_sem);
@@ -1717,9 +1731,13 @@ out:
 static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     char key[MAX_KEY_SIZE];
-    char *value;
+    char *value = NULL;
     size_t value_len;
     int ret;
+
+    if (!arg && cmd != 3) {  // Allow arg to be null for purge operation
+        return -EINVAL;
+    }
 
     switch (cmd) {
         case 0:  // Get by exact key
@@ -1729,12 +1747,16 @@ static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             key[MAX_KEY_SIZE - 1] = '\0';
             ret = search_record(key, &value, &value_len);
             if (ret == 0) {
+                if (value && value_len > 0) {
                 if (copy_to_user((void __user *)arg, value, value_len)) {
-                    kfree(value);  // Free the allocated memory
+                        kfree(value);
                     return -EFAULT;
                 }
-                kfree(value);  // Free the allocated memory
+                    kfree(value);
                 return 0;
+                } else {
+                    return -EINVAL;
+                }
             }
             return ret;
         
@@ -1750,10 +1772,19 @@ static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                 return -EFAULT;
             
             key[MAX_KEY_SIZE - 1] = '\0';
-            if (copy_from_user(value, (char __user *)(arg + MAX_KEY_SIZE), MAX_VALUE_SIZE))
-                return -EFAULT;
+            value = kmalloc(MAX_VALUE_SIZE, GFP_KERNEL);
+            if (!value)
+                return -ENOMEM;
             
-            return insert_or_update_record(key, value, strlen(value), true);
+            if (copy_from_user(value, (char __user *)(arg + MAX_KEY_SIZE), MAX_VALUE_SIZE)) {
+                kfree(value);
+                return -EFAULT;
+            }
+            
+            value[MAX_VALUE_SIZE - 1] = '\0';
+            ret = insert_or_update_record(key, value, strlen(value), true);
+            kfree(value);
+            return ret;
 
         case 3:  // Purge all data
             return purge_data();
@@ -1992,8 +2023,8 @@ error_unregister_chrdev:
 
 static void __exit hpkv_exit(void)
 {
-    struct record *record, *tmp;
-    struct rb_node *node;
+    struct record *record;
+    struct rb_node *node, *next;
     int bkt;
     struct hlist_node *htmp;
     struct cached_record *cached;
@@ -2040,8 +2071,11 @@ static void __exit hpkv_exit(void)
     }
 
     // Clear the red-black tree
-    while ((node = rb_first(&records_tree))) {
+    rcu_read_lock();
+    for (node = rb_first(&records_tree); node; node = next) {
+        next = rb_next(node);
         record = rb_entry(node, struct record, tree_node);
+        if (record) {
         rb_erase(node, &records_tree);
         if (record->value) {
             kfree(record->value);
@@ -2049,6 +2083,8 @@ static void __exit hpkv_exit(void)
         }
         kmem_cache_free(record_cache, record);
     }
+    }
+    rcu_read_unlock();
 
     // Clear cache
     spin_lock(&cache_lock);
