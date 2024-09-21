@@ -38,7 +38,7 @@
 #define HPKV_SIGNATURE_SIZE 8
 #define HPKV_METADATA_BLOCK 0
 #define WRITE_BUFFER_SIZE 1024
-#define WRITE_BUFFER_FLUSH_INTERVAL (HZ * 5) // 5 seconds
+#define WRITE_BUFFER_FLUSH_INTERVAL (HZ * 30) // 30 seconds
 #define MAX_DEVICE_SIZE (1ULL << 32)  // 4 GB, adjust as needed
 #define EXTENSION_SIZE (256 * 1024)  // Extend by 128KB at a time
 
@@ -89,7 +89,7 @@ static DEFINE_PER_CPU(struct llist_head, record_free_list);
 static struct percpu_rw_semaphore rw_sem;
 static atomic_t purge_in_progress = ATOMIC_INIT(0);
 static atomic_t flush_in_progress = ATOMIC_INIT(0);
-static DECLARE_WAIT_QUEUE_HEAD(purge_wait_queue);
+static atomic_t compact_in_progress = ATOMIC_INIT(0);
 
 struct hpkv_metadata {
     char signature[HPKV_SIGNATURE_SIZE];
@@ -980,9 +980,19 @@ static void flush_write_buffer(void)
     int records_changed = 0;
     long size_changed = 0;
 
+    // Check if purge or compact is in progress
+    if (atomic_read(&purge_in_progress) != 0) {
+        hpkv_log(HPKV_LOG_WARNING, "Purge operation in progress, skipping flush\n");
+        return;
+    }
+
+    if (atomic_read(&compact_in_progress) != 0) {
+        hpkv_log(HPKV_LOG_WARNING, "Compact operation in progress, skipping flush\n");
+        return;
+    }
+
     // Try to set the flush_in_progress flag
     if (atomic_cmpxchg(&flush_in_progress, 0, 1) != 0) {
-        // If flush is already in progress, log and return
         hpkv_log(HPKV_LOG_INFO, "Flush already in progress, skipping this call\n");
         return;
     }
@@ -1096,14 +1106,13 @@ static void flush_write_buffer(void)
     // At the end of the function, reset the flag
     atomic_set(&flush_in_progress, 0);
     hpkv_log(HPKV_LOG_INFO, "Finished flush_write_buffer\n");
-    wake_up(&purge_wait_queue);
 }
 
 static int write_buffer_worker(void *data)
 {
     unsigned long next_flush = jiffies + WRITE_BUFFER_FLUSH_INTERVAL;
 
-    while (!kthread_should_stop()) {
+    while (!kthread_should_stop() && !write_buffer_exit) {
         long ret = wait_event_interruptible_timeout(write_buffer_wait, 
                                          kthread_should_stop() || write_buffer_size() >= WRITE_BUFFER_SIZE,
                                          WRITE_BUFFER_FLUSH_INTERVAL);
@@ -1135,6 +1144,24 @@ static int write_buffer_worker(void *data)
 
 static void compact_disk(void)
 {
+    // Check if flush is in progress
+    if (atomic_read(&flush_in_progress) != 0) {
+        hpkv_log(HPKV_LOG_WARNING, "Flush operation in progress, cannot start compaction\n");
+        return;
+    }
+
+
+    if (atomic_read(&purge_in_progress) != 0) {
+        hpkv_log(HPKV_LOG_WARNING, "Purge operation in progress, skipping flush\n");
+        return;
+    }
+
+    // Set compact_in_progress flag
+    if (atomic_cmpxchg(&compact_in_progress, 0, 1) != 0) {
+        hpkv_log(HPKV_LOG_WARNING, "Compact operation already in progress\n");
+        return;
+    }
+
     // Flush write buffer before compaction
     flush_write_buffer();
 
@@ -1208,6 +1235,7 @@ static void compact_disk(void)
 
 out:
     percpu_up_write(&rw_sem);
+    atomic_set(&compact_in_progress, 0);
 }
 
 static int calculate_fragmentation(void)
@@ -1402,6 +1430,18 @@ static ssize_t device_write(struct file *file, const char __user *user_buffer, s
 
 static int purge_data(void)
 {
+    // Check if flush is in progress
+    if (atomic_read(&flush_in_progress) != 0) {
+        hpkv_log(HPKV_LOG_WARNING, "Flush operation in progress, cannot start purge\n");
+        return -EBUSY;
+    }
+
+    // Check if compact is in progress
+    if (atomic_read(&compact_in_progress) != 0) {
+        hpkv_log(HPKV_LOG_WARNING, "Compact operation in progress, skipping flush\n");
+        return -EBUSY;
+    }
+
     sector_t sector = 1;
     struct buffer_head *bh;
     int ret = 0;
@@ -1411,12 +1451,6 @@ static int purge_data(void)
     struct record *record;
 
     hpkv_log(HPKV_LOG_INFO, "Starting purge operation\n");
-
-    // Set purge_in_progress flag
-    if (atomic_cmpxchg(&purge_in_progress, 0, 1) != 0) {
-        hpkv_log(HPKV_LOG_WARNING, "Purge operation already in progress\n");
-        return -EBUSY;
-    }
 
     // Allocate an empty buffer once
     empty_buffer = kzalloc(BLOCK_SIZE, GFP_KERNEL);
@@ -1429,7 +1463,11 @@ static int purge_data(void)
 
     // Wait for write buffer to be flushed
     flush_write_buffer();
-    wait_event(purge_wait_queue, write_buffer_size() == 0);
+    // Set purge_in_progress flag
+    if (atomic_cmpxchg(&purge_in_progress, 0, 1) != 0) {
+        hpkv_log(HPKV_LOG_WARNING, "Purge operation already in progress\n");
+        return -EBUSY;
+    }
 
     // Use a write lock for the entire operation to prevent concurrent access
     percpu_down_write(&rw_sem);
@@ -1521,7 +1559,6 @@ out:
     kfree(empty_buffer);
     percpu_up_write(&rw_sem);
     atomic_set(&purge_in_progress, 0);
-    wake_up(&purge_wait_queue);
     hpkv_log(HPKV_LOG_INFO, "Purge operation completed with status %d\n", ret);
     return ret;
 }
@@ -1960,6 +1997,7 @@ static void __exit hpkv_exit(void)
     int bkt;
     struct hlist_node *htmp;
     struct cached_record *cached;
+    struct write_buffer_entry *wb_entry, *wb_tmp;
 
     hpkv_log(HPKV_LOG_INFO, "Starting module unload\n");
 
@@ -1967,12 +2005,31 @@ static void __exit hpkv_exit(void)
     cancel_delayed_work_sync(&compact_work);
     destroy_workqueue(compact_wq);
 
-    // Stop the write buffer thread and flush remaining entries
+    // Stop the write buffer thread
     if (write_buffer_thread) {
+        write_buffer_exit = true;
+        wake_up(&write_buffer_wait);
         kthread_stop(write_buffer_thread);
         write_buffer_thread = NULL;
     }
+
+    // Flush remaining entries in the write buffer
     flush_write_buffer();
+
+    // Clean up any remaining entries in the write buffer
+    spin_lock(&write_buffer_lock);
+    list_for_each_entry_safe(wb_entry, wb_tmp, &write_buffer, list) {
+        list_del(&wb_entry->list);
+        if (wb_entry->record) {
+            if (wb_entry->record->value) {
+                kfree(wb_entry->record->value);
+                wb_entry->record->value = NULL;
+            }
+            kmem_cache_free(record_cache, wb_entry->record);
+        }
+        kfree(wb_entry);
+    }
+    spin_unlock(&write_buffer_lock);
 
     // Acquire write lock to prevent any concurrent access
     percpu_down_write(&rw_sem);
