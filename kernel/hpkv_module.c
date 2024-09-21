@@ -87,6 +87,9 @@ static int major_num;
 static struct kmem_cache *record_cache;
 static DEFINE_PER_CPU(struct llist_head, record_free_list);
 static struct percpu_rw_semaphore rw_sem;
+static atomic_t purge_in_progress = ATOMIC_INIT(0);
+static atomic_t flush_in_progress = ATOMIC_INIT(0);
+static DECLARE_WAIT_QUEUE_HEAD(purge_wait_queue);
 
 struct hpkv_metadata {
     char signature[HPKV_SIGNATURE_SIZE];
@@ -622,6 +625,10 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
     int ret = 0;
     u32 hash = djb2_hash(key, strlen(key));
 
+    if (!key || !value || value_len == 0) {
+        return -EINVAL;
+    }
+
     new_record = kmem_cache_alloc(record_cache, GFP_KERNEL);
     if (!new_record) {
         return -ENOMEM;
@@ -863,11 +870,25 @@ static void write_record_to_disk(struct record *record)
     loff_t device_size, new_size;
     int required_sectors;
 
-    if (!record || !record->value || record->value_len == 0) {
-        hpkv_log(HPKV_LOG_ERR, "Attempted to write invalid record to disk. Key: %s, Value length: %zu\n", 
-                 record ? record->key : "NULL", record ? record->value_len : 0);
+    if (!record) {
+        hpkv_log(HPKV_LOG_ERR, "Attempted to write null record to disk\n");
         return;
     }
+
+    if (!record->value || record->value_len == 0) {
+        hpkv_log(HPKV_LOG_ERR, "Attempted to write invalid record to disk. Key: %s, Value length: %zu\n", 
+                 record->key, record->value_len);
+        return;
+    }
+
+    if (record->value_len > MAX_VALUE_SIZE) {
+        hpkv_log(HPKV_LOG_ERR, "Record value length exceeds maximum. Key: %s, Value length: %zu\n", 
+                 record->key, record->value_len);
+        return;
+    }
+
+    hpkv_log(HPKV_LOG_DEBUG, "Writing record to disk. Key: %s, Value length: %zu\n", 
+             record->key, record->value_len);
 
     device_size = i_size_read(bdev->bd_inode);
 
@@ -914,6 +935,15 @@ static void write_record_to_disk(struct record *record)
     memset(bh->b_data, 0, BLOCK_SIZE);  // Clear the buffer first
     memcpy(bh->b_data, record->key, sizeof(record->key));
     memcpy(bh->b_data + sizeof(record->key), &record->value_len, sizeof(size_t));
+    
+    // Add this check
+    if (!record->value) {
+        hpkv_log(HPKV_LOG_ERR, "Record value became null before writing to disk. Key: %s\n", record->key);
+        unlock_buffer(bh);
+        brelse(bh);
+        return;
+    }
+    
     memcpy(bh->b_data + sizeof(record->key) + sizeof(size_t), record->value, record->value_len);
     set_buffer_uptodate(bh);
     mark_buffer_dirty(bh);
@@ -950,6 +980,13 @@ static void flush_write_buffer(void)
     int records_changed = 0;
     long size_changed = 0;
 
+    // Try to set the flush_in_progress flag
+    if (atomic_cmpxchg(&flush_in_progress, 0, 1) != 0) {
+        // If flush is already in progress, log and return
+        hpkv_log(HPKV_LOG_INFO, "Flush already in progress, skipping this call\n");
+        return;
+    }
+
     hpkv_log(HPKV_LOG_INFO, "Starting flush_write_buffer\n");
 
     spin_lock(&write_buffer_lock);
@@ -984,6 +1021,11 @@ static void flush_write_buffer(void)
                     continue;
                 }
                 write_record_to_disk(entry->record);
+                // After writing to disk, free the in-memory value
+                if (entry->record->value) {
+                    kfree(entry->record->value);
+                    entry->record->value = NULL;
+                }
                 break;
 
             case OP_UPDATE:
@@ -1004,13 +1046,21 @@ static void flush_write_buffer(void)
                     continue;
                 }
                 write_record_to_disk(entry->record);
+                // After writing to disk, free the in-memory value
+                if (entry->record->value) {
+                    kfree(entry->record->value);
+                    entry->record->value = NULL;
+                }
                 break;
 
             case OP_DELETE:
                 records_changed--;
-                size_changed -= entry->record->value_len;
+                size_changed -= entry->old_value_len;
                 mark_sector_as_deleted(entry->record->sector);
-                kfree(entry->record->value);
+                if (entry->record->value) {
+                    kfree(entry->record->value);
+                    entry->record->value = NULL;
+                }
                 kmem_cache_free(record_cache, entry->record);
                 break;
         }
@@ -1043,13 +1093,15 @@ static void flush_write_buffer(void)
         }
     }
 
+    // At the end of the function, reset the flag
+    atomic_set(&flush_in_progress, 0);
     hpkv_log(HPKV_LOG_INFO, "Finished flush_write_buffer\n");
+    wake_up(&purge_wait_queue);
 }
 
 static int write_buffer_worker(void *data)
 {
     unsigned long next_flush = jiffies + WRITE_BUFFER_FLUSH_INTERVAL;
-    int flushed_count = 0;
 
     while (!kthread_should_stop()) {
         long ret = wait_event_interruptible_timeout(write_buffer_wait, 
@@ -1360,16 +1412,24 @@ static int purge_data(void)
 
     hpkv_log(HPKV_LOG_INFO, "Starting purge operation\n");
 
+    // Set purge_in_progress flag
+    if (atomic_cmpxchg(&purge_in_progress, 0, 1) != 0) {
+        hpkv_log(HPKV_LOG_WARNING, "Purge operation already in progress\n");
+        return -EBUSY;
+    }
+
     // Allocate an empty buffer once
     empty_buffer = kzalloc(BLOCK_SIZE, GFP_KERNEL);
     if (!empty_buffer) {
         hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for purge operation\n");
+        atomic_set(&purge_in_progress, 0);
         return -ENOMEM;
     }
     memcpy(empty_buffer, "\0DELETED", 8);  // Mark as deleted
 
-    // Clear the write buffer first
+    // Wait for write buffer to be flushed
     flush_write_buffer();
+    wait_event(purge_wait_queue, write_buffer_size() == 0);
 
     // Use a write lock for the entire operation to prevent concurrent access
     percpu_down_write(&rw_sem);
@@ -1460,6 +1520,8 @@ static int purge_data(void)
 out:
     kfree(empty_buffer);
     percpu_up_write(&rw_sem);
+    atomic_set(&purge_in_progress, 0);
+    wake_up(&purge_wait_queue);
     hpkv_log(HPKV_LOG_INFO, "Purge operation completed with status %d\n", ret);
     return ret;
 }
