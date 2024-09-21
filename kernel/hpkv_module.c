@@ -623,18 +623,24 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
     struct record *new_record, *old_record;
     struct write_buffer_entry *wb_entry;
     int ret = 0;
-    u32 hash = djb2_hash(key, strlen(key));
+    u32 hash;
 
-    if (!key || !value || value_len == 0) {
+    if (!key || !value || value_len == 0 || value_len > MAX_VALUE_SIZE) {
+        hpkv_log(HPKV_LOG_ERR, "Invalid input parameters for insert_or_update_record\n");
         return -EINVAL;
     }
 
+    hash = djb2_hash(key, strlen(key));
+
     new_record = kmem_cache_alloc(record_cache, GFP_KERNEL);
     if (!new_record) {
+        hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for new record\n");
         return -ENOMEM;
     }
 
-    strncpy(new_record->key, key, MAX_KEY_SIZE);
+    memset(new_record, 0, sizeof(struct record));  // Initialize the new record
+
+    strncpy(new_record->key, key, MAX_KEY_SIZE - 1);
     new_record->key[MAX_KEY_SIZE - 1] = '\0';
 
     // Update in-memory data structures
@@ -645,21 +651,28 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
         if (is_partial_update) {
             // Perform partial update
             size_t new_len = old_record->value_len + value_len;
-            char *new_value = kmalloc(new_len + 1, GFP_KERNEL);
-            if (!new_value) {
+            if (new_len > MAX_VALUE_SIZE) {
+                hpkv_log(HPKV_LOG_ERR, "Partial update exceeds maximum value size\n");
+                percpu_up_write(&rw_sem);
+                kmem_cache_free(record_cache, new_record);
+                return -EINVAL;
+            }
+            new_record->value = kmalloc(new_len + 1, GFP_KERNEL);
+            if (!new_record->value) {
+                hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for partial update\n");
                 percpu_up_write(&rw_sem);
                 kmem_cache_free(record_cache, new_record);
                 return -ENOMEM;
             }
-            memcpy(new_value, old_record->value, old_record->value_len);
-            memcpy(new_value + old_record->value_len, value, value_len);
-            new_value[new_len] = '\0';
-            new_record->value = new_value;
+            memcpy(new_record->value, old_record->value, old_record->value_len);
+            memcpy(new_record->value + old_record->value_len, value, value_len);
+            new_record->value[new_len] = '\0';
             new_record->value_len = new_len;
         } else {
             // Perform regular update
             new_record->value = kmalloc(value_len + 1, GFP_KERNEL);
             if (!new_record->value) {
+                hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for update\n");
                 percpu_up_write(&rw_sem);
                 kmem_cache_free(record_cache, new_record);
                 return -ENOMEM;
@@ -678,6 +691,7 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
         // New insert
         new_record->value = kmalloc(value_len + 1, GFP_KERNEL);
         if (!new_record->value) {
+            hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for new insert\n");
             percpu_up_write(&rw_sem);
             kmem_cache_free(record_cache, new_record);
             return -ENOMEM;
@@ -695,26 +709,11 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
 
     percpu_up_write(&rw_sem);
 
-    if (!new_record->value || new_record->value_len == 0) {
-        hpkv_log(HPKV_LOG_ERR, "Attempted to insert/update record with null or zero-length value. Key: %s\n", key);
-        percpu_down_write(&rw_sem);
-        hash_del_rcu(&new_record->hash_node);
-        rb_erase(&new_record->tree_node, &records_tree);
-        atomic_long_sub(new_record->value_len, &total_disk_usage);
-        if (!old_record) {
-            atomic_dec(&record_count);
-        }
-        percpu_up_write(&rw_sem);
-
-        kfree(new_record->value);
-        kmem_cache_free(record_cache, new_record);
-        return -EINVAL;
-    }
-
     // Add to write buffer
     wb_entry = kmalloc(sizeof(*wb_entry), GFP_KERNEL);
     if (!wb_entry) {
-        // Rollback changes if we can't add to write buffer
+        hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for write buffer entry\n");
+        // Rollback changes
         percpu_down_write(&rw_sem);
         hash_del_rcu(&new_record->hash_node);
         rb_erase(&new_record->tree_node, &records_tree);
@@ -1643,7 +1642,8 @@ static int load_indexes(void)
         if (key[0] != '\0' && value_len > 0 && value_len <= MAX_VALUE_SIZE) {
             struct record *record = kmem_cache_alloc(record_cache, GFP_KERNEL);
             if (record) {
-                strncpy(record->key, key, MAX_KEY_SIZE);
+                memset(record, 0, sizeof(struct record));  // Initialize the record
+                strncpy(record->key, key, MAX_KEY_SIZE - 1);
                 record->key[MAX_KEY_SIZE - 1] = '\0';  // Ensure null-termination
                 record->value = kmalloc(value_len + 1, GFP_KERNEL);
                 if (record->value) {
@@ -1748,12 +1748,12 @@ static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             ret = search_record(key, &value, &value_len);
             if (ret == 0) {
                 if (value && value_len > 0) {
-                if (copy_to_user((void __user *)arg, value, value_len)) {
+                    if (copy_to_user((void __user *)arg, value, value_len)) {
                         kfree(value);
-                    return -EFAULT;
-                }
+                        return -EFAULT;
+                    }
                     kfree(value);
-                return 0;
+                    return 0;
                 } else {
                     return -EINVAL;
                 }
@@ -2076,13 +2076,13 @@ static void __exit hpkv_exit(void)
         next = rb_next(node);
         record = rb_entry(node, struct record, tree_node);
         if (record) {
-        rb_erase(node, &records_tree);
-        if (record->value) {
-            kfree(record->value);
-            record->value = NULL;
+            rb_erase(node, &records_tree);
+            if (record->value) {
+                kfree(record->value);
+                record->value = NULL;
+            }
+            kmem_cache_free(record_cache, record);
         }
-        kmem_cache_free(record_cache, record);
-    }
     }
     rcu_read_unlock();
 
