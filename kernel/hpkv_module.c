@@ -367,18 +367,22 @@ static void record_free_rcu(struct rcu_head *head)
         }
         kmem_cache_free(record_cache, record);
     }
+    hpkv_log(HPKV_LOG_INFO, "RCU callback executed for record\n");
 }
-
 
 static struct record *record_find_rcu(const char *key)
 {
     struct record *record;
     u32 hash = djb2_hash(key, strlen(key));
 
+    rcu_read_lock();
     hash_for_each_possible_rcu(kv_store, record, hash_node, hash) {
-        if (strcmp(record->key, key) == 0)
+        if (strcmp(record->key, key) == 0) {
+            rcu_read_unlock();
             return record;
     }
+    }
+    rcu_read_unlock();
     return NULL;
 }
 
@@ -667,12 +671,15 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
         return -EINVAL;
     }
 
+    // Allocate memory for new_record using GFP_KERNEL flag
     new_record = kmem_cache_alloc(record_cache, GFP_KERNEL);
     if (!new_record) {
         hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for new record\n");
         return -ENOMEM;
     }
 
+    // Initialize the new_record structure
+    memset(new_record, 0, sizeof(struct record));
     strncpy(new_record->key, key, MAX_KEY_SIZE);
     new_record->key[MAX_KEY_SIZE - 1] = '\0';
 
@@ -863,6 +870,7 @@ static int extend_device(loff_t new_size)
     int ret = 0;
     struct block_device *bdev_ro = NULL;
     loff_t current_size = i_size_read(bdev->bd_inode);
+    unsigned long arg;
 
     hpkv_log(HPKV_LOG_INFO, "Current device size: %lld bytes, Requested size: %lld bytes\n", current_size, new_size);
 
@@ -890,17 +898,26 @@ static int extend_device(loff_t new_size)
         return PTR_ERR(bdev_ro);
     }
 
+    // Prepare the argument for ioctl
+    arg = (unsigned long)new_size;
+
     // Set the new size using ioctl
-    ret = blkdev_ioctl(bdev_ro, 0, BLKBSZSET, (unsigned long)&new_size);
+    ret = blkdev_ioctl(bdev_ro, 0, BLKBSZSET, arg);
 
     if (ret) {
         hpkv_log(HPKV_LOG_ERR, "Failed to set new device size: %d (%s)\n", ret, 
                  ret == -EACCES ? "Permission denied" : 
-                 ret == -ENOSPC ? "No space left on device" : "Unknown error");
+                 ret == -ENOSPC ? "No space left on device" : 
+                 ret == -EFAULT ? "Bad address" : 
+                 ret == -EINVAL ? "Invalid argument" : "Unknown error");
         if (ret == -EACCES) {
             hpkv_log(HPKV_LOG_ERR, "Make sure the module has the necessary permissions to resize the block device\n");
         } else if (ret == -ENOSPC) {
             hpkv_log(HPKV_LOG_ERR, "The underlying physical device does not have enough space for extension\n");
+        } else if (ret == -EFAULT) {
+            hpkv_log(HPKV_LOG_ERR, "Bad address passed to ioctl. This might be a bug in the module.\n");
+        } else if (ret == -EINVAL) {
+            hpkv_log(HPKV_LOG_ERR, "Invalid argument passed to ioctl. The new size might be invalid.\n");
         }
     } else {
         loff_t new_actual_size = i_size_read(bdev->bd_inode);
@@ -908,6 +925,12 @@ static int extend_device(loff_t new_size)
         
         // Update the size in our main bdev structure
         i_size_write(bdev->bd_inode, new_actual_size);
+
+        // Update metadata with new size
+        ret = update_metadata_size(new_actual_size);
+        if (ret) {
+            hpkv_log(HPKV_LOG_ERR, "Failed to update metadata with new size\n");
+        }
     }
 
     // Close the read-only block device
@@ -1070,7 +1093,9 @@ static void flush_write_buffer(void)
             case OP_INSERT:
                 records_changed++;
                 size_changed += entry->record->value_len;
+                    spin_lock(&write_buffer_lock);
                 entry->record->sector = find_free_sector(entry->record->value_len);
+                    spin_unlock(&write_buffer_lock);
                 if (entry->record->sector == -ENOSPC) {
                     // Handle device extension
                     loff_t new_size = i_size_read(bdev->bd_inode) + EXTENSION_SIZE;
@@ -1079,7 +1104,9 @@ static void flush_write_buffer(void)
                         hpkv_log(HPKV_LOG_ERR, "Failed to extend device, skipping record: %s\n", entry->record->key);
                         continue;
                     }
+                        spin_lock(&write_buffer_lock);
                     entry->record->sector = find_free_sector(entry->record->value_len);
+                        spin_unlock(&write_buffer_lock);
                 }
                 if (entry->record->sector < 0) {
                     hpkv_log(HPKV_LOG_ERR, "Failed to find free sector for key: %s\n", entry->record->key);
@@ -1095,7 +1122,9 @@ static void flush_write_buffer(void)
 
             case OP_UPDATE:
                 size_changed += (long)entry->record->value_len - (long)entry->old_value_len;
+                    spin_lock(&write_buffer_lock);
                 entry->record->sector = find_free_sector(entry->record->value_len);
+                    spin_unlock(&write_buffer_lock);
                 if (entry->record->sector == -ENOSPC) {
                     // Handle device extension
                     loff_t new_size = i_size_read(bdev->bd_inode) + EXTENSION_SIZE;
@@ -1104,7 +1133,9 @@ static void flush_write_buffer(void)
                         hpkv_log(HPKV_LOG_ERR, "Failed to extend device, skipping record: %s\n", entry->record->key);
                         continue;
                     }
+                        spin_lock(&write_buffer_lock);
                     entry->record->sector = find_free_sector(entry->record->value_len);
+                        spin_unlock(&write_buffer_lock);
                 }
                 if (entry->record->sector < 0) {
                     hpkv_log(HPKV_LOG_ERR, "Failed to find free sector for key: %s\n", entry->record->key);
@@ -1552,11 +1583,7 @@ static int purge_data(void)
         next = rb_next(node);
         record = rb_entry(node, struct record, tree_node);
         rb_erase(node, &records_tree);
-        if (record->value) {
-            kfree(record->value);
-            record->value = NULL;
-        }
-        kmem_cache_free(record_cache, record);
+        call_rcu(&record->rcu, record_free_rcu);
     }
 
     atomic_long_set(&total_disk_usage, 0);
@@ -1591,11 +1618,7 @@ static int purge_data(void)
     list_for_each_entry_safe(entry, tmp, &local_list, list) {
         list_del(&entry->list);
         if (entry->record) {
-            if (entry->record->value) {
-                kfree(entry->record->value);
-                entry->record->value = NULL;
-            }
-            kmem_cache_free(record_cache, entry->record);
+            call_rcu(&entry->record->rcu, record_free_rcu);
         }
         kfree(entry);
     }
@@ -1645,6 +1668,7 @@ static int purge_data(void)
 out:
     kfree(empty_buffer);
     percpu_up_write(&rw_sem);
+    synchronize_rcu();
     atomic_set(&purge_in_progress, 0);
     hpkv_log(HPKV_LOG_INFO, "Purge operation completed with status %d\n", ret);
     return ret;
@@ -1837,10 +1861,17 @@ static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                 return -EFAULT;
             
             key[MAX_KEY_SIZE - 1] = '\0';
-            if (copy_from_user(value, (char __user *)(arg + MAX_KEY_SIZE), MAX_VALUE_SIZE))
+            value = kmalloc(MAX_VALUE_SIZE, GFP_KERNEL);
+            if (!value)
+                return -ENOMEM;
+            if (copy_from_user(value, (char __user *)(arg + MAX_KEY_SIZE), MAX_VALUE_SIZE)) {
+                kfree(value);
                 return -EFAULT;
+            }
             
-            return insert_or_update_record(key, value, strlen(value), true);
+            ret = insert_or_update_record(key, value, strlen(value), true);
+            kfree(value);
+            return ret;
 
         case 3:  // Purge all data
             return purge_data();
@@ -1951,7 +1982,7 @@ static bool is_disk_empty(struct block_device *bdev)
 
 static void hpkv_rcu_callback(struct rcu_head *head)
 {
-    // This function intentionally left empty
+    hpkv_log(HPKV_LOG_INFO, "RCU callback executed\n");
 }
 
 static int __init hpkv_init(void)
@@ -2092,6 +2123,9 @@ static void __exit hpkv_exit(void)
     cancel_delayed_work_sync(&compact_work);
     destroy_workqueue(compact_wq);
 
+    // Flush remaining entries in the write buffer
+    flush_write_buffer();
+
     // Stop the write buffer thread
     if (write_buffer_thread) {
         write_buffer_exit = true;
@@ -2123,7 +2157,7 @@ static void __exit hpkv_exit(void)
 
     // Clear the hash table
     hash_for_each_safe(kv_store, bkt, htmp, record, hash_node) {
-        hash_del(&record->hash_node);
+        hash_del_rcu(&record->hash_node);
     }
 
     // Clear the red-black tree
