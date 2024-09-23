@@ -62,6 +62,7 @@ static int write_buffer_size(void);
 static sector_t find_free_sector(size_t required_size);
 static bool check_contiguous_free_sectors(sector_t start_sector, int required_sectors);
 static int update_metadata(void);
+static int update_metadata_size(loff_t new_size);
 static int insert_or_update_record(const char *key, const char *value, size_t value_len, bool is_partial_update);
 static int delete_record(const char *key);
 static int write_buffer_worker(void *data);
@@ -187,7 +188,11 @@ MODULE_PARM_DESC(log_level, "Logging level (0-7, default: 4)");
                 case HPKV_LOG_DEBUG:   kern_level = KERN_DEBUG; break; \
                 default:               kern_level = KERN_DEFAULT; break; \
             } \
-            printk("%sHPKV: %s:%d: " fmt, kern_level, __func__, __LINE__, ##__VA_ARGS__); \
+            if (log_level == HPKV_LOG_DEBUG) { \
+                printk("%sHPKV: %s:%d: " fmt, kern_level, __func__, __LINE__, ##__VA_ARGS__); \
+            } else { \
+                printk("%sHPKV: " fmt, kern_level, ##__VA_ARGS__); \
+            } \
         } \
     } while (0)
 
@@ -618,6 +623,33 @@ static int update_metadata(void)
     return 0;
 }
 
+static int update_metadata_size(loff_t new_size)
+{
+    struct buffer_head *bh;
+    struct hpkv_metadata metadata;
+
+    bh = __bread(bdev, HPKV_METADATA_BLOCK, BLOCK_SIZE);
+    if (!bh) {
+        hpkv_log(HPKV_LOG_ERR, "Failed to read metadata block for update\n");
+        return -EIO;
+    }
+
+    memcpy(&metadata, bh->b_data, sizeof(struct hpkv_metadata));
+
+    // Update the total_size field
+    metadata.total_size = new_size;
+
+    // Write back the updated metadata
+    memcpy(bh->b_data, &metadata, sizeof(struct hpkv_metadata));
+    mark_buffer_dirty(bh);
+    sync_dirty_buffer(bh);
+    brelse(bh);
+
+    hpkv_log(HPKV_LOG_INFO, "Updated metadata size - New total size: %llu bytes\n", new_size);
+
+    return 0;
+}
+
 static int insert_or_update_record(const char *key, const char *value, size_t value_len, bool is_partial_update)
 {
     struct record *new_record, *old_record;
@@ -626,11 +658,18 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
     u32 hash = djb2_hash(key, strlen(key));
 
     if (!key || !value || value_len == 0) {
+        hpkv_log(HPKV_LOG_ERR, "Invalid parameters for insert_or_update_record\n");
+        return -EINVAL;
+    }
+
+    if (!record_cache) {
+        hpkv_log(HPKV_LOG_ERR, "record_cache is not initialized\n");
         return -EINVAL;
     }
 
     new_record = kmem_cache_alloc(record_cache, GFP_KERNEL);
     if (!new_record) {
+        hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for new record\n");
         return -ENOMEM;
     }
 
@@ -649,6 +688,7 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
             if (!new_value) {
                 percpu_up_write(&rw_sem);
                 kmem_cache_free(record_cache, new_record);
+                hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for partial update\n");
                 return -ENOMEM;
             }
             memcpy(new_value, old_record->value, old_record->value_len);
@@ -662,6 +702,7 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
             if (!new_record->value) {
                 percpu_up_write(&rw_sem);
                 kmem_cache_free(record_cache, new_record);
+                hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for regular update\n");
                 return -ENOMEM;
             }
             memcpy(new_record->value, value, value_len);
@@ -680,6 +721,7 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
         if (!new_record->value) {
             percpu_up_write(&rw_sem);
             kmem_cache_free(record_cache, new_record);
+            hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for new insert\n");
             return -ENOMEM;
         }
         memcpy(new_record->value, value, value_len);
@@ -689,9 +731,15 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
     }
 
     // Insert new record
-    hash_add_rcu(kv_store, &new_record->hash_node, hash);
-    insert_rb_tree(new_record);
-    atomic_long_add(new_record->value_len, &total_disk_usage);
+    if (new_record) {
+        hash_add_rcu(kv_store, &new_record->hash_node, hash);
+        insert_rb_tree(new_record);
+        atomic_long_add(new_record->value_len, &total_disk_usage);
+    } else {
+        hpkv_log(HPKV_LOG_ERR, "Attempted to insert a null record. Key: %s\n", key);
+        percpu_up_write(&rw_sem);
+        return -EINVAL;
+    }
 
     percpu_up_write(&rw_sem);
 
@@ -726,6 +774,7 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
 
         kfree(new_record->value);
         kmem_cache_free(record_cache, new_record);
+        hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for write buffer entry\n");
         return -ENOMEM;
     }
 
@@ -856,6 +905,9 @@ static int extend_device(loff_t new_size)
     } else {
         loff_t new_actual_size = i_size_read(bdev->bd_inode);
         hpkv_log(HPKV_LOG_INFO, "Successfully extended device. New size: %lld bytes\n", new_actual_size);
+        
+        // Update the size in our main bdev structure
+        i_size_write(bdev->bd_inode, new_actual_size);
     }
 
     // Close the read-only block device
@@ -915,6 +967,9 @@ static void write_record_to_disk(struct record *record)
             hpkv_log(HPKV_LOG_ERR, "Failed to extend device. Writing aborted. Key: %s\n", record->key);
             return;
         }
+
+        // Update device_size after extension
+        device_size = i_size_read(bdev->bd_inode);
 
         // Retry finding a free sector after extension
         record->sector = find_free_sector(record->value_len);
@@ -1106,7 +1161,6 @@ static void flush_write_buffer(void)
     // At the end of the function, reset the flag
     atomic_set(&flush_in_progress, 0);
     hpkv_log(HPKV_LOG_INFO, "Finished flush_write_buffer\n");
-    wake_up(&purge_wait_queue);
 }
 
 static int write_buffer_worker(void *data)
@@ -1229,8 +1283,23 @@ static void compact_disk(void)
 
     // Truncate the device to the new size
     sector_t new_size = write_sector * BLOCK_SIZE;
-    i_size_write(bdev->bd_inode, new_size);
-    sync_blockdev(bdev);
+    loff_t old_size = i_size_read(bdev->bd_inode);
+    
+    hpkv_log(HPKV_LOG_INFO, "Compaction: Old size: %lld, New size: %llu\n", 
+             old_size, (unsigned long long)new_size);
+
+    if (new_size < old_size) {
+        i_size_write(bdev->bd_inode, new_size);
+        sync_blockdev(bdev);
+        hpkv_log(HPKV_LOG_INFO, "Device shrunk from %lld to %llu bytes\n", 
+                 old_size, (unsigned long long)new_size);
+        
+        // Update the metadata with the new size
+        update_metadata_size(new_size);
+    } else {
+        hpkv_log(HPKV_LOG_WARNING, "New size (%llu) not smaller than old size (%lld), skipping shrink\n", 
+                 (unsigned long long)new_size, old_size);
+    }
 
     hpkv_log(HPKV_LOG_INFO, "Disk compaction completed. New size: %llu sectors\n", (unsigned long long)write_sector);
 
@@ -1456,14 +1525,10 @@ static int purge_data(void)
     unsigned long flags;
     struct rb_node *node, *next;
     struct record *record;
+    struct write_buffer_entry *entry, *tmp;
+    LIST_HEAD(local_list);
 
     hpkv_log(HPKV_LOG_INFO, "Starting purge operation\n");
-
-    // Set purge_in_progress flag
-    if (atomic_cmpxchg(&purge_in_progress, 0, 1) != 0) {
-        hpkv_log(HPKV_LOG_WARNING, "Purge operation already in progress\n");
-        return -EBUSY;
-    }
 
     // Allocate an empty buffer once
     empty_buffer = kzalloc(BLOCK_SIZE, GFP_KERNEL);
@@ -1473,10 +1538,6 @@ static int purge_data(void)
         return -ENOMEM;
     }
     memcpy(empty_buffer, "\0DELETED", 8);  // Mark as deleted
-
-    // Wait for write buffer to be flushed
-    flush_write_buffer();
-    wait_event(purge_wait_queue, write_buffer_size() == 0);
 
     // Use a write lock for the entire operation to prevent concurrent access
     percpu_down_write(&rw_sem);
@@ -1522,6 +1583,25 @@ static int purge_data(void)
 
     hpkv_log(HPKV_LOG_INFO, "In-memory structures cleared\n");
 
+    // Clear the write buffer
+    spin_lock(&write_buffer_lock);
+    list_splice_init(&write_buffer, &local_list);
+    spin_unlock(&write_buffer_lock);
+
+    list_for_each_entry_safe(entry, tmp, &local_list, list) {
+        list_del(&entry->list);
+        if (entry->record) {
+            if (entry->record->value) {
+                kfree(entry->record->value);
+                entry->record->value = NULL;
+            }
+            kmem_cache_free(record_cache, entry->record);
+        }
+        kfree(entry);
+    }
+
+    hpkv_log(HPKV_LOG_INFO, "Write buffer cleared\n");
+
     // Now clear the disk
     while (sector * BLOCK_SIZE < i_size_read(bdev->bd_inode)) {
         bh = __getblk(bdev, sector, BLOCK_SIZE);
@@ -1550,8 +1630,6 @@ static int purge_data(void)
             ret = -EINTR;
             goto out;
         }
-
-        cond_resched();  // Allow other processes to run
     }
 
     // Final sync
@@ -1568,7 +1646,6 @@ out:
     kfree(empty_buffer);
     percpu_up_write(&rw_sem);
     atomic_set(&purge_in_progress, 0);
-    wake_up(&purge_wait_queue);
     hpkv_log(HPKV_LOG_INFO, "Purge operation completed with status %d\n", ret);
     return ret;
 }
