@@ -2187,14 +2187,13 @@ static void __exit hpkv_exit(void)
     synchronize_rcu();
     
     // Destroy the cache after a short delay to ensure all operations are complete
-    msleep(100);
+    msleep(200);
+
+    // Destroy the cache
     kmem_cache_destroy(record_cache);
 
     unregister_chrdev(major_num, DEVICE_NAME);
     percpu_free_rwsem(&rw_sem);
-
-    // Add a small delay before exiting to allow any pending operations to complete
-    msleep(100);
 
     hpkv_log(HPKV_LOG_INFO, "Module unloaded successfully\n");
 }
