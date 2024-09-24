@@ -2106,10 +2106,9 @@ error_unregister_chrdev:
 
 static void __exit hpkv_exit(void)
 {
-    struct record *record, *tmp;
-    struct rb_node *node;
+    struct record *record;
+    struct hlist_node *tmp;
     int bkt;
-    struct hlist_node *htmp;
     struct cached_record *cached;
     struct write_buffer_entry *wb_entry, *wb_tmp;
 
@@ -2148,7 +2147,7 @@ static void __exit hpkv_exit(void)
     }
     spin_unlock(&write_buffer_lock);
 
-   // Clear the hash table and free all records
+    // Clear the hash table and free all records
     hash_for_each_safe(kv_store, bkt, tmp, record, hash_node) {
         hash_del_rcu(&record->hash_node);
         rb_erase(&record->tree_node, &records_tree);
@@ -2161,7 +2160,7 @@ static void __exit hpkv_exit(void)
 
     // Clear cache
     spin_lock(&cache_lock);
-    hash_for_each_safe(cache, bkt, htmp, cached, node) {
+    hash_for_each_safe(cache, bkt, tmp, cached, node) {
         hash_del(&cached->node);
         if (cached->value) {
             kfree(cached->value);
