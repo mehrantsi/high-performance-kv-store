@@ -2157,11 +2157,7 @@ static void __exit hpkv_exit(void)
     while ((node = rb_first(&records_tree))) {
         record = rb_entry(node, struct record, tree_node);
         rb_erase(node, &records_tree);
-        if (record->value) {
-            kfree(record->value);
-            record->value = NULL;
-        }
-        kmem_cache_free(record_cache, record);
+        call_rcu(&record->rcu, record_free_rcu);
     }
 
     // Clear cache
