@@ -2087,7 +2087,7 @@ static int __init hpkv_init(void)
     queue_delayed_work(compact_wq, &compact_work, COMPACT_INTERVAL);
 
     hpkv_log(HPKV_LOG_INFO, "Module loaded successfully\n");
-    hpkv_log(HPKV_LOG_INFO, "Registered with major number %d\n", major_num);
+    hpkv_log(HPKV_LOG_WARNING, "Registered with major number %d\n", major_num);
     return 0;
 
 error_remove_proc:
