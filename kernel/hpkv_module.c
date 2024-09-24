@@ -2151,7 +2151,6 @@ static void __exit hpkv_exit(void)
     // Clear the hash table
     hash_for_each_safe(kv_store, bkt, htmp, record, hash_node) {
         hash_del_rcu(&record->hash_node);
-        call_rcu(&record->rcu, record_free_rcu);
     }
 
     // Clear the red-black tree
