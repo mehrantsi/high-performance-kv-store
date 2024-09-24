@@ -2022,7 +2022,7 @@ static int __init hpkv_init(void)
         ret = PTR_ERR(bdev_handle);
         goto error_free_rwsem;
     }
-    bdev = bdev_handle_to_bdev(bdev_handle);
+    bdev = bdev_handle->bdev;
     hpkv_log(HPKV_LOG_INFO, "Block device opened successfully\n");
 
     // Check if the device is valid and get its size
