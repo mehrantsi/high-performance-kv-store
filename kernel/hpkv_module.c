@@ -84,6 +84,9 @@ static bool is_disk_empty(struct block_device *bdev);
 static void flush_write_buffer(void);
 static void write_record_to_disk(struct record *record);
 static int extend_device(loff_t new_size);
+static void flush_work_handler(struct work_struct *work);
+static void write_record_work(struct work_struct *work);
+static void metadata_update_work(struct work_struct *work);
 
 static int major_num;
 static struct kmem_cache *record_cache;
@@ -131,6 +134,7 @@ struct write_buffer_entry {
     struct record *record;
     size_t old_value_len;
     struct list_head list;
+    struct work_struct work;
 };
 
 static LIST_HEAD(write_buffer);
@@ -161,6 +165,9 @@ MODULE_PARM_DESC(initialize_if_empty, "Initialize the device if it's empty (defa
 
 static struct workqueue_struct *compact_wq;
 static struct delayed_work compact_work;
+
+static struct workqueue_struct *flush_wq;
+static struct work_struct flush_work;
 
 #define HPKV_LOG_EMERG   0
 #define HPKV_LOG_ALERT   1
@@ -798,6 +805,7 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
     wb_entry->op = old_record ? OP_UPDATE : OP_INSERT;
     wb_entry->record = new_record;
     wb_entry->old_value_len = old_record ? old_record->value_len : 0;
+    INIT_WORK(&wb_entry->work, write_record_work);
 
     spin_lock(&write_buffer_lock);
     list_add_tail(&wb_entry->list, &write_buffer);
@@ -850,6 +858,7 @@ static int delete_record(const char *key)
     wb_entry->op = OP_DELETE;
     wb_entry->record = record;
     wb_entry->old_value_len = record->value_len;
+    INIT_WORK(&wb_entry->work, write_record_work);
 
     spin_lock(&write_buffer_lock);
     list_add_tail(&wb_entry->list, &write_buffer);
@@ -1058,13 +1067,8 @@ static void flush_write_buffer(void)
     long size_changed = 0;
 
     // Check if purge or compact is in progress
-    if (atomic_read(&purge_in_progress) != 0) {
-        hpkv_log(HPKV_LOG_WARNING, "Purge operation in progress, skipping flush\n");
-        return;
-    }
-
-    if (atomic_read(&compact_in_progress) != 0) {
-        hpkv_log(HPKV_LOG_WARNING, "Compact operation in progress, skipping flush\n");
+    if (atomic_read(&purge_in_progress) != 0 || atomic_read(&compact_in_progress) != 0) {
+        hpkv_log(HPKV_LOG_WARNING, "Purge or compact operation in progress, skipping flush\n");
         return;
     }
 
@@ -1111,12 +1115,7 @@ static void flush_write_buffer(void)
                     hpkv_log(HPKV_LOG_ERR, "Failed to find free sector for key: %s\n", entry->record->key);
                     continue;
                 }
-                write_record_to_disk(entry->record);
-                // After writing to disk, free the in-memory value
-                if (entry->record->value) {
-                    kfree(entry->record->value);
-                    entry->record->value = NULL;
-                }
+                queue_work(flush_wq, &entry->work);
                 break;
 
             case OP_UPDATE:
@@ -1140,12 +1139,7 @@ static void flush_write_buffer(void)
                     hpkv_log(HPKV_LOG_ERR, "Failed to find free sector for key: %s\n", entry->record->key);
                     continue;
                 }
-                write_record_to_disk(entry->record);
-                // After writing to disk, free the in-memory value
-                if (entry->record->value) {
-                    kfree(entry->record->value);
-                    entry->record->value = NULL;
-                }
+                queue_work(flush_wq, &entry->work);
                 break;
 
             case OP_DELETE:
@@ -1166,31 +1160,11 @@ static void flush_write_buffer(void)
 
     // Update metadata after processing all entries
     if (records_changed != 0 || size_changed != 0) {
-        struct buffer_head *bh;
-        struct hpkv_metadata metadata;
-
-        bh = __bread(bdev, HPKV_METADATA_BLOCK, HPKV_BLOCK_SIZE);
-        if (!bh) {
-            hpkv_log(HPKV_LOG_ERR, "Failed to read metadata block for update\n");
-        } else {
-            memcpy(&metadata, bh->b_data, sizeof(struct hpkv_metadata));
-
-            metadata.total_records += records_changed;
-            metadata.total_size += size_changed;
-
-            memcpy(bh->b_data, &metadata, sizeof(struct hpkv_metadata));
-            mark_buffer_dirty(bh);
-            sync_dirty_buffer(bh);
-            brelse(bh);
-
-            hpkv_log(HPKV_LOG_INFO, "Updated metadata - Total records: %llu, Total size: %llu bytes\n",
-                   metadata.total_records, metadata.total_size);
-        }
+        queue_work(flush_wq, &metadata_update_work);
     }
 
-    // At the end of the function, reset the flag
     atomic_set(&flush_in_progress, 0);
-    hpkv_log(HPKV_LOG_INFO, "Finished flush_write_buffer\n");
+    hpkv_log(HPKV_LOG_INFO, "Finished queueing flush operations\n");
 }
 
 static int write_buffer_worker(void *data)
@@ -1218,13 +1192,31 @@ static int write_buffer_worker(void *data)
         // Flush if buffer size threshold is reached or time interval has passed
         if (write_buffer_size() >= WRITE_BUFFER_SIZE || time_after_eq(jiffies, next_flush)) {
             hpkv_log(HPKV_LOG_INFO, "Starting write buffer flush at jiffies: %lu\n", jiffies);
-            flush_write_buffer();
+            // Use a separate workqueue for flushing to avoid scheduling while atomic
+            queue_work(flush_wq, &flush_work);
             next_flush = jiffies + WRITE_BUFFER_FLUSH_INTERVAL;
-            hpkv_log(HPKV_LOG_INFO, "Finished write buffer flush at jiffies: %lu\n", jiffies);
+            hpkv_log(HPKV_LOG_INFO, "Queued write buffer flush at jiffies: %lu\n", jiffies);
         }
     }
 
     return 0;
+}
+
+static void flush_work_handler(struct work_struct *work)
+{
+    flush_write_buffer();
+}
+
+static void write_record_work(struct work_struct *work)
+{
+    struct write_buffer_entry *entry = container_of(work, struct write_buffer_entry, work);
+    write_record_to_disk(entry->record);
+    kfree(entry);
+}
+
+static void metadata_update_work(struct work_struct *work)
+{
+    update_metadata();
 }
 
 static void compact_disk(void)
@@ -2090,10 +2082,21 @@ static int __init hpkv_init(void)
     INIT_DELAYED_WORK(&compact_work, compact_work_handler);
     queue_delayed_work(compact_wq, &compact_work, COMPACT_INTERVAL);
 
+    flush_wq = create_singlethread_workqueue("hpkv_flush");
+    if (!flush_wq) {
+        hpkv_log(HPKV_LOG_ALERT, "Failed to create flush workqueue\n");
+        ret = -ENOMEM;
+        goto error_destroy_compact_wq;
+    }
+
+    INIT_WORK(&flush_work, flush_work_handler);
+
     hpkv_log(HPKV_LOG_INFO, "Module loaded successfully\n");
     hpkv_log(HPKV_LOG_WARNING, "Registered with major number %d\n", major_num);
     return 0;
 
+error_destroy_compact_wq:
+    destroy_workqueue(compact_wq);
 error_remove_proc:
     remove_proc_entry(PROC_ENTRY, NULL);
 error_put_device:
@@ -2195,6 +2198,9 @@ static void __exit hpkv_exit(void)
 
     unregister_chrdev(major_num, DEVICE_NAME);
     percpu_free_rwsem(&rw_sem);
+
+    cancel_work_sync(&flush_work);
+    destroy_workqueue(flush_wq);
 
     hpkv_log(HPKV_LOG_INFO, "Module unloaded successfully\n");
 }
