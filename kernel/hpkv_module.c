@@ -86,7 +86,7 @@ static void write_record_to_disk(struct record *record);
 static int extend_device(loff_t new_size);
 static void flush_work_handler(struct work_struct *work);
 static void write_record_work(struct work_struct *work);
-static void metadata_update_work(struct work_struct *work);
+static void metadata_update_work_func(struct work_struct *work);
 
 static int major_num;
 static struct kmem_cache *record_cache;
@@ -167,7 +167,8 @@ static struct workqueue_struct *compact_wq;
 static struct delayed_work compact_work;
 
 static struct workqueue_struct *flush_wq;
-static struct work_struct flush_work;
+static struct work_struct hpkv_flush_work;
+static DECLARE_WORK(metadata_update_work, metadata_update_work_func);
 
 #define HPKV_LOG_EMERG   0
 #define HPKV_LOG_ALERT   1
@@ -1193,7 +1194,7 @@ static int write_buffer_worker(void *data)
         if (write_buffer_size() >= WRITE_BUFFER_SIZE || time_after_eq(jiffies, next_flush)) {
             hpkv_log(HPKV_LOG_INFO, "Starting write buffer flush at jiffies: %lu\n", jiffies);
             // Use a separate workqueue for flushing to avoid scheduling while atomic
-            queue_work(flush_wq, &flush_work);
+            queue_work(flush_wq, &hpkv_flush_work);
             next_flush = jiffies + WRITE_BUFFER_FLUSH_INTERVAL;
             hpkv_log(HPKV_LOG_INFO, "Queued write buffer flush at jiffies: %lu\n", jiffies);
         }
@@ -1214,7 +1215,7 @@ static void write_record_work(struct work_struct *work)
     kfree(entry);
 }
 
-static void metadata_update_work(struct work_struct *work)
+static void metadata_update_work_func(struct work_struct *work)
 {
     update_metadata();
 }
@@ -2089,7 +2090,7 @@ static int __init hpkv_init(void)
         goto error_destroy_compact_wq;
     }
 
-    INIT_WORK(&flush_work, flush_work_handler);
+    INIT_WORK(&hpkv_flush_work, flush_work_handler);
 
     hpkv_log(HPKV_LOG_INFO, "Module loaded successfully\n");
     hpkv_log(HPKV_LOG_WARNING, "Registered with major number %d\n", major_num);
@@ -2199,7 +2200,7 @@ static void __exit hpkv_exit(void)
     unregister_chrdev(major_num, DEVICE_NAME);
     percpu_free_rwsem(&rw_sem);
 
-    cancel_work_sync(&flush_work);
+    cancel_work_sync(&hpkv_flush_work);
     destroy_workqueue(flush_wq);
 
     hpkv_log(HPKV_LOG_INFO, "Module unloaded successfully\n");
