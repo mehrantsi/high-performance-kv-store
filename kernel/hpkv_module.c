@@ -2154,6 +2154,12 @@ static void __exit hpkv_exit(void)
         call_rcu(&record->rcu, record_free_rcu);
     }
 
+    // Iterate through all items in record_cache and free them
+    while ((objp = kmem_cache_alloc(record_cache, GFP_KERNEL)) != NULL) {
+        struct record *record = (struct record *)objp;
+        call_rcu(&record->rcu, record_free_rcu);
+    }
+
     // Clear cache
     spin_lock(&cache_lock);
     hash_for_each_safe(cache, bkt, tmp, cached, node) {
