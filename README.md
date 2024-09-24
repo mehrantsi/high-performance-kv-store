@@ -88,78 +88,78 @@ HPKV's **scalability is demonstrated by its ability to handle datasets of varyin
 ### Compilation and Installation
 
 1. Clone the repository:
-   ```
+   ```sh
    git clone https://github.com/mehrantsi/kernel-high-performance-kv-store.git
    cd kernel-high-performance-kv-store/kernel
    ```
 
 2. Install Essential Packages:
    First, you need to install the necessary development tools and kernel headers. On Ubuntu or Debian-based systems, you can do this with:
-   ```
+   ```sh
    sudo apt-get update
    sudo apt-get install build-essential linux-headers-$(uname -r)
    ```
    On Red Hat-based systems (like CentOS or Fedora), use:
-   ```
+   ```sh
    sudo yum groupinstall "Development Tools"
    sudo yum install kernel-devel kernel-headers
    ```
    
 3. Verify Kernel Headers:
    Ensure that the kernel headers are installed for your current kernel version:
-   ```
+   ```sh
    ls /lib/modules/$(uname -r)/build
    ```
    
 4. Compile the module:
-   ```
+   ```sh
    make
    ```
    This will compile the `hpkv_module.c` file and create the kernel module `hpkv.ko`.
 
 5. Load the module:
-   ```
+   ```sh
    sudo insmod hpkv.ko
    ```
    You can specify the mount path for the block device by adding a parameter:
-   ```
+   ```sh
    sudo insmod hpkv.ko mount_path="/dev/sdb"
    ```
    You can also specify initialize_if_empty flag to not initialize the disk if it is empty (default is 1):
-   ```
+   ```sh
    sudo insmod hpkv.ko mount_path="/dev/sdb" initialize_if_empty=0
    ```
      
 6. Verify that the module is loaded:
-   ```
+   ```sh
    lsmod | grep hpkv
    ```
 
 7. Create a device node:
    First, check the major number assigned to the module:
-   ```
+   ```sh
    dmesg | grep "hpkv: registered with major number"
    ```
    You should see a line like "hpkv: registered with major number 234" (the number may be different).
 
    Now, create the device node:
-   ```
+   ```sh
    sudo mknod /dev/hpkv c <major_number> 0
    ```
    Replace <major_number> with the number you found in the previous step.
 
 8. Set appropriate permissions for the device node:
-   ```
+   ```sh
    sudo chmod 666 /dev/hpkv
    ```
    This allows read and write access for all users. Adjust the permissions as needed for your security requirements.
 
 9. To unload the module:
-   ```
+   ```sh
    sudo rmmod hpkv
    ```
    Note: Remember to remove the device node when you're done:
-   ```
+   ```sh
    sudo rm /dev/hpkv
    ```
 
