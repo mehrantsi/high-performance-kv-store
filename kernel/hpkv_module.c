@@ -149,6 +149,7 @@ static int cache_count = 0;
 static DEFINE_SPINLOCK(cache_lock);
 
 static struct block_device *bdev;
+static struct bdev_handle *bdev_handle;
 
 static char *mount_path = "/dev/sdb";  // Adjust this to your persistent storage device
 module_param(mount_path, charp, 0644);
@@ -880,6 +881,7 @@ static int delete_record(const char *key)
 static int extend_device(loff_t new_size)
 {
     int ret = 0;
+    struct bdev_handle *bdev_ro_handle = NULL;
     struct block_device *bdev_ro = NULL;
     loff_t current_size = i_size_read(bdev->bd_inode);
     unsigned long new_sectors;
@@ -904,11 +906,12 @@ static int extend_device(loff_t new_size)
     hpkv_log(HPKV_LOG_INFO, "Attempting to extend device to %lld bytes\n", new_size);
 
     // Reopen the block device in read-only mode
-    bdev_ro = bdev_open_by_path(mount_path, FMODE_READ, NULL, NULL);
-    if (IS_ERR(bdev_ro)) {
+    bdev_ro_handle = bdev_open_by_path(mount_path, FMODE_READ, NULL, NULL);
+    if (IS_ERR(bdev_ro_handle)) {
         hpkv_log(HPKV_LOG_ERR, "Failed to reopen block device in read-only mode\n");
-        return PTR_ERR(bdev_ro);
+        return PTR_ERR(bdev_ro_handle);
     }
+    bdev_ro = bdev_handle_to_bdev(bdev_ro_handle);
 
     // Calculate the new number of sectors
     new_sectors = new_size / bdev_ro->bd_disk->queue->limits.logical_block_size;
@@ -930,7 +933,7 @@ static int extend_device(loff_t new_size)
     }
 
     // Close the read-only block device
-    blkdev_put(bdev_ro, FMODE_READ);
+    bdev_release(bdev_ro_handle);
 
     return ret;
 }
@@ -2013,12 +2016,13 @@ static int __init hpkv_init(void)
     }
 
     hpkv_log(HPKV_LOG_INFO, "Attempting to open block device: %s\n", mount_path);
-    bdev = bdev_open_by_path(mount_path, FMODE_READ | FMODE_WRITE, NULL, NULL);
-    if (IS_ERR(bdev)) {
-        hpkv_log(HPKV_LOG_ALERT, "Failed to open block device, error %ld\n", PTR_ERR(bdev));
-        ret = PTR_ERR(bdev);
+    bdev_handle = bdev_open_by_path(mount_path, FMODE_READ | FMODE_WRITE, NULL, NULL);
+    if (IS_ERR(bdev_handle)) {
+        hpkv_log(HPKV_LOG_ALERT, "Failed to open block device, error %ld\n", PTR_ERR(bdev_handle));
+        ret = PTR_ERR(bdev_handle);
         goto error_free_rwsem;
     }
+    bdev = bdev_handle_to_bdev(bdev_handle);
     hpkv_log(HPKV_LOG_INFO, "Block device opened successfully\n");
 
     // Check if the device is valid and get its size
@@ -2093,7 +2097,7 @@ static int __init hpkv_init(void)
 error_remove_proc:
     remove_proc_entry(PROC_ENTRY, NULL);
 error_put_device:
-    blkdev_put(bdev, FMODE_READ | FMODE_WRITE);
+    bdev_release(bdev_handle);
 error_free_rwsem:
     percpu_free_rwsem(&rw_sem);
 error_destroy_cache:
@@ -2170,9 +2174,10 @@ static void __exit hpkv_exit(void)
     percpu_up_write(&rw_sem);
 
     // Close the block device
-    if (bdev) {
+    if (bdev_handle) {
         sync_blockdev(bdev);
-        blkdev_put(bdev, FMODE_READ | FMODE_WRITE);
+        bdev_release(bdev_handle);
+        bdev_handle = NULL;
         bdev = NULL;
     }
 
