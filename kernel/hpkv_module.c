@@ -870,6 +870,7 @@ static int extend_device(loff_t new_size)
 {
     int ret = 0;
     struct block_device *bdev_ro = NULL;
+    struct file *bdev_file = NULL;
     loff_t current_size = i_size_read(bdev->bd_inode);
     unsigned long arg;
 
@@ -899,12 +900,19 @@ static int extend_device(loff_t new_size)
         return PTR_ERR(bdev_ro);
     }
 
+    // Get the file structure for the block device
+    bdev_file = filp_open(mount_path, O_RDONLY, 0);
+    if (IS_ERR(bdev_file)) {
+        hpkv_log(HPKV_LOG_ERR, "Failed to open block device file\n");
+        blkdev_put(bdev_ro, FMODE_READ);
+        return PTR_ERR(bdev_file);
+    }
+
     // Prepare the argument for ioctl
     arg = (unsigned long)new_size;
 
     // Set the new size using ioctl
-    ret = blkdev_ioctl(bdev_ro, BLKBSZSET, (unsigned long)arg);
-
+    ret = vfs_ioctl(bdev_file, BLKBSZSET, (unsigned long)arg);
     if (ret) {
         hpkv_log(HPKV_LOG_ERR, "Failed to set new device size: %d (%s)\n", ret, 
                  ret == -EACCES ? "Permission denied" : 
@@ -935,6 +943,7 @@ static int extend_device(loff_t new_size)
     }
 
     // Close the read-only block device
+    filp_close(bdev_file, NULL);
     blkdev_put(bdev_ro, FMODE_READ);
 
     return ret;
