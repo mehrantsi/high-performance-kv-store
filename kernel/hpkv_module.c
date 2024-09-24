@@ -881,9 +881,8 @@ static int extend_device(loff_t new_size)
 {
     int ret = 0;
     struct block_device *bdev_ro = NULL;
-    struct file *bdev_file = NULL;
     loff_t current_size = i_size_read(bdev->bd_inode);
-    unsigned long arg;
+    unsigned long new_sectors;
 
     hpkv_log(HPKV_LOG_INFO, "Current device size: %lld bytes, Requested size: %lld bytes\n", current_size, new_size);
 
@@ -911,50 +910,26 @@ static int extend_device(loff_t new_size)
         return PTR_ERR(bdev_ro);
     }
 
-    // Get the file structure for the block device
-    bdev_file = filp_open(mount_path, O_RDONLY, 0);
-    if (IS_ERR(bdev_file)) {
-        hpkv_log(HPKV_LOG_ERR, "Failed to open block device file\n");
-        blkdev_put(bdev_ro, FMODE_READ);
-        return PTR_ERR(bdev_file);
-    }
+    // Calculate the new number of sectors
+    new_sectors = new_size / bdev_ro->bd_disk->queue->limits.logical_block_size;
 
-    // Prepare the argument for ioctl
-    arg = (unsigned long)new_size;
+    // Set the new capacity
+    set_capacity(bdev_ro->bd_disk, new_sectors);
+    hpkv_log(HPKV_LOG_INFO, "Set new capacity to %lu sectors\n", new_sectors);
 
-    // Set the new size using ioctl
-    ret = vfs_ioctl(bdev_file, BLKBSZSET, (unsigned long)arg);
+    // Update the size in our main bdev structure
+    i_size_write(bdev->bd_inode, new_size);
+    hpkv_log(HPKV_LOG_INFO, "Updated inode size to %lld bytes\n", new_size);
+
+    // Update metadata with new size
+    ret = update_metadata_size(new_size);
     if (ret) {
-        hpkv_log(HPKV_LOG_ERR, "Failed to set new device size: %d (%s)\n", ret, 
-                 ret == -EACCES ? "Permission denied" : 
-                 ret == -ENOSPC ? "No space left on device" : 
-                 ret == -EFAULT ? "Bad address" : 
-                 ret == -EINVAL ? "Invalid argument" : "Unknown error");
-        if (ret == -EACCES) {
-            hpkv_log(HPKV_LOG_ERR, "Make sure the module has the necessary permissions to resize the block device\n");
-        } else if (ret == -ENOSPC) {
-            hpkv_log(HPKV_LOG_ERR, "The underlying physical device does not have enough space for extension\n");
-        } else if (ret == -EFAULT) {
-            hpkv_log(HPKV_LOG_ERR, "Bad address passed to ioctl. This might be a bug in the module.\n");
-        } else if (ret == -EINVAL) {
-            hpkv_log(HPKV_LOG_ERR, "Invalid argument passed to ioctl. The new size might be invalid.\n");
-        }
+        hpkv_log(HPKV_LOG_ERR, "Failed to update metadata with new size\n");
     } else {
-        loff_t new_actual_size = i_size_read(bdev->bd_inode);
-        hpkv_log(HPKV_LOG_INFO, "Successfully extended device. New size: %lld bytes\n", new_actual_size);
-        
-        // Update the size in our main bdev structure
-        i_size_write(bdev->bd_inode, new_actual_size);
-
-        // Update metadata with new size
-        ret = update_metadata_size(new_actual_size);
-        if (ret) {
-            hpkv_log(HPKV_LOG_ERR, "Failed to update metadata with new size\n");
-        }
+        hpkv_log(HPKV_LOG_INFO, "Successfully updated metadata with new size\n");
     }
 
     // Close the read-only block device
-    filp_close(bdev_file, NULL);
     blkdev_put(bdev_ro, FMODE_READ);
 
     return ret;
