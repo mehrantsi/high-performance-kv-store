@@ -2130,6 +2130,9 @@ static void __exit hpkv_exit(void)
     // Flush remaining entries in the write buffer
     flush_write_buffer();
 
+    // Acquire write lock to prevent any concurrent access
+    percpu_down_write(&rw_sem);
+
     // Clean up any remaining entries in the write buffer
     spin_lock(&write_buffer_lock);
     list_for_each_entry_safe(wb_entry, wb_tmp, &write_buffer, list) {
@@ -2145,19 +2148,15 @@ static void __exit hpkv_exit(void)
     }
     spin_unlock(&write_buffer_lock);
 
-    // Acquire write lock to prevent any concurrent access
-    percpu_down_write(&rw_sem);
-
-    // Clear the hash table
-    hash_for_each_safe(kv_store, bkt, htmp, record, hash_node) {
+   // Clear the hash table and free all records
+    hash_for_each_safe(kv_store, bkt, tmp, record, hash_node) {
         hash_del_rcu(&record->hash_node);
-    }
-
-    // Clear the red-black tree
-    while ((node = rb_first(&records_tree))) {
-        record = rb_entry(node, struct record, tree_node);
-        rb_erase(node, &records_tree);
-        call_rcu(&record->rcu, record_free_rcu);
+        rb_erase(&record->tree_node, &records_tree);
+        if (record->value) {
+            kfree(record->value);
+            record->value = NULL;
+        }
+        kmem_cache_free(record_cache, record);
     }
 
     // Clear cache
