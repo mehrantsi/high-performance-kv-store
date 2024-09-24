@@ -1927,7 +1927,7 @@ static int initialize_empty_device(void)
 
     hpkv_log(HPKV_LOG_INFO, "Initializing empty device\n");
 
-    bh = __getblk(bdev, HPKV_METADATA_BLOCK, BLOCK_SIZE);
+    bh = __getblk(bdev, HPKV_METADATA_BLOCK, HPKV_BLOCK_SIZE);
     if (!bh) {
         hpkv_log(HPKV_LOG_ERR, "Failed to get block for initialization\n");
         return -EIO;
@@ -1939,16 +1939,16 @@ static int initialize_empty_device(void)
     metadata.total_size = 0;
     metadata.version = 1;  // Initial version
 
+    memset(bh->b_data, 0, HPKV_BLOCK_SIZE);  // Clear the block first
     memcpy(bh->b_data, &metadata, sizeof(struct hpkv_metadata));
     mark_buffer_dirty(bh);
     sync_dirty_buffer(bh);
     brelse(bh);
 
     // Set the device size to one block (or more if needed)
-    i_size_write(bdev->bd_inode, BLOCK_SIZE);
+    i_size_write(bdev->bd_inode, HPKV_BLOCK_SIZE);
 
     return ret;
-
 }
 
 static bool is_zero_buffer(const void *buf, size_t size)
@@ -1972,13 +1972,13 @@ static bool is_disk_empty(struct block_device *bdev)
 
     // Check the first few blocks to see if they're all zeros
     for (i = 0; i < 10; i++) {
-        bh = __bread(bdev, i, BLOCK_SIZE);
+        bh = __bread(bdev, i, HPKV_BLOCK_SIZE);
         if (!bh) {
             hpkv_log(HPKV_LOG_ERR, "Failed to read block %d while checking if disk is empty\n", i);
             return false;  // Assume not empty if we can't read
         }
 
-        if (!is_zero_buffer(bh->b_data, BLOCK_SIZE)) {
+        if (!is_zero_buffer(bh->b_data, HPKV_BLOCK_SIZE)) {
             is_empty = false;
             brelse(bh);
             break;
