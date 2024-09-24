@@ -2151,11 +2151,7 @@ static void __exit hpkv_exit(void)
     hash_for_each_safe(kv_store, bkt, tmp, record, hash_node) {
         hash_del_rcu(&record->hash_node);
         rb_erase(&record->tree_node, &records_tree);
-        if (record->value) {
-            kfree(record->value);
-            record->value = NULL;
-        }
-        kmem_cache_free(record_cache, record);
+        call_rcu(&record->rcu, record_free_rcu);
     }
 
     // Clear cache
@@ -2188,9 +2184,6 @@ static void __exit hpkv_exit(void)
     
     // Destroy the cache after a short delay to ensure all operations are complete
     msleep(100);
-
-    // Log the number of objects in the cache before destroying it
-    hpkv_log(HPKV_LOG_INFO, "Number of records before cache destruction: %d\n", atomic_read(&record_count));
 
     // Destroy the cache
     kmem_cache_destroy(record_cache);
