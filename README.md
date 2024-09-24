@@ -72,6 +72,10 @@ The use of kernel-space operations and optimized data structures allows HPKV to 
 
 HPKV's **scalability is demonstrated by its ability to handle datasets of varying sizes with minimal performance degradation**, particularly for read operations. This makes it a versatile choice for applications with growing data needs.
 
+## Technical Design
+
+For a detailed technical design of the HPKV module, please refer to the [Technical Design Document](TechnicalDesign.md).
+
 ## Getting Started
 
 ### Prerequisites
@@ -236,10 +240,6 @@ gcc -o myprogram myprogram.c
 ```
 
 Note: Depending on the permissions you set for the device node, you may need to run the program with sudo.
-
-## Technical Design
-
-For a detailed technical design of the HPKV module, please refer to the [Technical Design Document](TechnicalDesign.md).
 
 ## Contributing
 
