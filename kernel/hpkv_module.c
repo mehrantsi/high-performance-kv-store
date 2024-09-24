@@ -893,7 +893,7 @@ static int extend_device(loff_t new_size)
     hpkv_log(HPKV_LOG_INFO, "Attempting to extend device to %lld bytes\n", new_size);
 
     // Reopen the block device in read-only mode
-    bdev_ro = blkdev_get_by_path(mount_path, FMODE_READ, NULL);
+    bdev_ro = blkdev_get_by_path(mount_path, FMODE_READ, NULL, bdev_ro);
     if (IS_ERR(bdev_ro)) {
         hpkv_log(HPKV_LOG_ERR, "Failed to reopen block device in read-only mode\n");
         return PTR_ERR(bdev_ro);
@@ -903,7 +903,7 @@ static int extend_device(loff_t new_size)
     arg = (unsigned long)new_size;
 
     // Set the new size using ioctl
-    ret = ioctl_by_bdev(bdev_ro, BLKBSZSET, arg);
+    ret = blkdev_ioctl(bdev_ro, BLKBSZSET, (unsigned long)arg);
 
     if (ret) {
         hpkv_log(HPKV_LOG_ERR, "Failed to set new device size: %d (%s)\n", ret, 
@@ -935,7 +935,7 @@ static int extend_device(loff_t new_size)
     }
 
     // Close the read-only block device
-    blkdev_put(bdev_ro, NULL);
+    blkdev_put(bdev_ro, FMODE_READ);
 
     return ret;
 }
