@@ -911,7 +911,7 @@ static int extend_device(loff_t new_size)
         hpkv_log(HPKV_LOG_ERR, "Failed to reopen block device in read-only mode\n");
         return PTR_ERR(bdev_ro_handle);
     }
-    bdev_ro = bdev_handle_to_bdev(bdev_ro_handle);
+    bdev_ro = bdev_ro_handle->bdev;
 
     // Calculate the new number of sectors
     new_sectors = new_size / bdev_ro->bd_disk->queue->limits.logical_block_size;
