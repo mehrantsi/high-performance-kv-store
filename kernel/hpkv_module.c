@@ -2111,7 +2111,6 @@ static void __exit hpkv_exit(void)
     int bkt;
     struct cached_record *cached;
     struct write_buffer_entry *wb_entry, *wb_tmp;
-    void *objp;
 
     hpkv_log(HPKV_LOG_INFO, "Starting module unload\n");
 
@@ -2152,12 +2151,6 @@ static void __exit hpkv_exit(void)
     hash_for_each_safe(kv_store, bkt, tmp, record, hash_node) {
         hash_del_rcu(&record->hash_node);
         rb_erase(&record->tree_node, &records_tree);
-        call_rcu(&record->rcu, record_free_rcu);
-    }
-
-    // Iterate through all items in record_cache and free them
-    while ((objp = kmem_cache_alloc(record_cache, GFP_KERNEL)) != NULL) {
-        struct record *record = (struct record *)objp;
         call_rcu(&record->rcu, record_free_rcu);
     }
 
