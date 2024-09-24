@@ -24,6 +24,10 @@ Key features of its operation include:
 - Efficient memory management using kernel slabs
 - Optimized disk I/O with block device operations
 - Concurrent access support with fine-grained locking
+- Write buffering to batch write operations and reduce latency
+- Automatic disk compaction to optimize disk usage
+- Support for partial updates to existing records
+- Robust error handling and recovery mechanisms
 
 ## Features
 
@@ -45,12 +49,12 @@ Here's a table showing the performance of HPKV for different dataset sizes:
 
 | Number of Records | Write Latency (ms) | Write Std Dev (ms) | Read Latency (ms) | Read Std Dev (ms) |
 |-------------------|--------------------|--------------------|-------------------|--------------------|
-| 100               | 0.086              | 0.226              | 0.001             | 0.000              |
-| 1,000             | 0.157              | 0.029              | 0.000             | 0.000              |
-| 10,000            | 1.517              | 0.895              | 0.001             | 0.001              |
-| 100,000           | 19.794             | 8.154              | 0.001             | 0.000              |
+| 100               | 0.005              | 3.593              | 0.001             | 0.001              |
+| 1,000             | 0.007              | 0.023              | 0.002             | 0.002              |
+| 10,000            | 0.002              | 0.019              | 0.001             | 0.039              |
+| 100,000           | 0.002              | 0.023              | 0.001             | 1.517              |
 
-As shown, HPKV maintains **exceptionally low read latencies** even as the dataset size increases. Write performance scales linearly with dataset size, remaining highly competitive.
+As shown, HPKV maintains **exceptionally low read/write latencies** even as the dataset size increases. Write performance is highly competitive, thanks to the write buffer that batches write operations to reduce latency. This means that it takes more time to persist the data to disk (under 20ms for 100,000 sequential writes), but thanks to in-memory structures, whihch makes inserted/updated records immediately available, the apparent write latency is in the order of a few microseconds.
 
 ## Advantages
 
@@ -65,8 +69,6 @@ As shown, HPKV maintains **exceptionally low read latencies** even as the datase
 HPKV is designed to **excel in environments requiring low-latency access to medium-sized datasets**. Its performance shines particularly for read-heavy workloads, making it ideal for caching layers and real-time data retrieval scenarios.
 
 The use of kernel-space operations and optimized data structures allows HPKV to **maintain consistent, microsecond-level read latencies** even as the dataset grows to hundreds of thousands of records.
-
-While write performance does increase with dataset size, it remains highly competitive, with median latencies staying under 20ms even for 100,000 records.
 
 HPKV's **scalability is demonstrated by its ability to handle datasets of varying sizes with minimal performance degradation**, particularly for read operations. This makes it a versatile choice for applications with growing data needs.
 
@@ -165,7 +167,35 @@ HPKV's **scalability is demonstrated by its ability to handle datasets of varyin
 
 After loading the module and creating the device node, you can interact with it through the `/dev/hpkv` device file. Use standard file operations to read and write data.
 
-Example usage in C:
+#### Example Usage from Terminal
+
+1. **Insert/Update a key-value pair:**
+
+   ```sh
+   echo -n "mykey:myvalue" | sudo tee /dev/hpkv
+   ```
+
+2. **Read a value by key:**
+
+   ```sh
+   echo -n "mykey" | sudo tee /dev/hpkv
+   sudo cat /dev/hpkv
+   ```
+
+3. **Delete a key-value pair:**
+
+   ```sh
+   echo -n "mykey" | sudo tee /dev/hpkv
+   sudo ioctl /dev/hpkv 1
+   ```
+
+4. **Partial update of a key-value pair:**
+
+   ```sh
+   echo -n "mykey:+partialupdate" | sudo tee /dev/hpkv
+   ```
+
+#### Example Usage in C
 
 ```c
 #include <fcntl.h>
@@ -206,6 +236,10 @@ gcc -o myprogram myprogram.c
 ```
 
 Note: Depending on the permissions you set for the device node, you may need to run the program with sudo.
+
+## Technical Design
+
+For a detailed technical design of the HPKV module, please refer to the [Technical Design Document](TechnicalDesign.md).
 
 ## Contributing
 
