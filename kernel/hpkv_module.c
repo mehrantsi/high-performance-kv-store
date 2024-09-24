@@ -2190,15 +2190,7 @@ static void __exit hpkv_exit(void)
     msleep(100);
 
     // Log the number of objects in the cache before destroying it
-    {
-        unsigned int count = 0;
-        void *objp;
-
-        kmem_cache_for_each_slot(objp, record_cache, count) {
-            hpkv_log(HPKV_LOG_WARNING, "Object still in cache: %p\n", objp);
-        }
-        hpkv_log(HPKV_LOG_INFO, "Number of objects in cache before destruction: %u\n", count);
-    }
+    hpkv_log(HPKV_LOG_INFO, "Number of records before cache destruction: %d\n", atomic_read(&record_count));
 
     // Destroy the cache
     kmem_cache_destroy(record_cache);
