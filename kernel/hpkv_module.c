@@ -2111,6 +2111,7 @@ static void __exit hpkv_exit(void)
     int bkt;
     struct cached_record *cached;
     struct write_buffer_entry *wb_entry, *wb_tmp;
+    void *objp;
 
     hpkv_log(HPKV_LOG_INFO, "Starting module unload\n");
 
