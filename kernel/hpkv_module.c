@@ -210,19 +210,27 @@ static u32 djb2_hash(const char *str, size_t len)
 
 static struct record *search_record_in_memory(const char *key)
 {
-    struct rb_node *node = records_tree.rb_node;
+    struct rb_node *node;
+    struct record *data;
+    int result;
+
+    rcu_read_lock();
+    node = records_tree.rb_node;
 
     while (node) {
-        struct record *data = container_of(node, struct record, tree_node);
-        int result = strcmp(key, data->key);
+        data = container_of(node, struct record, tree_node);
+        result = strcmp(key, data->key);
 
         if (result < 0)
             node = node->rb_left;
         else if (result > 0)
             node = node->rb_right;
-        else
+        else {
+            rcu_read_unlock();
             return data;
+        }
     }
+    rcu_read_unlock();
     return NULL;
 }
 
@@ -861,6 +869,9 @@ static int delete_record(const char *key)
         }
     }
     spin_unlock(&cache_lock);
+
+    // Register RCU callback to free the record
+    call_rcu(&record->rcu, record_free_rcu);
 
     hpkv_log(HPKV_LOG_INFO, "Successfully queued delete operation for key: %s\n", key);
     return ret;
