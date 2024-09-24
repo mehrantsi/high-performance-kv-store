@@ -2123,9 +2123,6 @@ static void __exit hpkv_exit(void)
     cancel_delayed_work_sync(&compact_work);
     destroy_workqueue(compact_wq);
 
-    // Flush remaining entries in the write buffer
-    flush_write_buffer();
-
     // Stop the write buffer thread
     if (write_buffer_thread) {
         write_buffer_exit = true;
