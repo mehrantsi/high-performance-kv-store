@@ -13,6 +13,10 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - name: Setup Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install build-essential linux-headers-$(uname -r)
     - name: make
       run: make
       working-directory: ./kernel
