@@ -1089,6 +1089,7 @@ static void flush_write_buffer(void)
 
     hpkv_log(HPKV_LOG_INFO, "Starting flush_write_buffer\n");
 
+    // Move entries to a local list to minimize lock contention
     spin_lock(&write_buffer_lock);
     list_splice_init(&write_buffer, &local_list);
     spin_unlock(&write_buffer_lock);
@@ -1101,73 +1102,28 @@ static void flush_write_buffer(void)
             continue;
         }
 
+        // Queue the work without holding any locks
+        queue_work(flush_wq, &entry->work);
+
         switch (entry->op) {
             case OP_INSERT:
                 records_changed++;
                 size_changed += entry->record->value_len;
-                    spin_lock(&write_buffer_lock);
-                entry->record->sector = find_free_sector(entry->record->value_len);
-                    spin_unlock(&write_buffer_lock);
-                if (entry->record->sector == -ENOSPC) {
-                    // Handle device extension
-                    loff_t new_size = i_size_read(bdev->bd_inode) + EXTENSION_SIZE;
-                    int ret = extend_device(new_size);
-                    if (ret < 0) {
-                        hpkv_log(HPKV_LOG_ERR, "Failed to extend device, skipping record: %s\n", entry->record->key);
-                        continue;
-                    }
-                        spin_lock(&write_buffer_lock);
-                    entry->record->sector = find_free_sector(entry->record->value_len);
-                        spin_unlock(&write_buffer_lock);
-                }
-                if (entry->record->sector < 0) {
-                    hpkv_log(HPKV_LOG_ERR, "Failed to find free sector for key: %s\n", entry->record->key);
-                    continue;
-                }
-                queue_work(flush_wq, &entry->work);
                 break;
-
             case OP_UPDATE:
                 size_changed += (long)entry->record->value_len - (long)entry->old_value_len;
-                    spin_lock(&write_buffer_lock);
-                entry->record->sector = find_free_sector(entry->record->value_len);
-                    spin_unlock(&write_buffer_lock);
-                if (entry->record->sector == -ENOSPC) {
-                    // Handle device extension
-                    loff_t new_size = i_size_read(bdev->bd_inode) + EXTENSION_SIZE;
-                    int ret = extend_device(new_size);
-                    if (ret < 0) {
-                        hpkv_log(HPKV_LOG_ERR, "Failed to extend device, skipping record: %s\n", entry->record->key);
-                        continue;
-                    }
-                        spin_lock(&write_buffer_lock);
-                    entry->record->sector = find_free_sector(entry->record->value_len);
-                        spin_unlock(&write_buffer_lock);
-                }
-                if (entry->record->sector < 0) {
-                    hpkv_log(HPKV_LOG_ERR, "Failed to find free sector for key: %s\n", entry->record->key);
-                    continue;
-                }
-                queue_work(flush_wq, &entry->work);
                 break;
-
             case OP_DELETE:
                 records_changed--;
                 size_changed -= entry->old_value_len;
-                mark_sector_as_deleted(entry->record->sector);
-                if (entry->record->value) {
-                    kfree(entry->record->value);
-                    entry->record->value = NULL;
-                }
-                kmem_cache_free(record_cache, entry->record);
                 break;
         }
 
         list_del(&entry->list);
-        kfree(entry);
+        // Don't free the entry here, it will be freed after the work is done
     }
 
-    // Update metadata after processing all entries
+    // Queue metadata update work
     if (records_changed != 0 || size_changed != 0) {
         queue_work(flush_wq, &metadata_update_work);
     }
@@ -1223,7 +1179,28 @@ static void flush_work_handler(struct work_struct *work)
 static void write_record_work(struct work_struct *work)
 {
     struct write_buffer_entry *entry = container_of(work, struct write_buffer_entry, work);
-    write_record_to_disk(entry->record);
+    
+    if (!entry || !entry->record) {
+        hpkv_log(HPKV_LOG_ERR, "Invalid entry or record in write_record_work\n");
+        return;
+    }
+
+    switch (entry->op) {
+        case OP_INSERT:
+        case OP_UPDATE:
+            write_record_to_disk(entry->record);
+            break;
+        case OP_DELETE:
+            mark_sector_as_deleted(entry->record->sector);
+            if (entry->record->value) {
+                kfree(entry->record->value);
+                entry->record->value = NULL;
+            }
+            kmem_cache_free(record_cache, entry->record);
+            break;
+    }
+
+    // Free the entry after processing
     kfree(entry);
 }
 
@@ -2042,7 +2019,7 @@ static int __init hpkv_init(void)
     spin_lock_init(&write_buffer_lock);
     init_waitqueue_head(&write_buffer_wait);
 
-    flush_wq = create_singlethread_workqueue("hpkv_flush");
+    flush_wq = alloc_workqueue("hpkv_flush", WQ_UNBOUND | WQ_HIGHPRI, 4);
     if (!flush_wq) {
         hpkv_log(HPKV_LOG_ALERT, "Failed to create flush workqueue\n");
         ret = -ENOMEM;
