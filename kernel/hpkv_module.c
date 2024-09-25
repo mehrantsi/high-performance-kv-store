@@ -1254,13 +1254,12 @@ static bool flush_workqueue_timeout(struct workqueue_struct *wq, unsigned long t
 
 static void cancel_remaining_work(struct workqueue_struct *wq)
 {
-    struct work_struct *work, *n;
-
-    list_for_each_entry_safe(work, n, &wq->worklist, entry) {
-        if (work_busy(work)) {
-            cancel_work_sync(work);
-            hpkv_log(HPKV_LOG_WARNING, "Cancelled work item due to timeout\n");
-        }
+    // Flush the workqueue one last time with a short timeout
+    if (!flush_workqueue_timeout(wq, msecs_to_jiffies(100))) {
+        // If there's still work remaining, we'll have to cancel the entire workqueue
+        cancel_work_sync(&hpkv_flush_work);
+        cancel_work_sync(&metadata_update_work);
+        hpkv_log(HPKV_LOG_WARNING, "Cancelled remaining work items due to timeout\n");
     }
 }
 
