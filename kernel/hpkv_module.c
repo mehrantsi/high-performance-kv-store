@@ -1520,7 +1520,13 @@ static int purge_data(void)
 
     // Check if compact is in progress
     if (atomic_read(&compact_in_progress) != 0) {
-        hpkv_log(HPKV_LOG_WARNING, "Compact operation in progress, skipping flush\n");
+        hpkv_log(HPKV_LOG_WARNING, "Compact operation in progress, cannot start purge\n");
+        return -EBUSY;
+    }
+
+    // Check again if there are entries in the write buffer
+    if (write_buffer_size() > 0) {
+        hpkv_log(HPKV_LOG_WARNING, "Write buffer is not empty after flush, cannot start purge\n");
         return -EBUSY;
     }
 
