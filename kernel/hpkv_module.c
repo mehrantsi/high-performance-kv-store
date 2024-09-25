@@ -179,6 +179,10 @@ static bool force_initialize = false;
 module_param(force_initialize, bool, 0644);
 MODULE_PARM_DESC(force_initialize, "Force initialize the device even if it contains data (default: false)");
 
+static bool force_read_disk = false;
+module_param(force_read_disk, bool, 0644);
+MODULE_PARM_DESC(force_read_disk, "Force reading the entire disk even beyond metadata size (default: false)");
+
 static struct workqueue_struct *compact_wq;
 static struct delayed_work compact_work;
 
@@ -1794,7 +1798,7 @@ static int load_indexes(void)
     struct hpkv_metadata metadata;
     sector_t sector = 1;  // Start from sector 1, as sector 0 is reserved for metadata
     char *buffer;
-    loff_t device_size;
+    loff_t device_size, read_size;
     bool corruption_detected = false;
     int ret = 0;
 
@@ -1825,6 +1829,15 @@ static int load_indexes(void)
     device_size = i_size_read(bdev->bd_inode);
     hpkv_log(HPKV_LOG_INFO, "Device size: %lld bytes\n", device_size);
 
+    // Determine how much of the disk to read
+    if (force_read_disk) {
+        read_size = device_size;
+        hpkv_log(HPKV_LOG_INFO, "Force reading entire disk: %lld bytes\n", read_size);
+    } else {
+        read_size = min_t(loff_t, metadata.total_size, device_size);
+        hpkv_log(HPKV_LOG_INFO, "Reading up to metadata size: %lld bytes\n", read_size);
+    }
+
     buffer = vmalloc(HPKV_BLOCK_SIZE);
     if (!buffer) {
         hpkv_log(HPKV_LOG_ERR, "Failed to allocate buffer for load_indexes\n");
@@ -1832,7 +1845,7 @@ static int load_indexes(void)
         goto out;
     }
 
-    while (sector * HPKV_BLOCK_SIZE < device_size) {
+    while (sector * HPKV_BLOCK_SIZE < read_size) {
         hpkv_log(HPKV_LOG_INFO, "Reading sector %llu\n", (unsigned long long)sector);
         
         bh = __bread(bdev, sector, HPKV_BLOCK_SIZE);
