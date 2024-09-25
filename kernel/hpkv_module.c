@@ -107,6 +107,7 @@ struct hpkv_metadata {
     char signature[HPKV_SIGNATURE_SIZE];
     uint64_t total_records;
     uint64_t total_size;
+    uint64_t device_size;
     uint32_t version;
 };
 
@@ -659,9 +660,10 @@ static int update_metadata(void)
 
     memcpy(&metadata, bh->b_data, sizeof(struct hpkv_metadata));
 
-    // Only update the fields we should change, leave the signature intact
+    // Update the fields
     metadata.total_records = atomic_read(&record_count);
     metadata.total_size = atomic_long_read(&total_disk_usage);
+    metadata.device_size = i_size_read(bdev->bd_inode);  // Update the actual device size
 
     // Write back the updated metadata
     lock_buffer(bh);
@@ -674,8 +676,8 @@ static int update_metadata(void)
     if (ret) {
         hpkv_log(HPKV_LOG_ERR, "Failed to sync updated metadata\n");
     } else {
-        hpkv_log(HPKV_LOG_INFO, "Updated metadata - Total records: %llu, Total size: %llu bytes, Version: %u\n",
-               metadata.total_records, metadata.total_size, metadata.version);
+        hpkv_log(HPKV_LOG_INFO, "Updated metadata - Total records: %llu, Total size: %llu bytes, Device size: %llu bytes, Version: %u\n",
+               metadata.total_records, metadata.total_size, metadata.device_size, metadata.version);
     }
 
     brelse(bh);
@@ -1835,19 +1837,19 @@ static int load_indexes(void)
     }
 
     hpkv_log(HPKV_LOG_INFO, "Valid signature found. Loading existing data.\n");
-    hpkv_log(HPKV_LOG_INFO, "Total records: %llu, Total size: %llu bytes, Version: %u\n", 
-           metadata.total_records, metadata.total_size, metadata.version);
+    hpkv_log(HPKV_LOG_INFO, "Total records: %llu, Total size: %llu bytes, Device size: %llu bytes, Version: %u\n", 
+           metadata.total_records, metadata.total_size, metadata.device_size, metadata.version);
 
     device_size = i_size_read(bdev->bd_inode);
-    hpkv_log(HPKV_LOG_INFO, "Device size: %lld bytes\n", device_size);
+    hpkv_log(HPKV_LOG_INFO, "Current device size: %lld bytes\n", device_size);
 
     // Determine how much of the disk to read
     if (force_read_disk) {
         read_size = device_size;
         hpkv_log(HPKV_LOG_INFO, "Force reading entire disk: %lld bytes\n", read_size);
     } else {
-        read_size = min_t(loff_t, metadata.total_size, device_size);
-        hpkv_log(HPKV_LOG_INFO, "Reading up to metadata size: %lld bytes\n", read_size);
+        read_size = min_t(loff_t, metadata.device_size, device_size);
+        hpkv_log(HPKV_LOG_INFO, "Reading up to metadata device size: %lld bytes\n", read_size);
     }
 
     buffer = vmalloc(HPKV_BLOCK_SIZE);
@@ -2078,6 +2080,7 @@ static int initialize_empty_device(void)
     memcpy(metadata.signature, HPKV_SIGNATURE, HPKV_SIGNATURE_SIZE);
     metadata.total_records = 0;
     metadata.total_size = 0;
+    metadata.device_size = i_size_read(bdev->bd_inode);  // Set the initial device size
     metadata.version = 1;  // Initial version
 
     lock_buffer(bh);
@@ -2094,8 +2097,7 @@ static int initialize_empty_device(void)
     
     brelse(bh);
 
-    // Set the device size to one block (or more if needed)
-    i_size_write(bdev->bd_inode, HPKV_BLOCK_SIZE);
+    hpkv_log(HPKV_LOG_INFO, "Device initialized with size: %llu bytes\n", metadata.device_size);
 
     return ret;
 }
