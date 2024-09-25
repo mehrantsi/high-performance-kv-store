@@ -1,4 +1,4 @@
-# Kernel Space, High-Performance KV Store (HPKV)
+# High-Performance KV Store (HPKV)
 
 HPKV is a high-performance, kernel-space key-value store designed for Linux systems. It offers exceptional read and write performance, especially for datasets ranging from 10,000 to 1,000,000 records.
 
