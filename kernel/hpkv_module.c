@@ -2355,9 +2355,6 @@ static void __exit hpkv_exit(void)
     cancel_work_sync(&hpkv_flush_work);
     destroy_workqueue(flush_wq);
 
-    // Wait for any ongoing flush to complete
-    wait_for_completion(&flush_completion);
-
     hpkv_log(HPKV_LOG_INFO, "Module unloaded successfully\n");
 }
 
