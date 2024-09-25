@@ -1240,7 +1240,7 @@ static bool flush_workqueue_timeout(struct workqueue_struct *wq, unsigned long t
     unsigned long expire = jiffies + timeout;
 
     while (time_before(jiffies, expire)) {
-        if (workqueue_active(wq) == 0)
+        if (work_busy(&hpkv_flush_work) == 0 && work_busy(&metadata_update_work) == 0)
             return true;
         
         if (signal_pending(current))
@@ -1249,7 +1249,7 @@ static bool flush_workqueue_timeout(struct workqueue_struct *wq, unsigned long t
         schedule_timeout_interruptible(HZ/10); // Sleep for 100ms
     }
 
-    return workqueue_active(wq) == 0;
+    return (work_busy(&hpkv_flush_work) == 0 && work_busy(&metadata_update_work) == 0);
 }
 
 static void cancel_remaining_work(struct workqueue_struct *wq)
