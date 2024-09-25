@@ -46,6 +46,7 @@
 #define MAX_DEVICE_SIZE (1ULL << 40)  // 1 TB, adjust as needed
 #define EXTENSION_SIZE (256 * 1024)  // Extend by 256KB at a time
 #define SECTORS_BITMAP_SIZE (MAX_DEVICE_SIZE / HPKV_BLOCK_SIZE)
+#define WORK_TIMEOUT_MS 5000  // 5 seconds timeout for individual work items
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Mehran Toosi");
@@ -92,7 +93,6 @@ static void write_record_work(struct work_struct *work);
 static void metadata_update_work_func(struct work_struct *work);
 static void release_sectors(sector_t start_sector, size_t size);
 static bool flush_workqueue_timeout(struct workqueue_struct *wq, unsigned long timeout);
-static void cancel_remaining_work(struct workqueue_struct *wq);
 
 static int major_num;
 static struct kmem_cache *record_cache;
@@ -142,6 +142,8 @@ struct write_buffer_entry {
     size_t old_value_len;
     struct list_head list;
     struct work_struct work;
+    struct completion work_done;
+    atomic_t work_status;  // 0: not started, 1: in progress, 2: completed, 3: timed out
 };
 
 static LIST_HEAD(write_buffer);
@@ -1143,90 +1145,60 @@ static void flush_write_buffer(void)
     int records_changed = 0;
     long size_changed = 0;
     unsigned long timeout;
-    bool buffer_was_empty = false;
 
-    // Check if purge or compact is in progress
-    if (atomic_read(&purge_in_progress) != 0 || atomic_read(&compact_in_progress) != 0) {
-        hpkv_log(HPKV_LOG_WARNING, "Purge or compact operation in progress, skipping flush\n");
-        return;
-    }
-
-    // Try to set the flush_running flag
     if (atomic_cmpxchg(&flush_running, 0, 1) != 0) {
         hpkv_log(HPKV_LOG_INFO, "Flush already in progress, waiting for completion\n");
-        timeout = wait_for_completion_timeout(&flush_completion, msecs_to_jiffies(5000));
-        if (timeout == 0) {
-            hpkv_log(HPKV_LOG_WARNING, "Flush wait timed out after 5 seconds\n");
-            atomic_set(&flush_running, 0);
-            return;
-        }
+        wait_for_completion_timeout(&flush_completion, msecs_to_jiffies(10000));
+        return;
     }
 
     reinit_completion(&flush_completion);
 
     hpkv_log(HPKV_LOG_INFO, "Starting flush_write_buffer\n");
 
-    // Move entries to a local list to minimize lock contention
     spin_lock(&write_buffer_lock);
-    if (list_empty(&write_buffer)) {
-        buffer_was_empty = true;
-    } else {
-        list_splice_init(&write_buffer, &local_list);
-    }
+    list_splice_init(&write_buffer, &local_list);
     spin_unlock(&write_buffer_lock);
-
-    if (buffer_was_empty) {
-        hpkv_log(HPKV_LOG_INFO, "Write buffer is empty, nothing to flush\n");
-        atomic_set(&flush_running, 0);
-        complete(&flush_completion);
-        return;
-    }
 
     list_for_each_entry_safe(entry, tmp, &local_list, list) {
         if (!entry || !entry->record) {
-            hpkv_log(HPKV_LOG_WARNING, "Encountered null entry or record in write buffer\n");
             list_del(&entry->list);
             kfree(entry);
             continue;
         }
 
-        // Queue the work without holding any locks
-        if (!flush_wq) {
-            hpkv_log(HPKV_LOG_ERR, "Flush workqueue is not available\n");
-            break;
-        }
+        init_completion(&entry->work_done);
+        atomic_set(&entry->work_status, 0);
         queue_work(flush_wq, &entry->work);
 
-        switch (entry->op) {
-            case OP_INSERT:
-                records_changed++;
-                size_changed += entry->record->value_len;
-                break;
-            case OP_UPDATE:
-                size_changed += (long)entry->record->value_len - (long)entry->old_value_len;
-                break;
-            case OP_DELETE:
-                records_changed--;
-                size_changed -= entry->old_value_len;
-                break;
+        timeout = wait_for_completion_timeout(&entry->work_done, msecs_to_jiffies(WORK_TIMEOUT_MS));
+        if (timeout == 0) {
+            hpkv_log(HPKV_LOG_WARNING, "Work item timed out for key: %s\n", entry->record->key);
+            cancel_work_sync(&entry->work);
+        }
+
+        if (atomic_read(&entry->work_status) == 2) {  // Completed successfully
+            switch (entry->op) {
+                case OP_INSERT:
+                    records_changed++;
+                    size_changed += entry->record->value_len;
+                    break;
+                case OP_UPDATE:
+                    size_changed += (long)entry->record->value_len - (long)entry->old_value_len;
+                    break;
+                case OP_DELETE:
+                    records_changed--;
+                    size_changed -= entry->old_value_len;
+                    break;
+            }
         }
 
         list_del(&entry->list);
-        // Don't free the entry here, it will be freed after the work is done
+        kfree(entry);
     }
 
-    // Queue metadata update work
-    if (records_changed != 0 || size_changed != 0 && flush_wq) {
-        queue_work(flush_wq, &metadata_update_work);
-    }
-
-    // Wait for all queued work to complete with a timeout
-    if (flush_wq) {
-        timeout = msecs_to_jiffies(10000); // 10 seconds timeout
-        if (!flush_workqueue_timeout(flush_wq, timeout)) {
-            hpkv_log(HPKV_LOG_ERR, "Flush workqueue timed out after 10 seconds\n");
-            cancel_remaining_work(flush_wq);
-        }
+    if (records_changed != 0 || size_changed != 0) {
+        update_metadata();
     }
 
     atomic_set(&flush_running, 0);
@@ -1237,29 +1209,39 @@ static void flush_write_buffer(void)
 static bool flush_workqueue_timeout(struct workqueue_struct *wq, unsigned long timeout)
 {
     unsigned long expire = jiffies + timeout;
+    struct work_struct *work;
+    struct write_buffer_entry *entry;
+    bool all_completed = true;
 
     while (time_before(jiffies, expire)) {
-        if (work_busy(&hpkv_flush_work) == 0 && work_busy(&metadata_update_work) == 0)
+        all_completed = true;
+        list_for_each_entry(work, &wq->worklist, entry) {
+            entry = container_of(work, struct write_buffer_entry, work);
+            if (atomic_read(&entry->work_status) < 2) {  // Not completed
+                all_completed = false;
+                break;
+            }
+        }
+
+        if (all_completed)
             return true;
-        
+
         if (signal_pending(current))
             break;
-        
-        schedule_timeout_interruptible(HZ/10); // Sleep for 100ms
+
+        schedule_timeout_interruptible(HZ/10);  // Sleep for 100ms
     }
 
-    return (work_busy(&hpkv_flush_work) == 0 && work_busy(&metadata_update_work) == 0);
-}
-
-static void cancel_remaining_work(struct workqueue_struct *wq)
-{
-    // Flush the workqueue one last time with a short timeout
-    if (!flush_workqueue_timeout(wq, msecs_to_jiffies(100))) {
-        // If there's still work remaining, we'll have to cancel the entire workqueue
-        cancel_work_sync(&hpkv_flush_work);
-        cancel_work_sync(&metadata_update_work);
-        hpkv_log(HPKV_LOG_WARNING, "Cancelled remaining work items due to timeout\n");
+    // Timeout occurred, mark unfinished work as timed out
+    list_for_each_entry(work, &wq->worklist, entry) {
+        entry = container_of(work, struct write_buffer_entry, work);
+        if (atomic_read(&entry->work_status) < 2) {
+            atomic_set(&entry->work_status, 3);  // Mark as timed out
+            complete(&entry->work_done);
+        }
     }
+
+    return false;
 }
 
 static int write_buffer_worker(void *data)
@@ -1309,11 +1291,14 @@ static void flush_work_handler(struct work_struct *work)
 static void write_record_work(struct work_struct *work)
 {
     struct write_buffer_entry *entry = container_of(work, struct write_buffer_entry, work);
+    unsigned long timeout;
     
     if (!entry || !entry->record) {
         hpkv_log(HPKV_LOG_ERR, "Invalid entry or record in write_record_work\n");
         return;
     }
+
+    atomic_set(&entry->work_status, 1);  // Mark as in progress
 
     switch (entry->op) {
         case OP_INSERT:
@@ -1322,13 +1307,12 @@ static void write_record_work(struct work_struct *work)
             break;
         case OP_DELETE:
             mark_sector_as_deleted(entry->record->sector);
-            // Use RCU to free the record
             call_rcu(&entry->record->rcu, record_free_rcu);
             break;
     }
 
-    // Free the entry after processing
-    kfree(entry);
+    atomic_set(&entry->work_status, 2);  // Mark as completed
+    complete(&entry->work_done);
 }
 
 static void metadata_update_work_func(struct work_struct *work)
