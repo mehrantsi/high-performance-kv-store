@@ -1212,7 +1212,7 @@ static bool flush_workqueue_timeout(struct workqueue_struct *wq, unsigned long t
     bool all_completed = false;
 
     while (time_before(jiffies, expire)) {
-        if (workqueue_active(wq) == 0) {
+        if (work_busy(&hpkv_flush_work) == 0) {
             all_completed = true;
             break;
         }
