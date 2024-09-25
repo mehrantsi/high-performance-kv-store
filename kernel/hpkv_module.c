@@ -1193,10 +1193,14 @@ static int write_buffer_worker(void *data)
         // Flush if buffer size threshold is reached or time interval has passed
         if (write_buffer_size() >= WRITE_BUFFER_SIZE || time_after_eq(jiffies, next_flush)) {
             hpkv_log(HPKV_LOG_INFO, "Starting write buffer flush at jiffies: %lu\n", jiffies);
-            // Use a separate workqueue for flushing to avoid scheduling while atomic
-            queue_work(flush_wq, &hpkv_flush_work);
-            next_flush = jiffies + WRITE_BUFFER_FLUSH_INTERVAL;
-            hpkv_log(HPKV_LOG_INFO, "Queued write buffer flush at jiffies: %lu\n", jiffies);
+            // Check if flush_wq is initialized before queueing work
+            if (flush_wq) {
+                queue_work(flush_wq, &hpkv_flush_work);
+                next_flush = jiffies + WRITE_BUFFER_FLUSH_INTERVAL;
+                hpkv_log(HPKV_LOG_INFO, "Queued write buffer flush at jiffies: %lu\n", jiffies);
+            } else {
+                hpkv_log(HPKV_LOG_WARNING, "Flush workqueue not initialized, skipping flush\n");
+            }
         }
     }
 
@@ -2030,12 +2034,21 @@ static int __init hpkv_init(void)
     spin_lock_init(&write_buffer_lock);
     init_waitqueue_head(&write_buffer_wait);
 
-    // Start the write buffer thread
+    flush_wq = create_singlethread_workqueue("hpkv_flush");
+    if (!flush_wq) {
+        hpkv_log(HPKV_LOG_ALERT, "Failed to create flush workqueue\n");
+        ret = -ENOMEM;
+        goto error_destroy_compact_wq;
+    }
+
+    INIT_WORK(&hpkv_flush_work, flush_work_handler);
+
+    // Start the write buffer thread after initializing flush_wq
     write_buffer_thread = kthread_run(write_buffer_worker, NULL, "hpkv_write_buffer");
     if (IS_ERR(write_buffer_thread)) {
         hpkv_log(HPKV_LOG_ALERT, "Failed to create write buffer thread\n");
         ret = PTR_ERR(write_buffer_thread);
-        goto error_put_device;
+        goto error_destroy_flush_wq;
     }
 
     // Schedule an RCU callback
@@ -2083,19 +2096,12 @@ static int __init hpkv_init(void)
     INIT_DELAYED_WORK(&compact_work, compact_work_handler);
     queue_delayed_work(compact_wq, &compact_work, COMPACT_INTERVAL);
 
-    flush_wq = create_singlethread_workqueue("hpkv_flush");
-    if (!flush_wq) {
-        hpkv_log(HPKV_LOG_ALERT, "Failed to create flush workqueue\n");
-        ret = -ENOMEM;
-        goto error_destroy_compact_wq;
-    }
-
-    INIT_WORK(&hpkv_flush_work, flush_work_handler);
-
     hpkv_log(HPKV_LOG_INFO, "Module loaded successfully\n");
     hpkv_log(HPKV_LOG_WARNING, "Registered with major number %d\n", major_num);
     return 0;
 
+error_destroy_flush_wq:
+    destroy_workqueue(flush_wq);
 error_destroy_compact_wq:
     destroy_workqueue(compact_wq);
 error_remove_proc:
