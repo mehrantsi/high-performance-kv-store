@@ -1058,7 +1058,7 @@ static void write_record_to_disk(struct record *record)
     record->sector = find_free_sector(record->value_len);
     if (record->sector == -ENOSPC) {
         // No free sector available, extend the device
-        new_size = device_size + (required_sectors * HPKV_BLOCK_SIZE);
+        new_size = device_size + max(EXTENSION_SIZE, (loff_t)required_sectors * HPKV_BLOCK_SIZE);
         
         // Check if the new size exceeds the maximum allowed size
         if (new_size > MAX_DEVICE_SIZE) {
@@ -1120,9 +1120,8 @@ static void write_record_to_disk(struct record *record)
              record->key, (unsigned long long)record->sector, record->value_len);
 
     // Update the bitmap after writing
-    int sectors_used = (record->value_len + HPKV_BLOCK_SIZE - 1) / HPKV_BLOCK_SIZE;
     spin_lock(&sector_allocation_lock);
-    for (int i = 0; i < sectors_used; i++) {
+    for (int i = 0; i < required_sectors; i++) {
         set_bit(record->sector + i, allocated_sectors);
     }
     smp_mb();  // Memory barrier after bit operations
