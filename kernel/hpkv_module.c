@@ -490,6 +490,8 @@ static int write_buffer_size(void)
     return count;
 }
 
+static DEFINE_SPINLOCK(free_sector_lock);
+
 static sector_t find_free_sector(size_t required_size)
 {
     sector_t sector = 1;  // Start from sector 1 (sector 0 is reserved for metadata)
@@ -503,6 +505,7 @@ static sector_t find_free_sector(size_t required_size)
     int contiguous_deleted_sectors = 0;
     int total_free_sectors = 0;
     int total_deleted_sectors = 0;
+    sector_t result_sector = -ENOSPC;
 
     device_size = i_size_read(bdev->bd_inode);
 
@@ -514,6 +517,8 @@ static sector_t find_free_sector(size_t required_size)
         hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for find_free_sector\n");
         return -ENOMEM;
     }
+
+    spin_lock(&free_sector_lock);
 
     while (sector * HPKV_BLOCK_SIZE < device_size) {
         bh = __bread(bdev, sector, HPKV_BLOCK_SIZE);
@@ -533,10 +538,8 @@ static sector_t find_free_sector(size_t required_size)
             contiguous_deleted_sectors++;
             total_deleted_sectors++;
             if (contiguous_deleted_sectors >= required_sectors) {
-                kfree(buffer);
-                hpkv_log(HPKV_LOG_INFO, "Found contiguous deleted sectors at %llu\n", 
-                         (unsigned long long)first_deleted_sector);
-                return first_deleted_sector;
+                result_sector = first_deleted_sector;
+                break;
             }
         } else {
             contiguous_deleted_sectors = 0;
@@ -549,10 +552,8 @@ static sector_t find_free_sector(size_t required_size)
             contiguous_free_sectors++;
             total_free_sectors++;
             if (contiguous_free_sectors >= required_sectors) {
-                kfree(buffer);
-                hpkv_log(HPKV_LOG_INFO, "Found contiguous free sectors at %llu\n", 
-                         (unsigned long long)first_free_sector);
-                return first_free_sector;
+                result_sector = first_free_sector;
+                break;
             }
         } else {
             contiguous_free_sectors = 0;
@@ -561,24 +562,29 @@ static sector_t find_free_sector(size_t required_size)
         sector++;
     }
 
+    if (result_sector != -ENOSPC) {
+        // Mark the sectors as in use
+        for (sector_t i = result_sector; i < result_sector + required_sectors; i++) {
+            bh = __getblk(bdev, i, HPKV_BLOCK_SIZE);
+            if (bh) {
+                lock_buffer(bh);
+                memset(bh->b_data, 0xFF, HPKV_BLOCK_SIZE);  // Mark as in use
+                set_buffer_uptodate(bh);
+                mark_buffer_dirty(bh);
+                unlock_buffer(bh);
+                brelse(bh);
+            }
+        }
+    }
+
+    spin_unlock(&free_sector_lock);
+
     kfree(buffer);
 
-    hpkv_log(HPKV_LOG_INFO, "Scan complete. Total free: %d, Total deleted: %d, Required: %d\n", 
-             total_free_sectors, total_deleted_sectors, required_sectors);
+    hpkv_log(HPKV_LOG_INFO, "Scan complete. Total free: %d, Total deleted: %d, Required: %d, Result: %lld\n", 
+             total_free_sectors, total_deleted_sectors, required_sectors, (long long)result_sector);
 
-    if (first_deleted_sector > 0) {
-        hpkv_log(HPKV_LOG_INFO, "Returning first deleted sector at %llu\n", 
-                 (unsigned long long)first_deleted_sector);
-        return first_deleted_sector;
-    }
-    if (first_free_sector > 0) {
-        hpkv_log(HPKV_LOG_INFO, "Returning first free sector at %llu\n", 
-                 (unsigned long long)first_free_sector);
-        return first_free_sector;
-    }
-
-    hpkv_log(HPKV_LOG_INFO, "No suitable free space found. Recommending extension.\n");
-    return -ENOSPC;
+    return result_sector;
 }
 
 static bool check_contiguous_free_sectors(sector_t start_sector, int required_sectors)
