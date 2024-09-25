@@ -1215,11 +1215,8 @@ static void write_record_work(struct work_struct *work)
             break;
         case OP_DELETE:
             mark_sector_as_deleted(entry->record->sector);
-            if (entry->record->value) {
-                kfree(entry->record->value);
-                entry->record->value = NULL;
-            }
-            kmem_cache_free(record_cache, entry->record);
+            // Use RCU to free the record
+            call_rcu(&entry->record->rcu, record_free_rcu);
             break;
     }
 
