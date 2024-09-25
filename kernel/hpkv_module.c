@@ -1142,6 +1142,7 @@ static void flush_write_buffer(void)
     int records_changed = 0;
     long size_changed = 0;
     unsigned long timeout;
+    bool buffer_was_empty = false;
 
     // Check if purge or compact is in progress
     if (atomic_read(&purge_in_progress) != 0 || atomic_read(&compact_in_progress) != 0) {
@@ -1165,8 +1166,19 @@ static void flush_write_buffer(void)
 
     // Move entries to a local list to minimize lock contention
     spin_lock(&write_buffer_lock);
-    list_splice_init(&write_buffer, &local_list);
+    if (list_empty(&write_buffer)) {
+        buffer_was_empty = true;
+    } else {
+        list_splice_init(&write_buffer, &local_list);
+    }
     spin_unlock(&write_buffer_lock);
+
+    if (buffer_was_empty) {
+        hpkv_log(HPKV_LOG_INFO, "Write buffer is empty, nothing to flush\n");
+        atomic_set(&flush_running, 0);
+        complete(&flush_completion);
+        return;
+    }
 
     list_for_each_entry_safe(entry, tmp, &local_list, list) {
         if (!entry || !entry->record) {
@@ -1239,7 +1251,7 @@ static int write_buffer_worker(void *data)
         }
 
         // Flush if buffer size threshold is reached or time interval has passed
-        if (write_buffer_size() >= WRITE_BUFFER_SIZE || time_after_eq(jiffies, next_flush)) {
+        if (write_buffer_size() >= WRITE_BUFFER_SIZE || (time_after_eq(jiffies, next_flush) && write_buffer_size() > 0)) {
             hpkv_log(HPKV_LOG_INFO, "Starting write buffer flush at jiffies: %lu\n", jiffies);
             // Check if flush_wq is initialized before queueing work
             if (flush_wq) {
