@@ -656,7 +656,6 @@ static int update_metadata(void)
     // Only update the fields we should change, leave the signature intact
     metadata.total_records = atomic_read(&record_count);
     metadata.total_size = atomic_long_read(&total_disk_usage);
-    metadata.version++;  // Increment version on each update
 
     // Write back the updated metadata
     lock_buffer(bh);
