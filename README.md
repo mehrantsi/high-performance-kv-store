@@ -80,8 +80,9 @@ For a detailed technical design of the HPKV module, please refer to the [Technic
 
 ### Prerequisites
 
-- Linux kernel headers (matching your current kernel version)
-- GCC
+- Linux kernel version 6.8+
+- Linux kernel headers
+- GCC-12
 - Make
 - Root access (for loading the module and creating the device node)
 
