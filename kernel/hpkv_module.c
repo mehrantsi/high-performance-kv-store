@@ -2289,9 +2289,6 @@ static void __exit hpkv_exit(void)
     // Flush remaining entries in the write buffer
     flush_write_buffer();
 
-    // Wait for any ongoing flush to complete
-    wait_for_completion(&flush_completion);
-
     // Acquire write lock to prevent any concurrent access
     percpu_down_write(&rw_sem);
 
