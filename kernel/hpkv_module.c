@@ -1156,8 +1156,9 @@ static void flush_write_buffer(void)
         timeout = wait_for_completion_timeout(&flush_completion, msecs_to_jiffies(5000));
         if (timeout == 0) {
             hpkv_log(HPKV_LOG_WARNING, "Flush wait timed out after 5 seconds\n");
+            atomic_set(&flush_running, 0);
+            return;
         }
-        return;
     }
 
     reinit_completion(&flush_completion);
