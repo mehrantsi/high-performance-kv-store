@@ -2,9 +2,7 @@ name: C/C++ CI
 
 on:
   push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+    branches: [ "release/*" ]
 
 jobs:
   build:
@@ -17,6 +15,25 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install build-essential linux-headers-$(uname -r)
-    - name: make
+    - name: Build
       run: make
       working-directory: ./kernel
+    - name: Create Release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref }}
+        release_name: Release ${{ github.ref }}
+        draft: false
+        prerelease: false
+    - name: Upload Release Asset
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }} # This pulls from the CREATE RELEASE step above, referencing it's ID to get its outputs object, which include a `upload_url`. See this blog post for more info: https://jasonet.co/posts/new-features-of-github-actions/#passing-data-to-future-steps 
+        asset_path: ./kernel/hpkv_module.ko
+        asset_name: hpkv_module.ko
+        asset_content_type: application/ko-file
+      
