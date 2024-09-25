@@ -98,8 +98,9 @@ static struct kmem_cache *record_cache;
 static DEFINE_PER_CPU(struct llist_head, record_free_list);
 static struct percpu_rw_semaphore rw_sem;
 static atomic_t purge_in_progress = ATOMIC_INIT(0);
-static atomic_t flush_in_progress = ATOMIC_INIT(0);
 static atomic_t compact_in_progress = ATOMIC_INIT(0);
+static atomic_t flush_running = ATOMIC_INIT(0);
+static DECLARE_COMPLETION(flush_completion);
 
 struct hpkv_metadata {
     char signature[HPKV_SIGNATURE_SIZE];
@@ -1137,6 +1138,7 @@ static void flush_write_buffer(void)
     LIST_HEAD(local_list);
     int records_changed = 0;
     long size_changed = 0;
+    unsigned long timeout;
 
     // Check if purge or compact is in progress
     if (atomic_read(&purge_in_progress) != 0 || atomic_read(&compact_in_progress) != 0) {
@@ -1144,11 +1146,17 @@ static void flush_write_buffer(void)
         return;
     }
 
-    // Try to set the flush_in_progress flag
-    if (atomic_cmpxchg(&flush_in_progress, 0, 1) != 0) {
-        hpkv_log(HPKV_LOG_INFO, "Flush already in progress, skipping this call\n");
+    // Try to set the flush_running flag
+    if (atomic_cmpxchg(&flush_running, 0, 1) != 0) {
+        hpkv_log(HPKV_LOG_INFO, "Flush already in progress, waiting for completion\n");
+        timeout = wait_for_completion_timeout(&flush_completion, msecs_to_jiffies(5000));
+        if (timeout == 0) {
+            hpkv_log(HPKV_LOG_WARNING, "Flush wait timed out after 5 seconds\n");
+        }
         return;
     }
+
+    reinit_completion(&flush_completion);
 
     hpkv_log(HPKV_LOG_INFO, "Starting flush_write_buffer\n");
 
@@ -1166,6 +1174,10 @@ static void flush_write_buffer(void)
         }
 
         // Queue the work without holding any locks
+        if (!flush_wq) {
+            hpkv_log(HPKV_LOG_ERR, "Flush workqueue is not available\n");
+            break;
+        }
         queue_work(flush_wq, &entry->work);
 
         switch (entry->op) {
@@ -1187,12 +1199,18 @@ static void flush_write_buffer(void)
     }
 
     // Queue metadata update work
-    if (records_changed != 0 || size_changed != 0) {
+    if (records_changed != 0 || size_changed != 0 && flush_wq) {
         queue_work(flush_wq, &metadata_update_work);
     }
 
-    atomic_set(&flush_in_progress, 0);
-    hpkv_log(HPKV_LOG_INFO, "Finished queueing flush operations\n");
+    // Wait for all queued work to complete
+    if (flush_wq) {
+        flush_workqueue(flush_wq);
+    }
+
+    atomic_set(&flush_running, 0);
+    complete(&flush_completion);
+    hpkv_log(HPKV_LOG_INFO, "Finished flush operations\n");
 }
 
 static int write_buffer_worker(void *data)
@@ -1272,7 +1290,7 @@ static void metadata_update_work_func(struct work_struct *work)
 static void compact_disk(void)
 {
     // Check if flush is in progress
-    if (atomic_read(&flush_in_progress) != 0) {
+    if (atomic_read(&flush_running) != 0) {
         hpkv_log(HPKV_LOG_WARNING, "Flush operation in progress, cannot start compaction\n");
         return;
     }
@@ -1595,7 +1613,7 @@ static ssize_t device_write(struct file *file, const char __user *user_buffer, s
 static int purge_data(void)
 {
     // Check if flush is in progress
-    if (atomic_read(&flush_in_progress) != 0) {
+    if (atomic_read(&flush_running) != 0) {
         hpkv_log(HPKV_LOG_WARNING, "Flush operation in progress, cannot start purge\n");
         return -EBUSY;
     }
@@ -1607,10 +1625,10 @@ static int purge_data(void)
     }
 
     // Check again if there are entries in the write buffer
-    if (write_buffer_size() > 0) {
-        hpkv_log(HPKV_LOG_WARNING, "Write buffer is not empty after flush, cannot start purge\n");
-        return -EBUSY;
-    }
+    //if (write_buffer_size() > 0) {
+    //    hpkv_log(HPKV_LOG_WARNING, "Write buffer is not empty, cannot start purge\n");
+    //    return -EBUSY;
+    //}
 
     // Set purge_in_progress flag
     if (atomic_cmpxchg(&purge_in_progress, 0, 1) != 0) {
@@ -2201,6 +2219,8 @@ static int __init hpkv_init(void)
     INIT_DELAYED_WORK(&compact_work, compact_work_handler);
     queue_delayed_work(compact_wq, &compact_work, COMPACT_INTERVAL);
 
+    init_completion(&flush_completion);
+
     hpkv_log(HPKV_LOG_INFO, "Module loaded successfully\n");
     hpkv_log(HPKV_LOG_WARNING, "Registered with major number %d\n", major_num);
     return 0;
@@ -2313,6 +2333,9 @@ static void __exit hpkv_exit(void)
 
     cancel_work_sync(&hpkv_flush_work);
     destroy_workqueue(flush_wq);
+
+    // Wait for any ongoing flush to complete
+    wait_for_completion(&flush_completion);
 
     hpkv_log(HPKV_LOG_INFO, "Module unloaded successfully\n");
 }
