@@ -13,7 +13,6 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
-    - name: configure
-      run: cd ~/work/kernel-high-performance-kv-store/kernel-high-performance-kv-store/kernel
     - name: make
       run: make
+      working-directory: ./kernel
