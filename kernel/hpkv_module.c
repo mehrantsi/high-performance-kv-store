@@ -1153,6 +1153,10 @@ static void flush_write_buffer(void)
     if (atomic_cmpxchg(&flush_running, 0, 1) != 0) {
         hpkv_log(HPKV_LOG_INFO, "Flush already in progress, waiting for completion\n");
         wait_for_completion_timeout(&flush_completion, msecs_to_jiffies(10000));
+        if (atomic_read(&flush_running) != 0) {
+            hpkv_log(HPKV_LOG_WARNING, "Flush operation timed out, forcing completion\n");
+            complete(&flush_completion);
+        }
         return;
     }
 
@@ -1291,6 +1295,8 @@ static void write_record_work(struct work_struct *work)
 
     atomic_set(&entry->work_status, 1);  // Mark as in progress
 
+    timeout = jiffies + msecs_to_jiffies(5000);  // 5 second timeout
+
     switch (entry->op) {
         case OP_INSERT:
         case OP_UPDATE:
@@ -1302,7 +1308,13 @@ static void write_record_work(struct work_struct *work)
             break;
     }
 
-    atomic_set(&entry->work_status, 2);  // Mark as completed
+    if (time_after(jiffies, timeout)) {
+        hpkv_log(HPKV_LOG_WARNING, "Write operation timed out for key: %s\n", entry->record->key);
+        atomic_set(&entry->work_status, 3);  // Mark as timed out
+    } else {
+        atomic_set(&entry->work_status, 2);  // Mark as completed
+    }
+
     complete(&entry->work_done);
 }
 
@@ -2289,12 +2301,26 @@ static void __exit hpkv_exit(void)
     int bkt;
     struct cached_record *cached;
     struct write_buffer_entry *wb_entry, *wb_tmp;
+    int retry_count = 0;
+    const int max_retries = 5;
 
     hpkv_log(HPKV_LOG_INFO, "Starting module unload\n");
 
-    // Cancel and destroy the compaction work
+    // Wait for compact_in_progress
+    while (atomic_read(&compact_in_progress)) {
+        if (retry_count++ >= max_retries) {
+            hpkv_log(HPKV_LOG_ERR, "Timed out waiting for compaction to complete. Forcing exit.\n");
+            break;
+        }
+        hpkv_log(HPKV_LOG_WARNING, "Waiting for ongoing compaction to complete before unloading...\n");
+        msleep(1000);  // Wait for 1 second before retrying
+    }
+
+    // Cancel and wait for all pending work
     cancel_delayed_work_sync(&compact_work);
-    destroy_workqueue(compact_wq);
+    cancel_work_sync(&hpkv_flush_work);
+    flush_workqueue(compact_wq);
+    flush_workqueue(flush_wq);
 
     // Stop the write buffer thread
     if (write_buffer_thread) {
@@ -2306,6 +2332,17 @@ static void __exit hpkv_exit(void)
 
     // Flush remaining entries in the write buffer
     flush_write_buffer();
+
+    // Wait for flush_running to become 0
+    retry_count = 0;
+    while (atomic_read(&flush_running)) {
+        if (retry_count++ >= max_retries) {
+            hpkv_log(HPKV_LOG_ERR, "Timed out waiting for flush to complete. Forcing exit.\n");
+            break;
+        }
+        hpkv_log(HPKV_LOG_WARNING, "Waiting for ongoing flush to complete before unloading...\n");
+        msleep(1000);  // Wait for 1 second before retrying
+    }
 
     // Acquire write lock to prevent any concurrent access
     percpu_down_write(&rw_sem);
@@ -2370,7 +2407,8 @@ static void __exit hpkv_exit(void)
     unregister_chrdev(major_num, DEVICE_NAME);
     percpu_free_rwsem(&rw_sem);
 
-    cancel_work_sync(&hpkv_flush_work);
+    // Destroy workqueues after all work is done
+    destroy_workqueue(compact_wq);
     destroy_workqueue(flush_wq);
 
     hpkv_log(HPKV_LOG_INFO, "Module unloaded successfully\n");
