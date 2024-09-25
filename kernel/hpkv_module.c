@@ -647,20 +647,29 @@ static int update_metadata(void)
 
     memcpy(&metadata, bh->b_data, sizeof(struct hpkv_metadata));
 
-    // Update the fields
+    // Only update the fields we should change, leave the signature intact
     metadata.total_records = atomic_read(&record_count);
     metadata.total_size = atomic_long_read(&total_disk_usage);
+    metadata.version++;  // Increment version on each update
 
     // Write back the updated metadata
+    lock_buffer(bh);
     memcpy(bh->b_data, &metadata, sizeof(struct hpkv_metadata));
+    set_buffer_uptodate(bh);
     mark_buffer_dirty(bh);
-    sync_dirty_buffer(bh);
+    unlock_buffer(bh);
+
+    int ret = sync_dirty_buffer(bh);
+    if (ret) {
+        hpkv_log(HPKV_LOG_ERR, "Failed to sync updated metadata\n");
+    } else {
+        hpkv_log(HPKV_LOG_INFO, "Updated metadata - Total records: %llu, Total size: %llu bytes, Version: %u\n",
+               metadata.total_records, metadata.total_size, metadata.version);
+    }
+
     brelse(bh);
 
-    hpkv_log(HPKV_LOG_INFO, "Updated metadata - Total records: %llu, Total size: %llu bytes\n",
-           metadata.total_records, metadata.total_size);
-
-    return 0;
+    return ret;
 }
 
 static int update_metadata_size(loff_t new_size)
@@ -680,14 +689,22 @@ static int update_metadata_size(loff_t new_size)
     metadata.total_size = new_size;
 
     // Write back the updated metadata
+    lock_buffer(bh);
     memcpy(bh->b_data, &metadata, sizeof(struct hpkv_metadata));
+    set_buffer_uptodate(bh);
     mark_buffer_dirty(bh);
-    sync_dirty_buffer(bh);
+    unlock_buffer(bh);
+
+    int ret = sync_dirty_buffer(bh);
+    if (ret) {
+        hpkv_log(HPKV_LOG_ERR, "Failed to sync updated metadata size\n");
+    } else {
+        hpkv_log(HPKV_LOG_INFO, "Updated metadata size - New total size: %llu bytes\n", new_size);
+    }
+
     brelse(bh);
 
-    hpkv_log(HPKV_LOG_INFO, "Updated metadata size - New total size: %llu bytes\n", new_size);
-
-    return 0;
+    return ret;
 }
 
 static int insert_or_update_record(const char *key, const char *value, size_t value_len, bool is_partial_update)
@@ -1766,8 +1783,8 @@ static int load_indexes(void)
     }
 
     hpkv_log(HPKV_LOG_INFO, "Valid signature found. Loading existing data.\n");
-    hpkv_log(HPKV_LOG_INFO, "Total records: %llu, Total size: %llu bytes\n", 
-           metadata.total_records, metadata.total_size);
+    hpkv_log(HPKV_LOG_INFO, "Total records: %llu, Total size: %llu bytes, Version: %u\n", 
+           metadata.total_records, metadata.total_size, metadata.version);
 
     device_size = i_size_read(bdev->bd_inode);
     hpkv_log(HPKV_LOG_INFO, "Device size: %lld bytes\n", device_size);
@@ -2002,10 +2019,18 @@ static int initialize_empty_device(void)
     metadata.total_size = 0;
     metadata.version = 1;  // Initial version
 
+    lock_buffer(bh);
     memset(bh->b_data, 0, HPKV_BLOCK_SIZE);  // Clear the block first
     memcpy(bh->b_data, &metadata, sizeof(struct hpkv_metadata));
+    set_buffer_uptodate(bh);
     mark_buffer_dirty(bh);
-    sync_dirty_buffer(bh);
+    unlock_buffer(bh);
+    
+    ret = sync_dirty_buffer(bh);
+    if (ret) {
+        hpkv_log(HPKV_LOG_ERR, "Failed to sync metadata block\n");
+    }
+    
     brelse(bh);
 
     // Set the device size to one block (or more if needed)
