@@ -1697,9 +1697,7 @@ static int purge_data(void)
     // Clear the bitmap
     spin_lock(&sector_allocation_lock);
     bitmap_zero(allocated_sectors, SECTORS_BITMAP_SIZE);
-    for (int i = 0; i < METADATA_SECTORS; i++) {
-        set_bit(i, allocated_sectors);  // Mark metadata sectors as allocated
-    }
+    set_bit(0, allocated_sectors);  // Mark metadata sector as allocated
     smp_mb();  // Memory barrier after bit operations
     spin_unlock(&sector_allocation_lock);
 
@@ -2158,9 +2156,7 @@ static int __init hpkv_init(void)
     
     // Initialize the allocated_sectors bitmap
     bitmap_zero(allocated_sectors, SECTORS_BITMAP_SIZE);
-    for (int i = 0; i < METADATA_SECTORS; i++) {
-        set_bit(i, allocated_sectors);  // Mark metadata sectors as allocated
-    }
+    set_bit(0, allocated_sectors);  // Mark metadata sector as allocated
     smp_mb();  // Memory barrier after bit operations
 
     ret = load_indexes();
