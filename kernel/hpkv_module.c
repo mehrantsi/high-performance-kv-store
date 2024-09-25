@@ -1209,22 +1209,13 @@ static void flush_write_buffer(void)
 static bool flush_workqueue_timeout(struct workqueue_struct *wq, unsigned long timeout)
 {
     unsigned long expire = jiffies + timeout;
-    struct work_struct *work;
-    struct write_buffer_entry *entry;
-    bool all_completed = true;
+    bool all_completed = false;
 
     while (time_before(jiffies, expire)) {
-        all_completed = true;
-        list_for_each_entry(work, &wq->worklist, entry) {
-            entry = container_of(work, struct write_buffer_entry, work);
-            if (atomic_read(&entry->work_status) < 2) {  // Not completed
-                all_completed = false;
-                break;
-            }
+        if (workqueue_active(wq) == 0) {
+            all_completed = true;
+            break;
         }
-
-        if (all_completed)
-            return true;
 
         if (signal_pending(current))
             break;
@@ -1232,16 +1223,12 @@ static bool flush_workqueue_timeout(struct workqueue_struct *wq, unsigned long t
         schedule_timeout_interruptible(HZ/10);  // Sleep for 100ms
     }
 
-    // Timeout occurred, mark unfinished work as timed out
-    list_for_each_entry(work, &wq->worklist, entry) {
-        entry = container_of(work, struct write_buffer_entry, work);
-        if (atomic_read(&entry->work_status) < 2) {
-            atomic_set(&entry->work_status, 3);  // Mark as timed out
-            complete(&entry->work_done);
-        }
+    if (!all_completed) {
+        // Timeout occurred, attempt to cancel remaining work
+        cancel_work_sync(&hpkv_flush_work);
     }
 
-    return false;
+    return all_completed;
 }
 
 static int write_buffer_worker(void *data)
