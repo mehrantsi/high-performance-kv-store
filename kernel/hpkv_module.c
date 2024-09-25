@@ -1062,11 +1062,12 @@ static void write_record_to_disk(struct record *record)
         
         // Check if the new size exceeds the maximum allowed size
         if (new_size > MAX_DEVICE_SIZE) {
-            if (device_size == MAX_DEVICE_SIZE) {
+            if (device_size < MAX_DEVICE_SIZE) {
+                new_size = MAX_DEVICE_SIZE;
+            } else {
                 hpkv_log(HPKV_LOG_ERR, "Device already at maximum size. Cannot extend further. Key: %s\n", record->key);
                 return;
             }
-            new_size = MAX_DEVICE_SIZE;
         }
 
         // Extend the device size
