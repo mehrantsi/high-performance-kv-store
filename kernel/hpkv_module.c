@@ -44,7 +44,7 @@
 #define WRITE_BUFFER_SIZE 1024
 #define WRITE_BUFFER_FLUSH_INTERVAL (HZ * 30) // 30 seconds
 #define MAX_DEVICE_SIZE (1ULL << 40)  // 1 TB, adjust as needed
-#define EXTENSION_SIZE (256 * 1024)  // Extend by 256KB at a time
+#define EXTENSION_SIZE (1024 * 1024)  // Extend by 1MB at a time
 #define SECTORS_BITMAP_SIZE (MAX_DEVICE_SIZE / HPKV_BLOCK_SIZE)
 #define WORK_TIMEOUT_MS 5000  // 5 seconds timeout for individual work items
 
