@@ -2195,7 +2195,7 @@ static void __exit hpkv_exit(void)
     msleep(100);
 
     // Destroy the cache
-    kmem_cache_destroy(record_cache);
+    kmem_cache_shrink(record_cache);
 
     unregister_chrdev(major_num, DEVICE_NAME);
     percpu_free_rwsem(&rw_sem);
