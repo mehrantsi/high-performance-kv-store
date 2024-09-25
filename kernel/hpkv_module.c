@@ -25,6 +25,7 @@
 #include <linux/delay.h>
 #include <linux/kthread.h>
 #include <linux/hashtable.h>
+#include <linux/bitmap.h>
 
 #define DEVICE_NAME "hpkv"
 #define MAX_KEY_SIZE 256
@@ -42,6 +43,7 @@
 #define WRITE_BUFFER_FLUSH_INTERVAL (HZ * 30) // 30 seconds
 #define MAX_DEVICE_SIZE (1ULL << 40)  // 1 TB, adjust as needed
 #define EXTENSION_SIZE (256 * 1024)  // Extend by 256KB at a time
+#define SECTORS_BITMAP_SIZE (MAX_DEVICE_SIZE / HPKV_BLOCK_SIZE)
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Mehran Toosi");
@@ -87,6 +89,7 @@ static int extend_device(loff_t new_size);
 static void flush_work_handler(struct work_struct *work);
 static void write_record_work(struct work_struct *work);
 static void metadata_update_work_func(struct work_struct *work);
+static void release_sectors(sector_t start_sector, size_t size);
 
 static int major_num;
 static struct kmem_cache *record_cache;
@@ -151,6 +154,9 @@ static atomic_t record_count = ATOMIC_INIT(0);
 static DEFINE_HASHTABLE(cache, 10);  // 1024 buckets
 static int cache_count = 0;
 static DEFINE_SPINLOCK(cache_lock);
+
+static DECLARE_BITMAP(allocated_sectors, SECTORS_BITMAP_SIZE);
+static DEFINE_SPINLOCK(sector_allocation_lock);
 
 static struct block_device *bdev;
 static struct bdev_handle *bdev_handle;
@@ -501,13 +507,45 @@ static sector_t find_free_sector(size_t required_size)
     int required_sectors = (required_size + HPKV_BLOCK_SIZE - 1) / HPKV_BLOCK_SIZE;
     int contiguous_free_sectors = 0;
     int contiguous_deleted_sectors = 0;
-    int total_free_sectors = 0;
-    int total_deleted_sectors = 0;
+    sector_t device_sectors = i_size_read(bdev->bd_inode) / HPKV_BLOCK_SIZE;
+    sector_t found_sector = 0;
+
+    spin_lock(&sector_allocation_lock);
+
+    // First, try to find contiguous free sectors in the bitmap
+    while (sector + required_sectors <= device_sectors) {
+        if (!test_bit(sector, allocated_sectors)) {
+            bool is_range_free = true;
+            for (int i = 0; i < required_sectors; i++) {
+                if (test_bit(sector + i, allocated_sectors)) {
+                    is_range_free = false;
+                    break;
+                }
+            }
+            if (is_range_free) {
+                found_sector = sector;
+                // Mark the sectors as allocated
+                for (int i = 0; i < required_sectors; i++) {
+                    set_bit(sector + i, allocated_sectors);
+                }
+                break;
+            }
+        }
+        sector++;
+    }
+
+    spin_unlock(&sector_allocation_lock);
+
+    if (found_sector != 0) {
+        hpkv_log(HPKV_LOG_INFO, "Found free sector at %llu using bitmap for size %zu (requires %d sectors)\n", 
+                 (unsigned long long)found_sector, required_size, required_sectors);
+        return found_sector;
+    }
+
+    // If not found in bitmap, fall back to the old method
+    hpkv_log(HPKV_LOG_INFO, "Falling back to device scan for finding free sector\n");
 
     device_size = i_size_read(bdev->bd_inode);
-
-    hpkv_log(HPKV_LOG_INFO, "Finding free sector for size %zu (requires %d sectors)\n", 
-             required_size, required_sectors);
 
     buffer = kmalloc(HPKV_BLOCK_SIZE, GFP_KERNEL);
     if (!buffer) {
@@ -515,6 +553,7 @@ static sector_t find_free_sector(size_t required_size)
         return -ENOMEM;
     }
 
+    sector = 1;  // Reset sector to 1
     while (sector * HPKV_BLOCK_SIZE < device_size) {
         bh = __bread(bdev, sector, HPKV_BLOCK_SIZE);
         if (!bh) {
@@ -531,8 +570,12 @@ static sector_t find_free_sector(size_t required_size)
                 first_deleted_sector = sector;
             }
             contiguous_deleted_sectors++;
-            total_deleted_sectors++;
             if (contiguous_deleted_sectors >= required_sectors) {
+                spin_lock(&sector_allocation_lock);
+                for (int i = 0; i < required_sectors; i++) {
+                    set_bit(first_deleted_sector + i, allocated_sectors);
+                }
+                spin_unlock(&sector_allocation_lock);
                 kfree(buffer);
                 hpkv_log(HPKV_LOG_INFO, "Found contiguous deleted sectors at %llu\n", 
                          (unsigned long long)first_deleted_sector);
@@ -547,8 +590,12 @@ static sector_t find_free_sector(size_t required_size)
                 first_free_sector = sector;
             }
             contiguous_free_sectors++;
-            total_free_sectors++;
             if (contiguous_free_sectors >= required_sectors) {
+                spin_lock(&sector_allocation_lock);
+                for (int i = 0; i < required_sectors; i++) {
+                    set_bit(first_free_sector + i, allocated_sectors);
+                }
+                spin_unlock(&sector_allocation_lock);
                 kfree(buffer);
                 hpkv_log(HPKV_LOG_INFO, "Found contiguous free sectors at %llu\n", 
                          (unsigned long long)first_free_sector);
@@ -563,57 +610,22 @@ static sector_t find_free_sector(size_t required_size)
 
     kfree(buffer);
 
-    hpkv_log(HPKV_LOG_INFO, "Scan complete. Total free: %d, Total deleted: %d, Required: %d\n", 
-             total_free_sectors, total_deleted_sectors, required_sectors);
-
-    if (first_deleted_sector > 0) {
-        hpkv_log(HPKV_LOG_INFO, "Returning first deleted sector at %llu\n", 
-                 (unsigned long long)first_deleted_sector);
-        return first_deleted_sector;
-    }
-    if (first_free_sector > 0) {
-        hpkv_log(HPKV_LOG_INFO, "Returning first free sector at %llu\n", 
-                 (unsigned long long)first_free_sector);
-        return first_free_sector;
-    }
-
     hpkv_log(HPKV_LOG_INFO, "No suitable free space found. Recommending extension.\n");
     return -ENOSPC;
 }
 
-static bool check_contiguous_free_sectors(sector_t start_sector, int required_sectors)
+static void release_sectors(sector_t start_sector, size_t size)
 {
-    sector_t sector;
-    struct buffer_head *bh;
-    char *buffer;
-    int free_count = 0;
+    int sectors_to_release = (size + HPKV_BLOCK_SIZE - 1) / HPKV_BLOCK_SIZE;
 
-    buffer = kmalloc(HPKV_BLOCK_SIZE, GFP_KERNEL);
-    if (!buffer) {
-        hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for check_contiguous_free_sectors\n");
-        return false;
+    spin_lock(&sector_allocation_lock);
+    for (int i = 0; i < sectors_to_release; i++) {
+        clear_bit(start_sector + i, allocated_sectors);
     }
+    spin_unlock(&sector_allocation_lock);
 
-    for (sector = start_sector; sector < start_sector + required_sectors; sector++) {
-        bh = __bread(bdev, sector, HPKV_BLOCK_SIZE);
-        if (!bh) {
-            hpkv_log(HPKV_LOG_ERR, "Failed to read sector %llu\n", (unsigned long long)sector);
-            kfree(buffer);
-            return false;
-        }
-
-        memcpy(buffer, bh->b_data, HPKV_BLOCK_SIZE);
-        brelse(bh);
-
-        if (buffer[0] == '\0') {
-            free_count++;
-        } else {
-            break;
-        }
-    }
-
-    kfree(buffer);
-    return (free_count == required_sectors);
+    hpkv_log(HPKV_LOG_INFO, "Released %d sectors starting at %llu\n", 
+             sectors_to_release, (unsigned long long)start_sector);
 }
 
 static int update_metadata(void)
@@ -748,6 +760,9 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
         rb_erase(&old_record->tree_node, &records_tree);
         atomic_long_sub(old_record->value_len, &total_disk_usage);
         call_rcu(&old_record->rcu, record_free_rcu);
+
+        // Release the sectors used by the old record
+        release_sectors(old_record->sector, old_record->value_len);
     } else {
         // New insert
         new_record->value = kmalloc(value_len + 1, GFP_KERNEL);
@@ -889,6 +904,9 @@ static int delete_record(const char *key)
     }
     spin_unlock(&cache_lock);
 
+    // Release the sectors used by this record
+    release_sectors(record->sector, record->value_len);
+
     // Register RCU callback to free the record
     call_rcu(&record->rcu, record_free_rcu);
 
@@ -941,6 +959,11 @@ static int extend_device(loff_t new_size)
     // Update the size in our main bdev structure
     i_size_write(bdev->bd_inode, new_size);
     hpkv_log(HPKV_LOG_INFO, "Updated inode size to %lld bytes\n", new_size);
+
+    // Update the bitmap to reflect the new size
+    spin_lock(&sector_allocation_lock);
+    bitmap_clear(allocated_sectors, current_size / HPKV_BLOCK_SIZE, (new_size - current_size) / HPKV_BLOCK_SIZE);
+    spin_unlock(&sector_allocation_lock);
 
     // Update metadata with new size
     ret = update_metadata_size(new_size);
@@ -1274,17 +1297,26 @@ static void compact_disk(void)
                 mark_buffer_dirty(write_bh);
                 sync_dirty_buffer(write_bh);
 
-                // Update the sector in the in-memory record
+                // Update the sector in the in-memory record and bitmap
                 char key[MAX_KEY_SIZE];
                 memcpy(key, read_bh->b_data, MAX_KEY_SIZE);
                 record = search_record_in_memory(key);
                 if (record) {
+                    spin_lock(&sector_allocation_lock);
+                    clear_bit(record->sector, allocated_sectors);
+                    set_bit(write_sector, allocated_sectors);
+                    spin_unlock(&sector_allocation_lock);
                     record->sector = write_sector;
                 }
 
                 brelse(write_bh);
             }
             write_sector++;
+        } else {
+            // Clear the bit for deleted or empty sectors
+            spin_lock(&sector_allocation_lock);
+            clear_bit(read_sector, allocated_sectors);
+            spin_unlock(&sector_allocation_lock);
         }
 
         brelse(read_bh);
@@ -1306,6 +1338,11 @@ static void compact_disk(void)
         hpkv_log(HPKV_LOG_INFO, "Device shrunk from %lld to %llu bytes\n", 
                  old_size, (unsigned long long)new_size);
         
+        // Update the bitmap to reflect the new size
+        spin_lock(&sector_allocation_lock);
+        bitmap_clear(allocated_sectors, new_size / HPKV_BLOCK_SIZE, (old_size - new_size) / HPKV_BLOCK_SIZE);
+        spin_unlock(&sector_allocation_lock);
+
         // Update the metadata with the new size
         update_metadata_size(new_size);
     } else {
@@ -1612,6 +1649,12 @@ static int purge_data(void)
 
     hpkv_log(HPKV_LOG_INFO, "Write buffer cleared\n");
 
+    // Clear the bitmap
+    spin_lock(&sector_allocation_lock);
+    bitmap_zero(allocated_sectors, SECTORS_BITMAP_SIZE);
+    set_bit(0, allocated_sectors);  // Mark sector 0 as allocated (metadata)
+    spin_unlock(&sector_allocation_lock);
+
     // Now clear the disk
     while (sector * HPKV_BLOCK_SIZE < i_size_read(bdev->bd_inode)) {
         bh = __getblk(bdev, sector, HPKV_BLOCK_SIZE);
@@ -1741,6 +1784,14 @@ static int load_indexes(void)
                     insert_rb_tree(record);
                     atomic_long_add(value_len, &total_disk_usage);
                     atomic_inc(&record_count);
+                
+                    // Mark the sectors as allocated in the bitmap
+                    int sectors_used = (value_len + HPKV_BLOCK_SIZE - 1) / HPKV_BLOCK_SIZE;
+                    spin_lock(&sector_allocation_lock);
+                    for (int i = 0; i < sectors_used; i++) {
+                        set_bit(sector + i, allocated_sectors);
+                    }
+                    spin_unlock(&sector_allocation_lock);
                 
                     hpkv_log(HPKV_LOG_INFO, "Added record for key: %s\n", key);
                 } else {
@@ -2045,6 +2096,10 @@ static int __init hpkv_init(void)
     // Schedule an RCU callback
     call_rcu(&((struct rcu_head){0}), hpkv_rcu_callback);
     
+    // Initialize the allocated_sectors bitmap
+    bitmap_zero(allocated_sectors, SECTORS_BITMAP_SIZE);
+    set_bit(0, allocated_sectors);  // Mark sector 0 as allocated (metadata)
+
     ret = load_indexes();
     if (ret == -EINVAL) {
         if (initialize_if_empty) {
