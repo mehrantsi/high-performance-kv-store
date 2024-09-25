@@ -65,7 +65,6 @@ static struct record *find_record_in_write_buffer(const char *key);
 static int search_record(const char *key, char **value, size_t *value_len);
 static int write_buffer_size(void);
 static sector_t find_free_sector(size_t required_size);
-static bool check_contiguous_free_sectors(sector_t start_sector, int required_sectors);
 static int update_metadata(void);
 static int update_metadata_size(loff_t new_size);
 static int insert_or_update_record(const char *key, const char *value, size_t value_len, bool is_partial_update);
@@ -171,6 +170,10 @@ MODULE_PARM_DESC(mount_path, "Path to the block device for persistent storage");
 static bool initialize_if_empty = true;
 module_param(initialize_if_empty, bool, 0644);
 MODULE_PARM_DESC(initialize_if_empty, "Initialize the device if it's empty (default: true)");
+
+static bool force_initialize = false;
+module_param(force_initialize, bool, 0644);
+MODULE_PARM_DESC(force_initialize, "Force initialize the device even if it contains data (default: false)");
 
 static struct workqueue_struct *compact_wq;
 static struct delayed_work compact_work;
@@ -2179,12 +2182,18 @@ static int __init hpkv_init(void)
 
     ret = load_indexes();
     if (ret == -EINVAL) {
-        if (initialize_if_empty) {
-            if (is_disk_empty(bdev)) {
-                hpkv_log(HPKV_LOG_INFO, "Device is empty. Initializing for HPKV use.\n");
+        if (initialize_if_empty || force_initialize) {
+            if (is_disk_empty(bdev) || force_initialize) {
+                hpkv_log(HPKV_LOG_INFO, "Device is empty or force_initialize is set. Initializing for HPKV use.\n");
                 ret = initialize_empty_device();
                 if (ret < 0) {
-                    hpkv_log(HPKV_LOG_ERR, "Failed to initialize empty device\n");
+                    hpkv_log(HPKV_LOG_ERR, "Failed to initialize device\n");
+                    goto error_put_device;
+                }
+                // After initialization, try to load indexes again
+                ret = load_indexes();
+                if (ret < 0) {
+                    hpkv_log(HPKV_LOG_ERR, "Failed to load indexes after initialization\n");
                     goto error_put_device;
                 }
             } else {
