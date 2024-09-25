@@ -677,9 +677,9 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
     struct record *new_record, *old_record;
     struct write_buffer_entry *wb_entry;
     int ret = 0;
-    u32 hash = djb2_hash(key, strlen(key));
+    u32 hash;
 
-    if (!key || !value || value_len == 0) {
+    if (!key || !value || value_len == 0 || value_len > MAX_VALUE_SIZE) {
         hpkv_log(HPKV_LOG_ERR, "Invalid parameters for insert_or_update_record\n");
         return -EINVAL;
     }
@@ -688,6 +688,8 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
         hpkv_log(HPKV_LOG_ERR, "record_cache is not initialized\n");
         return -EINVAL;
     }
+
+    hash = djb2_hash(key, strlen(key));
 
     // Allocate memory for new_record using GFP_KERNEL flag
     new_record = kmem_cache_alloc(record_cache, GFP_KERNEL);
@@ -698,7 +700,7 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
 
     // Initialize the new_record structure
     memset(new_record, 0, sizeof(struct record));
-    strncpy(new_record->key, key, MAX_KEY_SIZE);
+    strncpy(new_record->key, key, MAX_KEY_SIZE - 1);
     new_record->key[MAX_KEY_SIZE - 1] = '\0';
 
     // Update in-memory data structures
@@ -709,6 +711,12 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
         if (is_partial_update) {
             // Perform partial update
             size_t new_len = old_record->value_len + value_len;
+            if (new_len > MAX_VALUE_SIZE) {
+                percpu_up_write(&rw_sem);
+                kmem_cache_free(record_cache, new_record);
+                hpkv_log(HPKV_LOG_ERR, "Partial update exceeds maximum value size\n");
+                return -EMSGSIZE;
+            }
             char *new_value = kmalloc(new_len + 1, GFP_KERNEL);
             if (!new_value) {
                 percpu_up_write(&rw_sem);
