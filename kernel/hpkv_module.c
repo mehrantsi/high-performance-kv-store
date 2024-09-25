@@ -26,6 +26,8 @@
 #include <linux/kthread.h>
 #include <linux/hashtable.h>
 #include <linux/bitmap.h>
+#include <linux/atomic.h>
+#include <linux/smp.h>
 
 #define DEVICE_NAME "hpkv"
 #define MAX_KEY_SIZE 256
@@ -528,6 +530,7 @@ static sector_t find_free_sector(size_t required_size)
                 for (int i = 0; i < required_sectors; i++) {
                     set_bit(sector + i, allocated_sectors);
                 }
+                smp_mb();  // Memory barrier after bit operations
                 break;
             }
         }
@@ -575,6 +578,7 @@ static sector_t find_free_sector(size_t required_size)
                 for (int i = 0; i < required_sectors; i++) {
                     set_bit(first_deleted_sector + i, allocated_sectors);
                 }
+                smp_mb();  // Memory barrier after bit operations
                 spin_unlock(&sector_allocation_lock);
                 kfree(buffer);
                 hpkv_log(HPKV_LOG_INFO, "Found contiguous deleted sectors at %llu\n", 
@@ -595,6 +599,7 @@ static sector_t find_free_sector(size_t required_size)
                 for (int i = 0; i < required_sectors; i++) {
                     set_bit(first_free_sector + i, allocated_sectors);
                 }
+                smp_mb();  // Memory barrier after bit operations
                 spin_unlock(&sector_allocation_lock);
                 kfree(buffer);
                 hpkv_log(HPKV_LOG_INFO, "Found contiguous free sectors at %llu\n", 
@@ -622,6 +627,7 @@ static void release_sectors(sector_t start_sector, size_t size)
     for (int i = 0; i < sectors_to_release; i++) {
         clear_bit(start_sector + i, allocated_sectors);
     }
+    smp_mb();  // Memory barrier after bit operations
     spin_unlock(&sector_allocation_lock);
 
     hpkv_log(HPKV_LOG_INFO, "Released %d sectors starting at %llu\n", 
@@ -759,7 +765,10 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
         hash_del_rcu(&old_record->hash_node);
         rb_erase(&old_record->tree_node, &records_tree);
         atomic_long_sub(old_record->value_len, &total_disk_usage);
-        call_rcu(&old_record->rcu, record_free_rcu);
+        if (atomic_dec_and_test(&old_record->refcount)) {
+            kfree(old_record->value);
+            kmem_cache_free(record_cache, old_record);
+        }
 
         // Release the sectors used by the old record
         release_sectors(old_record->sector, old_record->value_len);
@@ -777,6 +786,9 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
         new_record->value_len = value_len;
         atomic_inc(&record_count);
     }
+
+    // Initialize refcount for new record
+    atomic_set(&new_record->refcount, 1);
 
     // Insert new record
     if (new_record) {
@@ -990,6 +1002,7 @@ static void write_record_to_disk(struct record *record)
         return;
     }
 
+    smp_rmb();  // Memory barrier before reading record data
     if (!record->value || record->value_len == 0) {
         hpkv_log(HPKV_LOG_ERR, "Attempted to write invalid record to disk. Key: %s, Value length: %zu\n", 
                  record->key, record->value_len);
@@ -1278,6 +1291,7 @@ static void compact_disk(void)
             continue;
         }
 
+        smp_rmb();  // Memory barrier before reading record data
         // Check if the record is deleted (first byte of key is 0)
         if (read_bh->b_data[0] != '\0') {
             // Record is not deleted, so we need to keep it
@@ -1303,6 +1317,7 @@ static void compact_disk(void)
                     clear_bit(record->sector, allocated_sectors);
                     set_bit(write_sector, allocated_sectors);
                     spin_unlock(&sector_allocation_lock);
+                    smp_wmb();  // Memory barrier before updating record sector
                     record->sector = write_sector;
                 }
 
@@ -1777,6 +1792,9 @@ static int load_indexes(void)
                     record->sector = sector;
                 
                     u32 hash = djb2_hash(key, strlen(key));
+                    atomic_set(&record->refcount, 1);
+                    smp_wmb();  // Memory barrier before making the record visible
+
                     hash_add_rcu(kv_store, &record->hash_node, hash);
                     insert_rb_tree(record);
                     atomic_long_add(value_len, &total_disk_usage);
@@ -1788,6 +1806,7 @@ static int load_indexes(void)
                     for (int i = 0; i < sectors_used; i++) {
                         set_bit(sector + i, allocated_sectors);
                     }
+                    smp_mb();  // Memory barrier after bit operations
                     spin_unlock(&sector_allocation_lock);
                 
                     hpkv_log(HPKV_LOG_INFO, "Added record for key: %s\n", key);
