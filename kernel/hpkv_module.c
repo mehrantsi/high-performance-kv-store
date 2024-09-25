@@ -545,7 +545,7 @@ static sector_t find_free_sector(size_t required_size)
         return found_sector;
     }
 
-    // If not found in bitmap, fall back to the old method
+    // If not found in bitmap, fallback to the disk scan
     hpkv_log(HPKV_LOG_INFO, "Falling back to device scan for finding free sector\n");
 
     device_size = i_size_read(bdev->bd_inode);
@@ -975,6 +975,7 @@ static int extend_device(loff_t new_size)
     // Update the bitmap to reflect the new size
     spin_lock(&sector_allocation_lock);
     bitmap_clear(allocated_sectors, current_size / HPKV_BLOCK_SIZE, (new_size - current_size) / HPKV_BLOCK_SIZE);
+    smp_mb();  // Memory barrier after bit operations
     spin_unlock(&sector_allocation_lock);
 
     // Update metadata with new size
@@ -1087,6 +1088,15 @@ static void write_record_to_disk(struct record *record)
     brelse(bh);
     hpkv_log(HPKV_LOG_INFO, "Successfully wrote record to disk: key=%s, sector=%llu, value_len=%zu\n", 
              record->key, (unsigned long long)record->sector, record->value_len);
+
+    // Update the bitmap after writing
+    int sectors_used = (record->value_len + HPKV_BLOCK_SIZE - 1) / HPKV_BLOCK_SIZE;
+    spin_lock(&sector_allocation_lock);
+    for (int i = 0; i < sectors_used; i++) {
+        set_bit(record->sector + i, allocated_sectors);
+    }
+    smp_mb();  // Memory barrier after bit operations
+    spin_unlock(&sector_allocation_lock);
 }
 
 static void mark_sector_as_deleted(sector_t sector)
@@ -1314,8 +1324,12 @@ static void compact_disk(void)
                 record = search_record_in_memory(key);
                 if (record) {
                     spin_lock(&sector_allocation_lock);
-                    clear_bit(record->sector, allocated_sectors);
-                    set_bit(write_sector, allocated_sectors);
+                    int sectors_used = (record->value_len + HPKV_BLOCK_SIZE - 1) / HPKV_BLOCK_SIZE;
+                    for (int i = 0; i < sectors_used; i++) {
+                        clear_bit(record->sector + i, allocated_sectors);
+                        set_bit(write_sector + i, allocated_sectors);
+                    }
+                    smp_mb();  // Memory barrier after bit operations
                     spin_unlock(&sector_allocation_lock);
                     smp_wmb();  // Memory barrier before updating record sector
                     record->sector = write_sector;
@@ -1328,6 +1342,7 @@ static void compact_disk(void)
             // Clear the bit for deleted or empty sectors
             spin_lock(&sector_allocation_lock);
             clear_bit(read_sector, allocated_sectors);
+            smp_mb();  // Memory barrier after bit operations
             spin_unlock(&sector_allocation_lock);
         }
 
@@ -1353,6 +1368,7 @@ static void compact_disk(void)
         // Update the bitmap to reflect the new size
         spin_lock(&sector_allocation_lock);
         bitmap_clear(allocated_sectors, new_size / HPKV_BLOCK_SIZE, (old_size - new_size) / HPKV_BLOCK_SIZE);
+        smp_mb();  // Memory barrier after bit operations
         spin_unlock(&sector_allocation_lock);
 
         // Update the metadata with the new size
@@ -1664,7 +1680,10 @@ static int purge_data(void)
     // Clear the bitmap
     spin_lock(&sector_allocation_lock);
     bitmap_zero(allocated_sectors, SECTORS_BITMAP_SIZE);
-    set_bit(0, allocated_sectors);  // Mark sector 0 as allocated (metadata)
+    for (int i = 0; i < METADATA_SECTORS; i++) {
+        set_bit(i, allocated_sectors);  // Mark metadata sectors as allocated
+    }
+    smp_mb();  // Memory barrier after bit operations
     spin_unlock(&sector_allocation_lock);
 
     // Now clear the disk
@@ -2114,7 +2133,10 @@ static int __init hpkv_init(void)
     
     // Initialize the allocated_sectors bitmap
     bitmap_zero(allocated_sectors, SECTORS_BITMAP_SIZE);
-    set_bit(0, allocated_sectors);  // Mark sector 0 as allocated (metadata)
+    for (int i = 0; i < METADATA_SECTORS; i++) {
+        set_bit(i, allocated_sectors);  // Mark metadata sectors as allocated
+    }
+    smp_mb();  // Memory barrier after bit operations
 
     ret = load_indexes();
     if (ret == -EINVAL) {
