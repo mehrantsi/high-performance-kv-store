@@ -30,7 +30,7 @@
 #define MAX_KEY_SIZE 256
 #define MAX_VALUE_SIZE 1000
 #define HPKV_HASH_BITS (20) // 2^20 = 1,048,576 buckets
-#define MAX_DISK_USAGE (1UL << 32) // 4 GB max disk usage
+#define MAX_DISK_USAGE (1UL << 40) // 1 TB max disk usage
 #define HPKV_BLOCK_SIZE 4096
 #define PROC_ENTRY "hpkv_stats"
 #define CACHE_SIZE 1000
@@ -40,7 +40,7 @@
 #define HPKV_METADATA_BLOCK 0
 #define WRITE_BUFFER_SIZE 1024
 #define WRITE_BUFFER_FLUSH_INTERVAL (HZ * 30) // 30 seconds
-#define MAX_DEVICE_SIZE (1ULL << 32)  // 4 GB, adjust as needed
+#define MAX_DEVICE_SIZE (1ULL << 40)  // 1 TB, adjust as needed
 #define EXTENSION_SIZE (256 * 1024)  // Extend by 256KB at a time
 
 MODULE_LICENSE("GPL");
