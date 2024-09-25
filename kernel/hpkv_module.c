@@ -91,6 +91,8 @@ static void flush_work_handler(struct work_struct *work);
 static void write_record_work(struct work_struct *work);
 static void metadata_update_work_func(struct work_struct *work);
 static void release_sectors(sector_t start_sector, size_t size);
+static bool flush_workqueue_timeout(struct workqueue_struct *wq, unsigned long timeout);
+static void cancel_remaining_work(struct workqueue_struct *wq);
 
 static int major_num;
 static struct kmem_cache *record_cache;
@@ -1219,14 +1221,47 @@ static void flush_write_buffer(void)
         queue_work(flush_wq, &metadata_update_work);
     }
 
-    // Wait for all queued work to complete
+    // Wait for all queued work to complete with a timeout
     if (flush_wq) {
-        flush_workqueue(flush_wq);
+        timeout = msecs_to_jiffies(10000); // 10 seconds timeout
+        if (!flush_workqueue_timeout(flush_wq, timeout)) {
+            hpkv_log(HPKV_LOG_ERR, "Flush workqueue timed out after 10 seconds\n");
+            cancel_remaining_work(flush_wq);
+        }
     }
 
     atomic_set(&flush_running, 0);
     complete(&flush_completion);
     hpkv_log(HPKV_LOG_INFO, "Finished flush operations\n");
+}
+
+static bool flush_workqueue_timeout(struct workqueue_struct *wq, unsigned long timeout)
+{
+    unsigned long expire = jiffies + timeout;
+
+    while (time_before(jiffies, expire)) {
+        if (workqueue_active(wq) == 0)
+            return true;
+        
+        if (signal_pending(current))
+            break;
+        
+        schedule_timeout_interruptible(HZ/10); // Sleep for 100ms
+    }
+
+    return workqueue_active(wq) == 0;
+}
+
+static void cancel_remaining_work(struct workqueue_struct *wq)
+{
+    struct work_struct *work, *n;
+
+    list_for_each_entry_safe(work, n, &wq->worklist, entry) {
+        if (work_busy(work)) {
+            cancel_work_sync(work);
+            hpkv_log(HPKV_LOG_WARNING, "Cancelled work item due to timeout\n");
+        }
+    }
 }
 
 static int write_buffer_worker(void *data)
