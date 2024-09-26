@@ -1672,9 +1672,9 @@ static int purge_data(void)
     char *empty_buffer;
     unsigned long flags;
     struct rb_node *node, *next;
-    struct record *record;
-    struct write_buffer_entry *entry, *tmp;
-    LIST_HEAD(local_list);
+    struct record *record, *tmp_record;
+    struct write_buffer_entry *entry, *tmp_entry;
+    int bkt;
 
     hpkv_log(HPKV_LOG_INFO, "Starting purge operation\n");
 
@@ -1690,44 +1690,52 @@ static int purge_data(void)
     // Use a write lock for the entire operation to prevent concurrent access
     percpu_down_write(&rw_sem);
 
-    // Clear in-memory data structures
-    rcu_read_lock();
-    hash_init(kv_store);  // This effectively clears the hash table
-    rcu_read_unlock();
-
-    // Clear the red-black tree
-    for (node = rb_first(&records_tree); node; node = next) {
-        next = rb_next(node);
-        record = rb_entry(node, struct record, tree_node);
-        rb_erase(node, &records_tree);
-        call_rcu(&record->rcu, record_free_rcu);
-    }
-
-    atomic_long_set(&total_disk_usage, 0);
-    atomic_set(&record_count, 0);
-
-    // Clear cache
-    spin_lock_irqsave(&cache_lock, flags);
-    hash_init(cache);
-    cache_count = 0;
-    spin_unlock_irqrestore(&cache_lock, flags);
-
-    hpkv_log(HPKV_LOG_INFO, "In-memory structures cleared\n");
-
-    // Clear the write buffer
+    // Clear the write buffer first
     spin_lock(&write_buffer_lock);
-    list_splice_init(&write_buffer, &local_list);
-    spin_unlock(&write_buffer_lock);
-
-    list_for_each_entry_safe(entry, tmp, &local_list, list) {
+    list_for_each_entry_safe(entry, tmp_entry, &write_buffer, list) {
         list_del(&entry->list);
         if (entry->record) {
-            call_rcu(&entry->record->rcu, record_free_rcu);
+            kfree(entry->record->value);
+            kmem_cache_free(record_cache, entry->record);
         }
         kfree(entry);
     }
+    INIT_LIST_HEAD(&write_buffer);
+    spin_unlock(&write_buffer_lock);
 
     hpkv_log(HPKV_LOG_INFO, "Write buffer cleared\n");
+
+    // Clear the red-black tree and hash table
+    rcu_read_lock();
+    for (node = rb_first(&records_tree); node; node = next) {
+        next = rb_next(node);
+        record = rb_entry(node, struct record, tree_node);
+        rb_erase(&record->tree_node, &records_tree);
+        hash_del_rcu(&record->hash_node);
+        call_rcu(&record->rcu, record_free_rcu);
+    }
+    rcu_read_unlock();
+
+    // Reinitialize the hash table
+    hash_init(kv_store);
+
+    hpkv_log(HPKV_LOG_INFO, "In-memory structures (RB-tree and hash table) cleared\n");
+
+    // Clear cache
+    spin_lock_irqsave(&cache_lock, flags);
+    hash_for_each_safe(cache, bkt, tmp_record, cached, node) {
+        hash_del(&cached->node);
+        kfree(cached->value);
+        kfree(cached);
+    }
+    cache_count = 0;
+    spin_unlock_irqrestore(&cache_lock, flags);
+
+    hpkv_log(HPKV_LOG_INFO, "Cache cleared\n");
+
+    // Reset counters
+    atomic_long_set(&total_disk_usage, 0);
+    atomic_set(&record_count, 0);
 
     // Clear only the allocated sectors on disk
     spin_lock(&sector_allocation_lock);
