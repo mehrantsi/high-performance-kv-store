@@ -1775,7 +1775,7 @@ static int purge_data(void)
 
     // Perform a controlled sync operation
     hpkv_log(HPKV_LOG_INFO, "Starting final sync operation\n");
-    ret = blkdev_issue_flush(bdev, GFP_KERNEL);
+    ret = blkdev_issue_flush(bdev);
     if (ret) {
         hpkv_log(HPKV_LOG_ERR, "Final sync failed with error %d\n", ret);
     } else {
