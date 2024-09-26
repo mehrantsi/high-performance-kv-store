@@ -2384,7 +2384,11 @@ static void __exit hpkv_exit(void)
     hash_for_each_safe(kv_store, bkt, tmp, record, hash_node) {
         hash_del_rcu(&record->hash_node);
         rb_erase(&record->tree_node, &records_tree);
-        call_rcu(&record->rcu, record_free_rcu);
+        if (record->value) {
+            kfree(record->value);
+            record->value = NULL;
+        }
+        kmem_cache_free(record_cache, record);
     }
 
     // Clear cache
@@ -2419,29 +2423,15 @@ static void __exit hpkv_exit(void)
     // Wait for a short period to ensure all operations are complete
     msleep(500);
 
-    unregister_chrdev(major_num, DEVICE_NAME);
-    percpu_free_rwsem(&rw_sem);
-
-    // Add additional safeguards and logging for kmem_cache_destroy
     if (record_cache) {
-        hpkv_log(HPKV_LOG_INFO, "Attempting to shrink record_cache\n");
         kmem_cache_shrink(record_cache);
-        hpkv_log(HPKV_LOG_INFO, "Record cache shrunk, attempting to destroy\n");
-        
-        // Ensure all RCU callbacks have completed before destroying the cache
-        rcu_barrier();
-        
-        // Short delay to allow any ongoing operations to complete
-        msleep(100);
-        
-        // Destroy the cache
         kmem_cache_destroy(record_cache);
-        
-        hpkv_log(HPKV_LOG_INFO, "Record cache destroy operation completed\n");
-        
         record_cache = NULL;
     }
 
+    unregister_chrdev(major_num, DEVICE_NAME);
+    percpu_free_rwsem(&rw_sem);
+   
     hpkv_log(HPKV_LOG_INFO, "Module unloaded successfully\n");
 }
 
