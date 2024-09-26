@@ -1660,12 +1660,6 @@ static int purge_data(void)
         return -EBUSY;
     }
 
-    // Check again if there are entries in the write buffer
-    //if (write_buffer_size() > 0) {
-    //    hpkv_log(HPKV_LOG_WARNING, "Write buffer is not empty, cannot start purge\n");
-    //    return -EBUSY;
-    //}
-
     // Set purge_in_progress flag
     if (atomic_cmpxchg(&purge_in_progress, 0, 1) != 0) {
         hpkv_log(HPKV_LOG_WARNING, "Purge operation already in progress\n");
@@ -1773,6 +1767,11 @@ static int purge_data(void)
         if (sector % 1000 == 0) {  // Sync every 1000 sectors to avoid overwhelming I/O
             sync_dirty_buffer(bh);
             hpkv_log(HPKV_LOG_INFO, "Purged %llu sectors\n", (unsigned long long)sector);
+            
+            // Allow other processes to run
+            percpu_up_write(&rw_sem);
+            cond_resched();
+            percpu_down_write(&rw_sem);
         }
         
         brelse(bh);
