@@ -93,6 +93,7 @@ static void write_record_work(struct work_struct *work);
 static void metadata_update_work_func(struct work_struct *work);
 static void release_sectors(sector_t start_sector, size_t size);
 static bool flush_workqueue_timeout(struct workqueue_struct *wq, unsigned long timeout);
+static void force_free_records(void);
 
 static int major_num;
 static struct kmem_cache *record_cache;
@@ -2328,20 +2329,32 @@ error_unregister_chrdev:
 
 static void force_free_records(void)
 {
-    struct kmem_cache_cpu *c;
-    struct page *page;
-    void *object;
-    unsigned long flags;
+    void *obj;
+    int freed = 0;
 
     hpkv_log(HPKV_LOG_INFO, "Forcibly freeing remaining records\n");
 
-    local_irq_save(flags);
-    c = this_cpu_ptr(record_cache->cpu_slab);
-    while ((object = c->freelist) != NULL) {
-        c->freelist = get_freepointer(record_cache, object);
-        free_one(record_cache, page, object);
+    if (!record_cache) {
+        hpkv_log(HPKV_LOG_WARNING, "Record cache is already NULL\n");
+        return;
     }
-    local_irq_restore(flags);
+
+    // Iterate through all objects in the cache and free them
+    while ((obj = kmem_cache_alloc(record_cache, GFP_KERNEL)) != NULL) {
+        struct record *record = obj;
+        if (record->value) {
+            kfree(record->value);
+            record->value = NULL;
+        }
+        kmem_cache_free(record_cache, obj);
+        freed++;
+    }
+
+    // Now it's safe to destroy the cache
+    kmem_cache_destroy(record_cache);
+    record_cache = NULL;
+
+    hpkv_log(HPKV_LOG_INFO, "Finished forcibly freeing %d records\n", freed);
 }
 
 static void __exit hpkv_exit(void)
