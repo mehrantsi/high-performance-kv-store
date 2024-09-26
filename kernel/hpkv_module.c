@@ -1714,7 +1714,7 @@ static int purge_data(void)
     // Use a write lock for the entire operation to prevent concurrent access
     percpu_down_write(&rw_sem);
 
-    // Clear in-memory data structures first
+    // Clear in-memory data structures
     rcu_read_lock();
     hash_init(kv_store);  // This effectively clears the hash table
     rcu_read_unlock();
@@ -1732,21 +1732,8 @@ static int purge_data(void)
 
     // Clear cache
     spin_lock_irqsave(&cache_lock, flags);
-    {
-        int bkt;
-        struct hlist_node *tmp;
-        struct cached_record *cached;
-
-        hash_for_each_safe(cache, bkt, tmp, cached, node) {
-            hash_del(&cached->node);
-            if (cached->value) {
-                kfree(cached->value);
-                cached->value = NULL;
-            }
-            kfree(cached);
-        }
-        cache_count = 0;
-    }
+    hash_init(cache);
+    cache_count = 0;
     spin_unlock_irqrestore(&cache_lock, flags);
 
     hpkv_log(HPKV_LOG_INFO, "In-memory structures cleared\n");
@@ -1817,6 +1804,10 @@ static int purge_data(void)
     kfree(empty_buffer);
     percpu_up_write(&rw_sem);
     synchronize_rcu();
+
+    INIT_LIST_HEAD(&write_buffer);
+    write_buffer_exit = false;
+
     atomic_set(&purge_in_progress, 0);
     hpkv_log(HPKV_LOG_INFO, "Purge operation completed with status %d\n", ret);
     return ret;
