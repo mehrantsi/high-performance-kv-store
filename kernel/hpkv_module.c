@@ -2342,9 +2342,6 @@ static void force_free_records(void)
         return;
     }
 
-    // Ensure all RCU read-side critical sections have completed
-    synchronize_rcu();
-
     // Acquire write lock to prevent any concurrent access
     percpu_down_write(&rw_sem);
 
