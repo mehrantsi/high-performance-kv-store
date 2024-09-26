@@ -1660,6 +1660,12 @@ static int purge_data(void)
         return -EBUSY;
     }
 
+    // Check again if there are entries in the write buffer
+    //if (write_buffer_size() > 0) {
+    //    hpkv_log(HPKV_LOG_WARNING, "Write buffer is not empty, cannot start purge\n");
+    //    return -EBUSY;
+    //}
+
     // Set purge_in_progress flag
     if (atomic_cmpxchg(&purge_in_progress, 0, 1) != 0) {
         hpkv_log(HPKV_LOG_WARNING, "Purge operation already in progress\n");
@@ -1672,11 +1678,9 @@ static int purge_data(void)
     char *empty_buffer;
     unsigned long flags;
     struct rb_node *node, *next;
-    struct record *record, *tmp_record;
-    struct cached_record *cached;
-    struct hlist_node *tmp_cached;
-    struct write_buffer_entry *entry, *tmp_entry;
-    int bkt;
+    struct record *record;
+    struct write_buffer_entry *entry, *tmp;
+    LIST_HEAD(local_list);
 
     hpkv_log(HPKV_LOG_INFO, "Starting purge operation\n");
 
@@ -1692,63 +1696,72 @@ static int purge_data(void)
     // Use a write lock for the entire operation to prevent concurrent access
     percpu_down_write(&rw_sem);
 
-    // Clear the write buffer first
-    spin_lock(&write_buffer_lock);
-    list_for_each_entry_safe(entry, tmp_entry, &write_buffer, list) {
-        list_del(&entry->list);
-        if (entry->record) {
-            kfree(entry->record->value);
-            kmem_cache_free(record_cache, entry->record);
-        }
-        kfree(entry);
-    }
-    INIT_LIST_HEAD(&write_buffer);
-    spin_unlock(&write_buffer_lock);
-
-    hpkv_log(HPKV_LOG_INFO, "Write buffer cleared\n");
-
-    // Clear the red-black tree and hash table
+    // Clear in-memory data structures first
     rcu_read_lock();
+    hash_init(kv_store);  // This effectively clears the hash table
+    rcu_read_unlock();
+
+    // Clear the red-black tree
     for (node = rb_first(&records_tree); node; node = next) {
         next = rb_next(node);
         record = rb_entry(node, struct record, tree_node);
-        rb_erase(&record->tree_node, &records_tree);
-        hash_del_rcu(&record->hash_node);
+        rb_erase(node, &records_tree);
         call_rcu(&record->rcu, record_free_rcu);
     }
-    rcu_read_unlock();
 
-    // Reinitialize the hash table
-    hash_init(kv_store);
-
-    hpkv_log(HPKV_LOG_INFO, "In-memory structures (RB-tree and hash table) cleared\n");
-
-    // Clear cache
-    spin_lock_irqsave(&cache_lock, flags);
-    hash_for_each_safe(cache, bkt, tmp_cached, cached, node) {
-        hash_del(&cached->node);
-        kfree(cached->value);
-        kfree(cached);
-    }
-    cache_count = 0;
-    spin_unlock_irqrestore(&cache_lock, flags);
-
-    hpkv_log(HPKV_LOG_INFO, "Cache cleared\n");
-
-    // Reset counters
     atomic_long_set(&total_disk_usage, 0);
     atomic_set(&record_count, 0);
 
-    // Clear only the allocated sectors on disk
-    spin_lock(&sector_allocation_lock);
-    for_each_set_bit(sector, allocated_sectors, SECTORS_BITMAP_SIZE) {
-        if (sector == 0) continue;  // Skip metadata sector
+    // Clear cache
+    spin_lock_irqsave(&cache_lock, flags);
+    {
+        int bkt;
+        struct hlist_node *tmp;
+        struct cached_record *cached;
 
+        hash_for_each_safe(cache, bkt, tmp, cached, node) {
+            hash_del(&cached->node);
+            if (cached->value) {
+                kfree(cached->value);
+                cached->value = NULL;
+            }
+            kfree(cached);
+        }
+        cache_count = 0;
+    }
+    spin_unlock_irqrestore(&cache_lock, flags);
+
+    hpkv_log(HPKV_LOG_INFO, "In-memory structures cleared\n");
+
+    // Clear the write buffer
+    spin_lock(&write_buffer_lock);
+    list_splice_init(&write_buffer, &local_list);
+    spin_unlock(&write_buffer_lock);
+
+    list_for_each_entry_safe(entry, tmp, &local_list, list) {
+        list_del(&entry->list);
+        if (entry->record) {
+            call_rcu(&entry->record->rcu, record_free_rcu);
+        }
+        kfree(entry);
+    }
+
+    hpkv_log(HPKV_LOG_INFO, "Write buffer cleared\n");
+
+    // Clear the bitmap
+    spin_lock(&sector_allocation_lock);
+    bitmap_zero(allocated_sectors, SECTORS_BITMAP_SIZE);
+    set_bit(0, allocated_sectors);  // Mark metadata sector as allocated
+    smp_mb();  // Memory barrier after bit operations
+    spin_unlock(&sector_allocation_lock);
+
+    // Now clear the disk
+    while (sector * HPKV_BLOCK_SIZE < i_size_read(bdev->bd_inode)) {
         bh = __getblk(bdev, sector, HPKV_BLOCK_SIZE);
         if (!bh) {
             hpkv_log(HPKV_LOG_ERR, "Failed to get block for purging at sector %llu\n", (unsigned long long)sector);
             ret = -EIO;
-            break;
+            goto out;
         }
 
         lock_buffer(bh);
@@ -1758,39 +1771,22 @@ static int purge_data(void)
         unlock_buffer(bh);
         
         if (sector % 1000 == 0) {  // Sync every 1000 sectors to avoid overwhelming I/O
-            hpkv_log(HPKV_LOG_DEBUG, "Syncing sector %llu\n", (unsigned long long)sector);
-            ret = sync_dirty_buffer(bh);
-            if (ret) {
-                hpkv_log(HPKV_LOG_ERR, "Failed to sync buffer at sector %llu, error %d\n", (unsigned long long)sector, ret);
-                brelse(bh);
-                break;
-            }
+            sync_dirty_buffer(bh);
             hpkv_log(HPKV_LOG_INFO, "Purged %llu sectors\n", (unsigned long long)sector);
         }
         
         brelse(bh);
+        sector++;
 
         if (signal_pending(current)) {
             hpkv_log(HPKV_LOG_WARNING, "Purge operation interrupted\n");
             ret = -EINTR;
-            break;
+            goto out;
         }
     }
-    
-    // Clear the bitmap, keeping only the metadata sector marked
-    bitmap_zero(allocated_sectors, SECTORS_BITMAP_SIZE);
-    set_bit(0, allocated_sectors);  // Mark metadata sector as allocated
-    smp_mb();  // Memory barrier after bit operations
-    spin_unlock(&sector_allocation_lock);
 
-    // Perform a controlled sync operation
-    hpkv_log(HPKV_LOG_INFO, "Starting final sync operation\n");
-    ret = blkdev_issue_flush(bdev);
-    if (ret) {
-        hpkv_log(HPKV_LOG_ERR, "Final sync failed with error %d\n", ret);
-    } else {
-        hpkv_log(HPKV_LOG_INFO, "Final sync completed successfully\n");
-    }
+    // Final sync
+    sync_blockdev(bdev);
 
     ret = update_metadata();
     if (ret < 0) {
@@ -1799,13 +1795,10 @@ static int purge_data(void)
         hpkv_log(HPKV_LOG_INFO, "Metadata updated successfully after purge\n");
     }
 
+out:
     kfree(empty_buffer);
     percpu_up_write(&rw_sem);
     synchronize_rcu();
-
-    INIT_LIST_HEAD(&write_buffer);
-    write_buffer_exit = false;
-
     atomic_set(&purge_in_progress, 0);
     hpkv_log(HPKV_LOG_INFO, "Purge operation completed with status %d\n", ret);
     return ret;
