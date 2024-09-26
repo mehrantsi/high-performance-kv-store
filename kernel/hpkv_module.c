@@ -462,7 +462,7 @@ static int search_record(const char *key, char **value, size_t *value_len)
     rcu_read_lock();
     record = record_find_rcu(key);
     if (record) {
-        *value = kmalloc(record->value_len + 1, GFP_ATOMIC);
+        *value = kmalloc(record->value_len + 1, GFP_KERNEL);
         if (!*value) {
             hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for value\n");
             rcu_read_unlock();
