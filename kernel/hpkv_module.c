@@ -2311,54 +2311,6 @@ error_unregister_chrdev:
     return ret;
 }
 
-static void force_free_records(void)
-{
-    struct record *record;
-    struct hlist_node *tmp;
-    int bkt;
-    int freed = 0;
-    void *obj;
-
-    hpkv_log(HPKV_LOG_INFO, "Forcibly freeing remaining records\n");
-
-    if (!record_cache) {
-        hpkv_log(HPKV_LOG_WARNING, "Record cache is already NULL\n");
-        return;
-    }
-
-    // Acquire write lock to prevent any concurrent access
-    percpu_down_write(&rw_sem);
-
-    // Iterate through the hash table and free all records
-    hash_for_each_safe(kv_store, bkt, tmp, record, hash_node) {
-        hash_del_rcu(&record->hash_node);
-        rb_erase(&record->tree_node, &records_tree);
-        if (record->value) {
-            kfree(record->value);
-            record->value = NULL;
-        }
-        kmem_cache_free(record_cache, record);
-        freed++;
-    }
-
-    // Clear the hash table
-    hash_init(kv_store);
-
-    // Free any remaining objects in the cache
-    while ((obj = kmem_cache_alloc(record_cache, GFP_KERNEL)) != NULL) {
-        kmem_cache_free(record_cache, obj);
-        freed++;
-    }
-
-    percpu_up_write(&rw_sem);
-
-    // Now it's safe to destroy the cache
-    kmem_cache_destroy(record_cache);
-    record_cache = NULL;
-
-    hpkv_log(HPKV_LOG_INFO, "Finished forcibly freeing %d records\n", freed);
-}
-
 static void __exit hpkv_exit(void)
 {
     struct record *record;
@@ -2467,14 +2419,14 @@ static void __exit hpkv_exit(void)
     // Wait for a short period to ensure all operations are complete
     msleep(500);
 
-    // Release the write lock before calling force_free_records
-    percpu_up_write(&rw_sem);
-
-    // Force free any remaining records
-    force_free_records();
-
     unregister_chrdev(major_num, DEVICE_NAME);
     percpu_free_rwsem(&rw_sem);
+
+    if (record_cache) {
+        kmem_cache_shrink(record_cache);
+        kmem_cache_destroy(record_cache);
+        record_cache = NULL;
+    }
 
     hpkv_log(HPKV_LOG_INFO, "Module unloaded successfully\n");
 }
