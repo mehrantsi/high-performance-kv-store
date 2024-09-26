@@ -438,7 +438,7 @@ static struct record *find_record_in_write_buffer(const char *key)
             return entry->record;
         }
     }
-    spin_unlock(&write_buffer_lock);
+    spin_lock(&write_buffer_lock);
     return NULL;
 }
 
@@ -2333,6 +2333,7 @@ static void force_free_records(void)
     struct hlist_node *tmp;
     int bkt;
     int freed = 0;
+    void *obj;
 
     hpkv_log(HPKV_LOG_INFO, "Forcibly freeing remaining records\n");
 
@@ -2340,6 +2341,12 @@ static void force_free_records(void)
         hpkv_log(HPKV_LOG_WARNING, "Record cache is already NULL\n");
         return;
     }
+
+    // Ensure all RCU read-side critical sections have completed
+    synchronize_rcu();
+
+    // Acquire write lock to prevent any concurrent access
+    percpu_down_write(&rw_sem);
 
     // Iterate through the hash table and free all records
     hash_for_each_safe(kv_store, bkt, tmp, record, hash_node) {
@@ -2352,6 +2359,17 @@ static void force_free_records(void)
         kmem_cache_free(record_cache, record);
         freed++;
     }
+
+    // Clear the hash table
+    hash_init(kv_store);
+
+    // Free any remaining objects in the cache
+    while ((obj = kmem_cache_alloc(record_cache, GFP_KERNEL)) != NULL) {
+        kmem_cache_free(record_cache, obj);
+        freed++;
+    }
+
+    percpu_up_write(&rw_sem);
 
     // Now it's safe to destroy the cache
     kmem_cache_destroy(record_cache);
@@ -2468,15 +2486,11 @@ static void __exit hpkv_exit(void)
     // Wait for a short period to ensure all operations are complete
     msleep(500);
 
+    // Release the write lock before calling force_free_records
+    percpu_up_write(&rw_sem);
+
     // Force free any remaining records
     force_free_records();
-
-    // Destroy the cache
-    if (record_cache) {
-        kmem_cache_shrink(record_cache);
-        kmem_cache_destroy(record_cache);
-        record_cache = NULL;
-    }
 
     unregister_chrdev(major_num, DEVICE_NAME);
     percpu_free_rwsem(&rw_sem);
