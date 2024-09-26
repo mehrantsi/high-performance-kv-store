@@ -1684,19 +1684,12 @@ static int purge_data(void)
         return -EBUSY;
     }
 
-    // Check again if there are entries in the write buffer
-    //if (write_buffer_size() > 0) {
-    //    hpkv_log(HPKV_LOG_WARNING, "Write buffer is not empty, cannot start purge\n");
-    //    return -EBUSY;
-    //}
-
     // Set purge_in_progress flag
     if (atomic_cmpxchg(&purge_in_progress, 0, 1) != 0) {
         hpkv_log(HPKV_LOG_WARNING, "Purge operation already in progress\n");
         return -EBUSY;
     }
 
-    sector_t sector = 1;
     struct buffer_head *bh;
     int ret = 0;
     char *empty_buffer;
@@ -1772,20 +1765,16 @@ static int purge_data(void)
 
     hpkv_log(HPKV_LOG_INFO, "Write buffer cleared\n");
 
-    // Clear the bitmap
+    // Clear only the allocated sectors on disk
     spin_lock(&sector_allocation_lock);
-    bitmap_zero(allocated_sectors, SECTORS_BITMAP_SIZE);
-    set_bit(0, allocated_sectors);  // Mark metadata sector as allocated
-    smp_mb();  // Memory barrier after bit operations
-    spin_unlock(&sector_allocation_lock);
+    for_each_set_bit(sector, allocated_sectors, SECTORS_BITMAP_SIZE) {
+        if (sector == 0) continue;  // Skip metadata sector
 
-    // Now clear the disk
-    while (sector * HPKV_BLOCK_SIZE < i_size_read(bdev->bd_inode)) {
         bh = __getblk(bdev, sector, HPKV_BLOCK_SIZE);
         if (!bh) {
             hpkv_log(HPKV_LOG_ERR, "Failed to get block for purging at sector %llu\n", (unsigned long long)sector);
             ret = -EIO;
-            goto out;
+            break;
         }
 
         lock_buffer(bh);
@@ -1800,14 +1789,19 @@ static int purge_data(void)
         }
         
         brelse(bh);
-        sector++;
 
         if (signal_pending(current)) {
             hpkv_log(HPKV_LOG_WARNING, "Purge operation interrupted\n");
             ret = -EINTR;
-            goto out;
+            break;
         }
     }
+    
+    // Clear the bitmap, keeping only the metadata sector marked
+    bitmap_zero(allocated_sectors, SECTORS_BITMAP_SIZE);
+    set_bit(0, allocated_sectors);  // Mark metadata sector as allocated
+    smp_mb();  // Memory barrier after bit operations
+    spin_unlock(&sector_allocation_lock);
 
     // Final sync
     sync_blockdev(bdev);
@@ -1819,7 +1813,6 @@ static int purge_data(void)
         hpkv_log(HPKV_LOG_INFO, "Metadata updated successfully after purge\n");
     }
 
-out:
     kfree(empty_buffer);
     percpu_up_write(&rw_sem);
     synchronize_rcu();
