@@ -2329,7 +2329,9 @@ error_unregister_chrdev:
 
 static void force_free_records(void)
 {
-    void *obj;
+    struct record *record;
+    struct hlist_node *tmp;
+    int bkt;
     int freed = 0;
 
     hpkv_log(HPKV_LOG_INFO, "Forcibly freeing remaining records\n");
@@ -2339,14 +2341,15 @@ static void force_free_records(void)
         return;
     }
 
-    // Iterate through all objects in the cache and free them
-    while ((obj = kmem_cache_alloc(record_cache, GFP_KERNEL)) != NULL) {
-        struct record *record = obj;
+    // Iterate through the hash table and free all records
+    hash_for_each_safe(kv_store, bkt, tmp, record, hash_node) {
+        hash_del_rcu(&record->hash_node);
+        rb_erase(&record->tree_node, &records_tree);
         if (record->value) {
             kfree(record->value);
             record->value = NULL;
         }
-        kmem_cache_free(record_cache, obj);
+        kmem_cache_free(record_cache, record);
         freed++;
     }
 
