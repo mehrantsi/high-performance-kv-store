@@ -456,6 +456,10 @@ static int search_record(const char *key, char **value, size_t *value_len)
     // First, check the write buffer
     percpu_down_read(&rw_sem);
     list_for_each_entry_reverse(entry, &write_buffer, list) {
+        if (!entry || !entry->record) {
+            hpkv_log(HPKV_LOG_WARNING, "Encountered null entry or record in write buffer\n");
+            continue;
+        }
         if (strcmp(entry->record->key, key) == 0) {
             if (entry->op == OP_DELETE) {
                 hpkv_log(HPKV_LOG_DEBUG, "Key %s found in write buffer, but marked for deletion\n", key);
