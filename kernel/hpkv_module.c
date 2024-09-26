@@ -2326,6 +2326,24 @@ error_unregister_chrdev:
     return ret;
 }
 
+static void force_free_records(void)
+{
+    struct kmem_cache_cpu *c;
+    struct page *page;
+    void *object;
+    unsigned long flags;
+
+    hpkv_log(HPKV_LOG_INFO, "Forcibly freeing remaining records\n");
+
+    local_irq_save(flags);
+    c = this_cpu_ptr(record_cache->cpu_slab);
+    while ((object = c->freelist) != NULL) {
+        c->freelist = get_freepointer(record_cache, object);
+        free_one(record_cache, page, object);
+    }
+    local_irq_restore(flags);
+}
+
 static void __exit hpkv_exit(void)
 {
     struct record *record;
@@ -2433,6 +2451,9 @@ static void __exit hpkv_exit(void)
     
     // Wait for a short period to ensure all operations are complete
     msleep(500);
+
+    // Force free any remaining records
+    force_free_records();
 
     // Destroy the cache
     if (record_cache) {
