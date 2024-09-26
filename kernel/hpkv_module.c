@@ -2422,9 +2422,26 @@ static void __exit hpkv_exit(void)
     unregister_chrdev(major_num, DEVICE_NAME);
     percpu_free_rwsem(&rw_sem);
 
+    // Add additional safeguards and logging for kmem_cache_destroy
     if (record_cache) {
+        hpkv_log(HPKV_LOG_INFO, "Attempting to shrink record_cache\n");
         kmem_cache_shrink(record_cache);
-        kmem_cache_destroy(record_cache);
+        hpkv_log(HPKV_LOG_INFO, "Record cache shrunk, attempting to destroy\n");
+        
+        // Add a retry mechanism for destroying the cache
+        int retry_count = 0;
+        while (kmem_cache_destroy(record_cache) != 0 && retry_count < 5) {
+            hpkv_log(HPKV_LOG_WARNING, "Failed to destroy record_cache, retrying (attempt %d)\n", retry_count + 1);
+            msleep(100);  // Wait for 100ms before retrying
+            retry_count++;
+        }
+        
+        if (retry_count == 5) {
+            hpkv_log(HPKV_LOG_ERR, "Failed to destroy record_cache after 5 attempts\n");
+        } else {
+            hpkv_log(HPKV_LOG_INFO, "Record cache destroyed successfully\n");
+        }
+        
         record_cache = NULL;
     }
 
