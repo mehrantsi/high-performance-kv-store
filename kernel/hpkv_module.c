@@ -455,13 +455,13 @@ static int search_record(const char *key, char **value, size_t *value_len)
     hpkv_log(HPKV_LOG_DEBUG, "Searching for key: %s\n", key);
 
     // First, check in-memory structures
-    rcu_read_lock();
-    record = record_find_rcu(key);
+    percpu_down_read(&rw_sem);
+    record = search_record_in_memory(key);
     if (record) {
         *value = kmalloc(record->value_len + 1, GFP_KERNEL);
         if (!*value) {
             hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for value\n");
-            rcu_read_unlock();
+            percpu_up_read(&rw_sem);
             return -ENOMEM;
         }
         memcpy(*value, record->value, record->value_len + 1);
@@ -469,7 +469,7 @@ static int search_record(const char *key, char **value, size_t *value_len)
         ret = 0;
         hpkv_log(HPKV_LOG_DEBUG, "Key %s found in memory\n", key);
     }
-    rcu_read_unlock();
+    percpu_up_read(&rw_sem);
 
     if (ret == 0) {
         if (!*value || *value_len == 0) {
