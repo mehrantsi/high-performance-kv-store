@@ -1992,9 +1992,9 @@ static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
     switch (cmd) {
         case 0:  // Get by exact key
-            if (!arg) {
-                hpkv_log(HPKV_LOG_ERR, "NULL argument passed to ioctl\n");
-                return -EINVAL;
+            if (!arg || !access_ok((void __user *)arg, MAX_KEY_SIZE)) {
+                hpkv_log(HPKV_LOG_ERR, "Invalid user space pointer\n");
+                return -EFAULT;
             }
             
             if (copy_from_user(key, (char __user *)arg, MAX_KEY_SIZE)) {
@@ -2007,8 +2007,8 @@ static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             
             ret = search_record(key, &value, &value_len);
             if (ret == 0) {
-                if (!value) {
-                    hpkv_log(HPKV_LOG_ERR, "search_record returned success but value is NULL\n");
+                if (!value || value_len == 0) {
+                    hpkv_log(HPKV_LOG_ERR, "search_record returned success but value is NULL or empty\n");
                     return -EFAULT;
                 }
                 
