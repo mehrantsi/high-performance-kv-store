@@ -446,21 +446,31 @@ static int search_record(const char *key, char **value, size_t *value_len)
     struct write_buffer_entry *entry;
     int ret = -ENOENT;
 
+    if (!key || !value || !value_len) {
+        hpkv_log(HPKV_LOG_ERR, "Invalid parameters passed to search_record\n");
+        return -EINVAL;
+    }
+
+    hpkv_log(HPKV_LOG_DEBUG, "Searching for key: %s\n", key);
+
     // First, check the write buffer
     percpu_down_read(&rw_sem);
     list_for_each_entry_reverse(entry, &write_buffer, list) {
         if (strcmp(entry->record->key, key) == 0) {
             if (entry->op == OP_DELETE) {
+                hpkv_log(HPKV_LOG_DEBUG, "Key %s found in write buffer, but marked for deletion\n", key);
                 percpu_up_read(&rw_sem);
                 return -ENOENT;  // Key was deleted
             }
             *value = kmalloc(entry->record->value_len + 1, GFP_KERNEL);
             if (!*value) {
+                hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for value\n");
                 percpu_up_read(&rw_sem);
                 return -ENOMEM;
             }
             memcpy(*value, entry->record->value, entry->record->value_len + 1);
             *value_len = entry->record->value_len;
+            hpkv_log(HPKV_LOG_DEBUG, "Key %s found in write buffer\n", key);
             percpu_up_read(&rw_sem);
             return 0;
         }
@@ -472,6 +482,7 @@ static int search_record(const char *key, char **value, size_t *value_len)
     if (record) {
         *value = kmalloc(record->value_len + 1, GFP_ATOMIC);
         if (!*value) {
+            hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for value\n");
             rcu_read_unlock();
             percpu_up_read(&rw_sem);
             return -ENOMEM;
@@ -479,6 +490,7 @@ static int search_record(const char *key, char **value, size_t *value_len)
         memcpy(*value, record->value, record->value_len + 1);
         *value_len = record->value_len;
         ret = 0;
+        hpkv_log(HPKV_LOG_DEBUG, "Key %s found in memory\n", key);
     }
     rcu_read_unlock();
     percpu_up_read(&rw_sem);
@@ -486,6 +498,8 @@ static int search_record(const char *key, char **value, size_t *value_len)
     if (ret == 0) {
         if (!*value || *value_len == 0) {
             hpkv_log(HPKV_LOG_ERR, "Invalid value or value_len in search_record\n");
+            kfree(*value);
+            *value = NULL;
             return -EFAULT;
         }
         cache_put(key, *value, *value_len, record->sector);
@@ -495,7 +509,10 @@ static int search_record(const char *key, char **value, size_t *value_len)
     // If not found in memory, attempt to load from disk
     ret = load_record_from_disk(key, value, value_len);
     if (ret == 0) {
+        hpkv_log(HPKV_LOG_DEBUG, "Key %s loaded from disk\n", key);
         cache_put(key, *value, *value_len, 0);
+    } else {
+        hpkv_log(HPKV_LOG_DEBUG, "Key %s not found on disk\n", key);
     }
 
     return ret;
@@ -2009,7 +2026,14 @@ static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             if (ret == 0) {
                 if (!value || value_len == 0) {
                     hpkv_log(HPKV_LOG_ERR, "search_record returned success but value is NULL or empty\n");
+                    kfree(value);
                     return -EFAULT;
+                }
+                
+                if (value_len > MAX_VALUE_SIZE) {
+                    hpkv_log(HPKV_LOG_ERR, "Value length exceeds maximum allowed size\n");
+                    kfree(value);
+                    return -EINVAL;
                 }
                 
                 if (copy_to_user((void __user *)arg, value, value_len)) {
@@ -2019,9 +2043,13 @@ static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                 }
                 kfree(value);
                 return 0;
+            } else if (ret == -ENOENT) {
+                hpkv_log(HPKV_LOG_DEBUG, "Key not found: %s\n", key);
+                return -ENOENT;
+            } else {
+                hpkv_log(HPKV_LOG_ERR, "search_record failed with error %d\n", ret);
+                return ret;
             }
-            hpkv_log(HPKV_LOG_DEBUG, "search_record returned %d\n", ret);
-            return ret;
         
         case 1:  // Delete by key
             if (copy_from_user(key, (char __user *)arg, MAX_KEY_SIZE))
