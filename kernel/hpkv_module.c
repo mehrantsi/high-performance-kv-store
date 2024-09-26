@@ -2380,16 +2380,15 @@ static void __exit hpkv_exit(void)
     }
     spin_unlock(&write_buffer_lock);
 
-    // Clear the hash table and free all records
+    // Clear the hash table and schedule records for deletion
     hash_for_each_safe(kv_store, bkt, tmp, record, hash_node) {
         hash_del_rcu(&record->hash_node);
         rb_erase(&record->tree_node, &records_tree);
-        if (record->value) {
-            kfree(record->value);
-            record->value = NULL;
-        }
-        kmem_cache_free(record_cache, record);
+        call_rcu(&record->rcu, record_free_rcu);
     }
+
+    // Ensure all RCU callbacks have completed
+    synchronize_rcu();
 
     // Clear cache
     spin_lock(&cache_lock);
@@ -2416,9 +2415,6 @@ static void __exit hpkv_exit(void)
 
     // Clean up other resources
     remove_proc_entry(PROC_ENTRY, NULL);
-    
-    // Ensure all RCU callbacks have completed
-    synchronize_rcu();
     
     // Wait for a short period to ensure all operations are complete
     msleep(500);
