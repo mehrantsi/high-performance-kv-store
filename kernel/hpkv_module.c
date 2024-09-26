@@ -2334,25 +2334,13 @@ static void __exit hpkv_exit(void)
     struct cached_record *cached;
     struct write_buffer_entry *wb_entry, *wb_tmp;
     int retry_count = 0;
-    const int max_retries = 5;
+    const int max_retries = 10;  // Increased from 5 to 10
 
     hpkv_log(HPKV_LOG_INFO, "Starting module unload\n");
 
-    // Wait for compact_in_progress
-    while (atomic_read(&compact_in_progress)) {
-        if (retry_count++ >= max_retries) {
-            hpkv_log(HPKV_LOG_ERR, "Timed out waiting for compaction to complete. Forcing exit.\n");
-            break;
-        }
-        hpkv_log(HPKV_LOG_WARNING, "Waiting for ongoing compaction to complete before unloading...\n");
-        msleep(1000);  // Wait for 1 second before retrying
-    }
-
-    // Cancel and wait for all pending work
+    // Cancel all pending work
     cancel_delayed_work_sync(&compact_work);
     cancel_work_sync(&hpkv_flush_work);
-    flush_workqueue(compact_wq);
-    flush_workqueue(flush_wq);
 
     // Stop the write buffer thread
     if (write_buffer_thread) {
@@ -2362,18 +2350,31 @@ static void __exit hpkv_exit(void)
         write_buffer_thread = NULL;
     }
 
+    // Wait for compact_in_progress and flush_running
+    while (atomic_read(&compact_in_progress) || atomic_read(&flush_running)) {
+        if (retry_count++ >= max_retries) {
+            hpkv_log(HPKV_LOG_ERR, "Timed out waiting for operations to complete. Forcing exit.\n");
+            atomic_set(&compact_in_progress, 0);
+            atomic_set(&flush_running, 0);
+            break;
+        }
+        hpkv_log(HPKV_LOG_WARNING, "Waiting for ongoing operations to complete before unloading...\n");
+        msleep(2000);  // Wait for 2 seconds before retrying
+    }
+
     // Flush remaining entries in the write buffer
     flush_write_buffer();
 
-    // Wait for flush_running to become 0
-    retry_count = 0;
-    while (atomic_read(&flush_running)) {
-        if (retry_count++ >= max_retries) {
-            hpkv_log(HPKV_LOG_ERR, "Timed out waiting for flush to complete. Forcing exit.\n");
-            break;
-        }
-        hpkv_log(HPKV_LOG_WARNING, "Waiting for ongoing flush to complete before unloading...\n");
-        msleep(1000);  // Wait for 1 second before retrying
+    // Flush and destroy workqueues
+    if (compact_wq) {
+        flush_workqueue(compact_wq);
+        destroy_workqueue(compact_wq);
+        compact_wq = NULL;
+    }
+    if (flush_wq) {
+        flush_workqueue(flush_wq);
+        destroy_workqueue(flush_wq);
+        flush_wq = NULL;
     }
 
     // Acquire write lock to prevent any concurrent access
@@ -2430,19 +2431,18 @@ static void __exit hpkv_exit(void)
     // Ensure all RCU callbacks have completed
     synchronize_rcu();
     
-    // Destroy the cache after a short delay to ensure all operations are complete
-    msleep(100);
+    // Wait for a short period to ensure all operations are complete
+    msleep(500);
 
     // Destroy the cache
-    kmem_cache_shrink(record_cache);
+    if (record_cache) {
+        kmem_cache_shrink(record_cache);
+        kmem_cache_destroy(record_cache);
+        record_cache = NULL;
+    }
 
     unregister_chrdev(major_num, DEVICE_NAME);
     percpu_free_rwsem(&rw_sem);
-
-    // Destroy workqueues after all work is done
-    destroy_workqueue(compact_wq);
-    destroy_workqueue(flush_wq);
-
 
     hpkv_log(HPKV_LOG_INFO, "Module unloaded successfully\n");
 }
