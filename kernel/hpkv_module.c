@@ -484,6 +484,10 @@ static int search_record(const char *key, char **value, size_t *value_len)
     percpu_up_read(&rw_sem);
 
     if (ret == 0) {
+        if (!*value || *value_len == 0) {
+            hpkv_log(HPKV_LOG_ERR, "Invalid value or value_len in search_record\n");
+            return -EFAULT;
+        }
         cache_put(key, *value, *value_len, record->sector);
         return ret;
     }
@@ -1982,25 +1986,41 @@ out:
 static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     char key[MAX_KEY_SIZE];
-    char *value;
+    char *value = NULL;
     size_t value_len;
     int ret;
 
     switch (cmd) {
         case 0:  // Get by exact key
-            if (copy_from_user(key, (char __user *)arg, MAX_KEY_SIZE))
+            if (!arg) {
+                hpkv_log(HPKV_LOG_ERR, "NULL argument passed to ioctl\n");
+                return -EINVAL;
+            }
+            
+            if (copy_from_user(key, (char __user *)arg, MAX_KEY_SIZE)) {
+                hpkv_log(HPKV_LOG_ERR, "Failed to copy key from user space\n");
                 return -EFAULT;
+            }
             
             key[MAX_KEY_SIZE - 1] = '\0';
+            hpkv_log(HPKV_LOG_DEBUG, "Searching for key: %s\n", key);
+            
             ret = search_record(key, &value, &value_len);
             if (ret == 0) {
-                if (copy_to_user((void __user *)arg, value, value_len)) {
-                    kfree(value);  // Free the allocated memory
+                if (!value) {
+                    hpkv_log(HPKV_LOG_ERR, "search_record returned success but value is NULL\n");
                     return -EFAULT;
                 }
-                kfree(value);  // Free the allocated memory
+                
+                if (copy_to_user((void __user *)arg, value, value_len)) {
+                    hpkv_log(HPKV_LOG_ERR, "Failed to copy value to user space\n");
+                    kfree(value);
+                    return -EFAULT;
+                }
+                kfree(value);
                 return 0;
             }
+            hpkv_log(HPKV_LOG_DEBUG, "search_record returned %d\n", ret);
             return ret;
         
         case 1:  // Delete by key
