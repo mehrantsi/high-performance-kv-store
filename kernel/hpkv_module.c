@@ -1690,6 +1690,7 @@ static int purge_data(void)
         return -EBUSY;
     }
 
+    sector_t sector = 1;
     struct buffer_head *bh;
     int ret = 0;
     char *empty_buffer;
