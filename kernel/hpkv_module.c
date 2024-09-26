@@ -1673,7 +1673,8 @@ static int purge_data(void)
     unsigned long flags;
     struct rb_node *node, *next;
     struct record *record, *tmp_record;
-    struct cached_record *cached, *tmp_cached;
+    struct cached_record *cached;
+    struct hlist_node *tmp_cached;
     struct write_buffer_entry *entry, *tmp_entry;
     int bkt;
 
