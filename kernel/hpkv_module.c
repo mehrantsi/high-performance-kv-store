@@ -93,6 +93,7 @@ static void write_record_work(struct work_struct *work);
 static void metadata_update_work_func(struct work_struct *work);
 static void release_sectors(sector_t start_sector, size_t size);
 static bool flush_workqueue_timeout(struct workqueue_struct *wq, unsigned long timeout);
+static void sync_work_func(struct work_struct *work);
 
 static int major_num;
 static struct kmem_cache *record_cache;
@@ -190,6 +191,10 @@ static struct delayed_work compact_work;
 static struct workqueue_struct *flush_wq;
 static struct work_struct hpkv_flush_work;
 static DECLARE_WORK(metadata_update_work, metadata_update_work_func);
+
+static struct workqueue_struct *hpkv_wq;
+static void sync_work_func(struct work_struct *work);
+static DECLARE_WORK(sync_work, sync_work_func);
 
 #define HPKV_LOG_EMERG   0
 #define HPKV_LOG_ALERT   1
@@ -1796,7 +1801,7 @@ static int purge_data(void)
     spin_unlock(&sector_allocation_lock);
 
     // Final sync
-    sync_blockdev(bdev);
+    queue_work(hpkv_wq, &sync_work);
 
     ret = update_metadata();
     if (ret < 0) {
@@ -1989,6 +1994,11 @@ out:
     return ret;
 }
 
+static void sync_work_func(struct work_struct *work)
+{
+    sync_blockdev(bdev);
+}
+
 static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     char key[MAX_KEY_SIZE];
@@ -2065,7 +2075,12 @@ static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             return ret;
 
         case 3:  // Purge all data
-            return purge_data();
+            ret = purge_data();
+            if (ret == 0) {
+                // Wait for the sync work to complete
+                flush_workqueue(hpkv_wq);
+            }
+            return ret;
 
         default:
             return -ENOTTY;
@@ -2312,6 +2327,13 @@ static int __init hpkv_init(void)
 
     init_completion(&flush_completion);
 
+    hpkv_wq = create_singlethread_workqueue("hpkv_wq");
+    if (!hpkv_wq) {
+        hpkv_log(HPKV_LOG_ALERT, "Failed to create hpkv_wq workqueue\n");
+        ret = -ENOMEM;
+        goto error_destroy_compact_wq;
+    }
+
     hpkv_log(HPKV_LOG_INFO, "Module loaded successfully\n");
     hpkv_log(HPKV_LOG_WARNING, "Registered with major number %d\n", major_num);
     return 0;
@@ -2450,6 +2472,11 @@ static void __exit hpkv_exit(void)
     // Destroy workqueues after all work is done
     destroy_workqueue(compact_wq);
     destroy_workqueue(flush_wq);
+
+    if (hpkv_wq) {
+        flush_workqueue(hpkv_wq);
+        destroy_workqueue(hpkv_wq);
+    }
 
     hpkv_log(HPKV_LOG_INFO, "Module unloaded successfully\n");
 }
