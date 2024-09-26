@@ -2319,7 +2319,7 @@ static void __exit hpkv_exit(void)
     struct cached_record *cached;
     struct write_buffer_entry *wb_entry, *wb_tmp;
     int retry_count = 0;
-    const int max_retries = 10;  // Increased from 5 to 10
+    const int max_retries = 10;
 
     hpkv_log(HPKV_LOG_INFO, "Starting module unload\n");
 
@@ -2389,6 +2389,7 @@ static void __exit hpkv_exit(void)
 
     // Ensure all RCU callbacks have completed
     synchronize_rcu();
+    rcu_barrier();
 
     // Clear cache
     spin_lock(&cache_lock);
