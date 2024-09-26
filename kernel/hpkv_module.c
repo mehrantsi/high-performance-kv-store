@@ -2428,19 +2428,16 @@ static void __exit hpkv_exit(void)
         kmem_cache_shrink(record_cache);
         hpkv_log(HPKV_LOG_INFO, "Record cache shrunk, attempting to destroy\n");
         
-        // Add a retry mechanism for destroying the cache
-        int retry_count = 0;
-        while (kmem_cache_destroy(record_cache) != 0 && retry_count < 5) {
-            hpkv_log(HPKV_LOG_WARNING, "Failed to destroy record_cache, retrying (attempt %d)\n", retry_count + 1);
-            msleep(100);  // Wait for 100ms before retrying
-            retry_count++;
-        }
+        // Ensure all RCU callbacks have completed before destroying the cache
+        rcu_barrier();
         
-        if (retry_count == 5) {
-            hpkv_log(HPKV_LOG_ERR, "Failed to destroy record_cache after 5 attempts\n");
-        } else {
-            hpkv_log(HPKV_LOG_INFO, "Record cache destroyed successfully\n");
-        }
+        // Short delay to allow any ongoing operations to complete
+        msleep(100);
+        
+        // Destroy the cache
+        kmem_cache_destroy(record_cache);
+        
+        hpkv_log(HPKV_LOG_INFO, "Record cache destroy operation completed\n");
         
         record_cache = NULL;
     }
