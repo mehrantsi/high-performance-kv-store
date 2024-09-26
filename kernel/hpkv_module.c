@@ -458,34 +458,7 @@ static int search_record(const char *key, char **value, size_t *value_len)
 
     hpkv_log(HPKV_LOG_DEBUG, "Searching for key: %s\n", key);
 
-    // First, check the write buffer
-    percpu_down_read(&rw_sem);
-    list_for_each_entry_reverse(entry, &write_buffer, list) {
-        if (!entry || !entry->record) {
-            hpkv_log(HPKV_LOG_WARNING, "Encountered null entry or record in write buffer\n");
-            continue;
-        }
-        if (strcmp(entry->record->key, key) == 0) {
-            if (entry->op == OP_DELETE) {
-                hpkv_log(HPKV_LOG_DEBUG, "Key %s found in write buffer, but marked for deletion\n", key);
-                percpu_up_read(&rw_sem);
-                return -ENOENT;  // Key was deleted
-            }
-            *value = kmalloc(entry->record->value_len + 1, GFP_KERNEL);
-            if (!*value) {
-                hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for value\n");
-                percpu_up_read(&rw_sem);
-                return -ENOMEM;
-            }
-            memcpy(*value, entry->record->value, entry->record->value_len + 1);
-            *value_len = entry->record->value_len;
-            hpkv_log(HPKV_LOG_DEBUG, "Key %s found in write buffer\n", key);
-            percpu_up_read(&rw_sem);
-            return 0;
-        }
-    }
-
-    // If not found in write buffer, check in-memory structures
+    // First, check in-memory structures
     rcu_read_lock();
     record = record_find_rcu(key);
     if (record) {
@@ -493,7 +466,6 @@ static int search_record(const char *key, char **value, size_t *value_len)
         if (!*value) {
             hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for value\n");
             rcu_read_unlock();
-            percpu_up_read(&rw_sem);
             return -ENOMEM;
         }
         memcpy(*value, record->value, record->value_len + 1);
@@ -502,7 +474,6 @@ static int search_record(const char *key, char **value, size_t *value_len)
         hpkv_log(HPKV_LOG_DEBUG, "Key %s found in memory\n", key);
     }
     rcu_read_unlock();
-    percpu_up_read(&rw_sem);
 
     if (ret == 0) {
         if (!*value || *value_len == 0) {
