@@ -144,7 +144,7 @@ struct write_buffer_entry {
     struct list_head list;
     struct work_struct work;
     struct completion work_done;
-    atomic_t work_status;  // 0: not started, 1: in progress, 2: completed, 3: timed out
+    atomic_t work_status;  // 0: not started, 1: in progress, 2: completed, 3: failed
 };
 
 static LIST_HEAD(write_buffer);
@@ -824,6 +824,7 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
     if (new_record) {
         hash_add_rcu(kv_store, &new_record->hash_node, hash);
         insert_rb_tree(new_record);
+        smp_wmb();  // Ensure all previous writes are visible before updating counters
         atomic_long_add(new_record->value_len, &total_disk_usage);
     } else {
         hpkv_log(HPKV_LOG_ERR, "Attempted to insert a null record. Key: %s\n", key);
