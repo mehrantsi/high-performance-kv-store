@@ -1673,6 +1673,7 @@ static int purge_data(void)
     unsigned long flags;
     struct rb_node *node, *next;
     struct record *record, *tmp_record;
+    struct cached_record *cached, *tmp_cached;
     struct write_buffer_entry *entry, *tmp_entry;
     int bkt;
 
@@ -1723,7 +1724,7 @@ static int purge_data(void)
 
     // Clear cache
     spin_lock_irqsave(&cache_lock, flags);
-    hash_for_each_safe(cache, bkt, tmp_record, cached, node) {
+    hash_for_each_safe(cache, bkt, tmp_cached, cached, node) {
         hash_del(&cached->node);
         kfree(cached->value);
         kfree(cached);
