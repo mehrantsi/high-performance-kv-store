@@ -62,7 +62,6 @@ static void cache_put(const char *key, const char *value, size_t value_len, sect
 static int load_record_from_disk(const char *key, char **value, size_t *value_len);
 static void record_free_rcu(struct rcu_head *head);
 static struct record *record_find_rcu(const char *key);
-static struct record *find_record_in_write_buffer(const char *key);
 static int search_record(const char *key, char **value, size_t *value_len);
 static int write_buffer_size(void);
 static sector_t find_free_sector(size_t required_size);
@@ -424,21 +423,6 @@ static struct record *record_find_rcu(const char *key)
     }
     }
     rcu_read_unlock();
-    return NULL;
-}
-
-static struct record *find_record_in_write_buffer(const char *key)
-{
-    struct write_buffer_entry *entry;
-
-    spin_lock(&write_buffer_lock);
-    list_for_each_entry(entry, &write_buffer, list) {
-        if (strcmp(entry->record->key, key) == 0) {
-            spin_unlock(&write_buffer_lock);
-            return entry->record;
-        }
-    }
-    spin_lock(&write_buffer_lock);
     return NULL;
 }
 
