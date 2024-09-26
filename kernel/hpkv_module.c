@@ -93,7 +93,6 @@ static void write_record_work(struct work_struct *work);
 static void metadata_update_work_func(struct work_struct *work);
 static void release_sectors(sector_t start_sector, size_t size);
 static bool flush_workqueue_timeout(struct workqueue_struct *wq, unsigned long timeout);
-static void sync_work_func(struct work_struct *work);
 
 static int major_num;
 static struct kmem_cache *record_cache;
@@ -192,9 +191,6 @@ static struct workqueue_struct *flush_wq;
 static struct work_struct hpkv_flush_work;
 static DECLARE_WORK(metadata_update_work, metadata_update_work_func);
 
-static struct workqueue_struct *hpkv_wq;
-static void sync_work_func(struct work_struct *work);
-static DECLARE_WORK(sync_work, sync_work_func);
 
 #define HPKV_LOG_EMERG   0
 #define HPKV_LOG_ALERT   1
@@ -1752,7 +1748,13 @@ static int purge_data(void)
         unlock_buffer(bh);
         
         if (sector % 1000 == 0) {  // Sync every 1000 sectors to avoid overwhelming I/O
-            sync_dirty_buffer(bh);
+            hpkv_log(HPKV_LOG_DEBUG, "Syncing sector %llu\n", (unsigned long long)sector);
+            ret = sync_dirty_buffer(bh);
+            if (ret) {
+                hpkv_log(HPKV_LOG_ERR, "Failed to sync buffer at sector %llu, error %d\n", (unsigned long long)sector, ret);
+                brelse(bh);
+                break;
+            }
             hpkv_log(HPKV_LOG_INFO, "Purged %llu sectors\n", (unsigned long long)sector);
         }
         
@@ -1771,8 +1773,14 @@ static int purge_data(void)
     smp_mb();  // Memory barrier after bit operations
     spin_unlock(&sector_allocation_lock);
 
-    // Final sync
-    queue_work(hpkv_wq, &sync_work);
+    // Perform a controlled sync operation
+    hpkv_log(HPKV_LOG_INFO, "Starting final sync operation\n");
+    ret = blkdev_issue_flush(bdev, GFP_KERNEL, NULL);
+    if (ret) {
+        hpkv_log(HPKV_LOG_ERR, "Final sync failed with error %d\n", ret);
+    } else {
+        hpkv_log(HPKV_LOG_INFO, "Final sync completed successfully\n");
+    }
 
     ret = update_metadata();
     if (ret < 0) {
@@ -2046,12 +2054,7 @@ static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             return ret;
 
         case 3:  // Purge all data
-            ret = purge_data();
-            if (ret == 0) {
-                // Wait for the sync work to complete
-                flush_workqueue(hpkv_wq);
-            }
-            return ret;
+            return purge_data();
 
         default:
             return -ENOTTY;
@@ -2298,12 +2301,6 @@ static int __init hpkv_init(void)
 
     init_completion(&flush_completion);
 
-    hpkv_wq = create_singlethread_workqueue("hpkv_wq");
-    if (!hpkv_wq) {
-        hpkv_log(HPKV_LOG_ALERT, "Failed to create hpkv_wq workqueue\n");
-        ret = -ENOMEM;
-        goto error_destroy_compact_wq;
-    }
 
     hpkv_log(HPKV_LOG_INFO, "Module loaded successfully\n");
     hpkv_log(HPKV_LOG_WARNING, "Registered with major number %d\n", major_num);
@@ -2444,10 +2441,6 @@ static void __exit hpkv_exit(void)
     destroy_workqueue(compact_wq);
     destroy_workqueue(flush_wq);
 
-    if (hpkv_wq) {
-        flush_workqueue(hpkv_wq);
-        destroy_workqueue(hpkv_wq);
-    }
 
     hpkv_log(HPKV_LOG_INFO, "Module unloaded successfully\n");
 }
