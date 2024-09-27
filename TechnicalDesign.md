@@ -17,6 +17,7 @@
 5. [Disk Operations](#disk-operations)
     - [Sector Management](#sector-management)
     - [Metadata Management](#metadata-management)
+    - [Device Extension](#device-extension)
 6. [Code Flows](#code-flows)
     - [Initialization](#initialization)
     - [Record Insertion/Update](#record-insertionupdate)
@@ -25,7 +26,9 @@
     - [Disk Compaction](#disk-compaction)
     - [Purge Operation](#purge-operation)
     - [Device IOCTL](#device-ioctl)
-7. [Diagrams](#diagrams)
+7. [Logging and Debugging](#logging-and-debugging)
+8. [Module Parameters](#module-parameters)
+9. [Diagrams](#diagrams)
     - [Sequence Diagrams](#sequence-diagrams)
     - [Flowcharts](#flowcharts)
     - [SVG Visualizations](#svg-visualizations)
@@ -40,7 +43,9 @@ The HPKV module consists of several key components that work together to provide
 2. **Write Buffer**: A linked list of `write_buffer_entry` structures used to buffer write operations before flushing them to disk.
 3. **Cache**: An in-memory hash table of `cached_record` structures used to cache frequently accessed key-value pairs.
 4. **Disk Storage**: The persistent storage where key-value pairs are stored on disk.
-5. **Metadata**: The metadata stored on disk that includes information about the total number of records, total size, and version.
+5. **Metadata**: The metadata stored on disk that includes information about the total number of records, total size, device size, and version.
+6. **Workqueues**: Separate workqueues for flushing the write buffer and performing disk compaction.
+7. **Bitmap**: A bitmap to track allocated sectors on the disk.
 
 The following diagram provides a high-level overview of the HPKV module's architecture:
 
@@ -53,11 +58,17 @@ graph TD
     B --> E[Cache]
     B --> F[Disk Storage]
     B --> G[Metadata]
+    B --> H[Flush Workqueue]
+    B --> I[Compact Workqueue]
+    B --> J[Sector Bitmap]
     C -->|Allocate/Free| B
     D -->|Buffer Writes| B
     E -->|Cache Access| B
     F -->|Read/Write| B
     G -->|Update| B
+    H -->|Flush to Disk| D
+    I -->|Optimize Disk| F
+    J -->|Track Sectors| F
 ```
 
 ## Data Structures
@@ -95,7 +106,7 @@ struct cached_record {
 ```
 
 ### Write Buffer Entry Structure
-The `write_buffer_entry` structure represents an entry in the write buffer. It includes fields for the operation type (insert, update, delete), the record, and the old value length.
+The `write_buffer_entry` structure represents an entry in the write buffer. It includes fields for the operation type (insert, update, delete), the record, and work-related fields for asynchronous processing.
 
 **Structure Definition:**
 ```c
@@ -104,11 +115,14 @@ struct write_buffer_entry {
     struct record *record;
     size_t old_value_len;
     struct list_head list;
+    struct work_struct work;
+    struct completion work_done;
+    atomic_t work_status;
 };
 ```
 
 ### HPKV Metadata Structure
-The `hpkv_metadata` structure represents the metadata stored on disk. It includes fields for the signature, total records, total size, and version.
+The `hpkv_metadata` structure represents the metadata stored on disk. It includes fields for the signature, total records, total size, device size, and version.
 
 **Structure Definition:**
 ```c
@@ -116,6 +130,7 @@ struct hpkv_metadata {
     char signature[HPKV_SIGNATURE_SIZE];
     uint64_t total_records;
     uint64_t total_size;
+    uint64_t device_size;
     uint32_t version;
 };
 ```
@@ -128,11 +143,6 @@ The record cache is a slab cache used to allocate and free `record` structures e
 **Initialization:**
 ```c
 record_cache = kmem_cache_create("hpkv_record", sizeof(struct record), 0, SLAB_HWCACHE_ALIGN | SLAB_PANIC, NULL);
-```
-
-**Destruction:**
-```c
-kmem_cache_destroy(record_cache);
 ```
 
 ### Write Buffer
@@ -179,7 +189,7 @@ new_record->value = kmalloc(value_len + 1, GFP_KERNEL);
 
 **Example:**
 ```c
-buffer = vmalloc(BLOCK_SIZE);
+buffer = vmalloc(HPKV_BLOCK_SIZE);
 ```
 
 ### Synchronization and Locking Mechanisms
@@ -200,11 +210,6 @@ hash_for_each_possible_rcu(kv_store, record, hash_node, hash) {
 rcu_read_unlock();
 ```
 
-**Details:**
-- **Readers:** RCU readers use `rcu_read_lock()` and `rcu_read_unlock()` to mark the beginning and end of a read-side critical section. This ensures that the data they are accessing remains consistent during the read operation.
-- **Writers:** RCU writers use `synchronize_rcu()` to wait for all ongoing RCU read-side critical sections to complete before making changes to the data. This ensures that readers see a consistent view of the data.
-- **Grace Period:** RCU provides a grace period during which updates can be made safely. After the grace period, the old data can be freed using `call_rcu()`.
-
 #### Per-CPU Read-Write Semaphores
 Per-CPU read-write semaphores (`percpu_rw_semaphore`) are used to protect critical sections that require read-write synchronization. Readers acquire the semaphore in read mode, while writers acquire it in write mode, ensuring mutual exclusion.
 
@@ -219,10 +224,6 @@ percpu_down_write(&rw_sem);
 percpu_up_write(&rw_sem);
 ```
 
-**Details:**
-- **Readers:** Readers use `percpu_down_read()` and `percpu_up_read()` to acquire and release the read lock. Multiple readers can acquire the read lock simultaneously.
-- **Writers:** Writers use `percpu_down_write()` and `percpu_up_write()` to acquire and release the write lock. Only one writer can acquire the write lock at a time, and it has exclusive access to the critical section.
-
 #### Spinlocks
 Spinlocks are used to protect short critical sections that require mutual exclusion. Spinlocks are efficient for protecting data structures like the write buffer and cache, where the critical sections are short and contention is low.
 
@@ -233,10 +234,6 @@ spin_lock(&write_buffer_lock);
 spin_unlock(&write_buffer_lock);
 ```
 
-**Details:**
-- **Locking:** Spinlocks use `spin_lock()` and `spin_unlock()` to acquire and release the lock. Spinlocks are busy-wait locks, meaning that the CPU will spin in a loop until the lock is acquired.
-- **Interrupts:** Spinlocks can be used with interrupts disabled to prevent deadlocks. This is done using `spin_lock_irqsave()` and `spin_unlock_irqrestore()`.
-
 #### Wait Queues
 Wait queues are used to synchronize threads that need to wait for certain conditions to be met. In the HPKV module, a wait queue is used to wake up the write buffer worker thread when there are entries to be processed.
 
@@ -244,10 +241,6 @@ Wait queues are used to synchronize threads that need to wait for certain condit
 ```c
 wait_event_interruptible(write_buffer_wait, !list_empty(&write_buffer) || write_buffer_exit);
 ```
-
-**Details:**
-- **Waiting:** Threads use `wait_event_interruptible()` to wait for a condition to be met. The condition is checked periodically, and the thread is put to sleep if the condition is not met.
-- **Waking Up:** Threads use `wake_up()` to wake up all threads waiting on the wait queue. This is done when the condition is met, such as when new entries are added to the write buffer.
 
 #### Kernel Threads
 Kernel threads are used for background tasks that need to run independently of user processes. The HPKV module uses a kernel thread for the write buffer worker, which processes write buffer entries and flushes them to disk.
@@ -257,24 +250,14 @@ Kernel threads are used for background tasks that need to run independently of u
 write_buffer_thread = kthread_run(write_buffer_worker, NULL, "hpkv_write_buffer");
 ```
 
-**Details:**
-- **Creation:** Kernel threads are created using `kthread_run()`, which starts the thread and runs the specified function.
-- **Stopping:** Kernel threads can be stopped using `kthread_stop()`, which signals the thread to exit and waits for it to complete.
-
-#### Timers and Workqueues
-Timers and workqueues are used for deferred and periodic tasks. The HPKV module uses a delayed workqueue for disk compaction, which runs periodically to optimize disk usage.
+#### Workqueues
+Workqueues are used for deferred and periodic tasks. The HPKV module uses separate workqueues for flushing the write buffer and performing disk compaction.
 
 **Example:**
 ```c
-INIT_DELAYED_WORK(&compact_work, compact_work_handler);
-queue_delayed_work(compact_wq, &compact_work, COMPACT_INTERVAL);
+flush_wq = alloc_workqueue("hpkv_flush", WQ_UNBOUND | WQ_HIGHPRI, 4);
+compact_wq = create_singlethread_workqueue("hpkv_compact");
 ```
-
-**Details:**
-- **Workqueues:** Workqueues are used to schedule work to be performed later. This is done using `INIT_DELAYED_WORK()` to initialize the work and `queue_delayed_work()` to schedule it.
-- **Timers:** Timers are used to schedule work to be performed after a certain interval. This is done using `mod_timer()` to set the timer and `del_timer_sync()` to delete it.
-
-By using these synchronization and locking mechanisms, the HPKV module ensures data integrity and consistency while maintaining high performance in a concurrent environment.
 
 ## Disk Operations
 
@@ -288,43 +271,31 @@ The `find_free_sector` function is crucial for disk management. Here's a detaile
 
 ```mermaid
 flowchart TD
-A[Start] --> B[Initialize variables]
-B --> C[Read next sector]
-C --> D{Is sector empty?}
-D -- Yes --> E[Update first_free_sector if not set]
-E --> F[Increment contiguous_free_sectors]
-F --> G{Enough contiguous sectors?}
-G -- Yes --> H[Return first_free_sector]
-G -- No --> C
-D -- No --> I{Is sector deleted?}
-I -- Yes --> J[Update first_deleted_sector if not set]
-J --> K[Increment contiguous_deleted_sectors]
-K --> L{Enough contiguous sectors?}
-L -- Yes --> M[Return first_deleted_sector]
-L -- No --> C
-I -- No --> N[Reset counters]
-N --> C
-C --> O{End of device?}
-O -- Yes --> P{Any deleted sectors?}
-P -- Yes --> Q[Return first_deleted_sector]
-P -- No --> R{Any free sectors?}
-R -- Yes --> S[Return first_free_sector]
-R -- No --> T[Return -ENOSPC]
-O -- No --> C
+A[Start] --> B[Check bitmap for free sectors]
+B --> C{Found in bitmap?}
+C -- Yes --> D[Mark sectors as allocated]
+D --> E[Return found sector]
+C -- No --> F[Scan disk for free/deleted sectors]
+F --> G{Found suitable sectors?}
+G -- Yes --> H[Mark sectors as allocated]
+H --> I[Return found sector]
+G -- No --> J[Extend device]
+J --> K{Extension successful?}
+K -- Yes --> L[Retry finding free sectors]
+L --> B
+K -- No --> M[Return -ENOSPC]
+E --> N[End]
+I --> N
+M --> N
 ```
 
-1. The function starts by initializing variables to track free and deleted sectors.
-2. It then reads sectors sequentially from the beginning of the device.
-3. For each sector:
-   - If it's empty (all zeros), it's considered free.
-   - If it starts with "\0DELETED", it's considered a deleted sector.
-   - Otherwise, it's an occupied sector.
-4. The function keeps track of contiguous free and deleted sectors.
-5. If enough contiguous sectors are found (based on the required size), the function returns the starting sector.
-6. If the end of the device is reached without finding enough contiguous sectors:
-   - It first checks for any deleted sectors that can be reused.
-   - If no deleted sectors are available, it checks for any free sectors.
-   - If no suitable space is found, it returns -ENOSPC to indicate that the device is full.
+1. The function first checks the `allocated_sectors` bitmap for free sectors.
+2. If free sectors are found in the bitmap, they are marked as allocated, and the starting sector is returned.
+3. If no free sectors are found in the bitmap, the function scans the disk for free or deleted sectors.
+4. If suitable sectors are found on disk, they are marked as allocated in the bitmap and returned.
+5. If no suitable space is found, the function attempts to extend the device.
+6. If extension is successful, the function retries finding free sectors.
+7. If extension fails or no space is available, it returns -ENOSPC to indicate that the device is full.
 
 #### Record Insertion
 
@@ -352,6 +323,7 @@ When deleting a record:
 1. The record is removed from in-memory structures.
 2. The sector on disk is marked as deleted by writing "\0DELETED" at the beginning.
 3. This sector becomes available for future use.
+4. The corresponding bits in the `allocated_sectors` bitmap are cleared.
 
 #### Purge Operation
 
@@ -360,7 +332,8 @@ The purge operation clears all data from the device:
 1. All in-memory structures (hash table, red-black tree, cache) are cleared.
 2. The write buffer is flushed and cleared.
 3. All sectors on the disk are marked as deleted.
-4. Metadata is updated to reflect an empty device.
+4. The `allocated_sectors` bitmap is reset.
+5. Metadata is updated to reflect an empty device.
 
 #### Disk Compaction
 
@@ -370,7 +343,8 @@ Disk compaction is performed periodically to optimize disk usage:
 2. Valid records are moved to the front of the device.
 3. Deleted and empty sectors are consolidated at the end.
 4. In-memory structures are updated to reflect new sector locations.
-5. The device size is potentially reduced if significant space is freed.
+5. The `allocated_sectors` bitmap is updated to reflect the new layout.
+6. The device size is potentially reduced if significant space is freed.
 
 Here's a flowchart of the disk compaction process:
 
@@ -381,14 +355,16 @@ B --> C[Read next sector]
 C --> D{Is sector valid?}
 D -- Yes --> E[Move record to write pointer]
 E --> F[Update in-memory structures]
-F --> G[Increment write pointer]
-G --> C
-D -- No --> C
-C --> H{End of device?}
-H -- No --> C
-H -- Yes --> I[Update device size]
-I --> J[Update metadata]
-J --> K[End Compaction]
+F --> G[Update sector bitmap]
+G --> H[Increment write pointer]
+H --> C
+D -- No --> I[Clear sector in bitmap]
+I --> C
+C --> J{End of device?}
+J -- No --> C
+J -- Yes --> K[Update device size]
+K --> L[Update metadata]
+L --> M[End Compaction]
 ```
 
 ### Metadata Management
@@ -398,6 +374,7 @@ Metadata is crucial for maintaining the integrity and state of the HPKV store. T
 - Signature: To identify HPKV-formatted devices
 - Total records: Number of records in the store
 - Total size: Total size of all records
+- Device size: Current size of the device
 - Version: Version of the HPKV format
 
 Metadata is updated in the following scenarios:
@@ -420,12 +397,10 @@ When the device runs out of space:
 
 1. The `extend_device` function is called.
 2. It attempts to increase the device size by a predefined amount (EXTENSION_SIZE).
-3. If successful, the new size is reflected in the metadata.
+3. If successful, the new size is reflected in the metadata and the `allocated_sectors` bitmap is updated.
 4. The device can now accommodate more records.
 
 This dynamic extension allows the HPKV store to grow as needed, up to a maximum defined size (MAX_DEVICE_SIZE).
-
-By managing these disk operations efficiently, the HPKV module ensures optimal use of disk space, fast record access, and the ability to handle large datasets while maintaining data integrity.
 
 ### High Level Disk Structure
 
@@ -443,18 +418,24 @@ sequenceDiagram
     participant Kernel
     participant HPKVModule
     participant BlockDevice
+    participant Metadata
 
     User->>Kernel: Load HPKV Module
     Kernel->>HPKVModule: module_init()
     HPKVModule->>HPKVModule: register_chrdev()
     HPKVModule->>HPKVModule: kmem_cache_create()
     HPKVModule->>HPKVModule: percpu_init_rwsem()
-    HPKVModule->>BlockDevice: blkdev_get_by_path()
+    HPKVModule->>BlockDevice: bdev_open_by_path()
     BlockDevice-->>HPKVModule: Block Device Handle
-    HPKVModule->>HPKVModule: load_indexes()
+    HPKVModule->>Metadata: check_metadata()
+    alt Metadata valid
+        HPKVModule->>HPKVModule: load_indexes()
+    else Metadata invalid or empty
+        HPKVModule->>HPKVModule: initialize_empty_device()
+    end
     HPKVModule->>HPKVModule: proc_create()
-    HPKVModule->>HPKVModule: create_singlethread_workqueue()
-    HPKVModule->>HPKVModule: queue_delayed_work()
+    HPKVModule->>HPKVModule: create_workqueues()
+    HPKVModule->>HPKVModule: start_write_buffer_thread()
     Kernel-->>User: Module Loaded
 ```
 
@@ -470,8 +451,9 @@ flowchart TD
     C --> E[Update Record]
     D --> E
     E --> F[Add to Write Buffer]
-    F --> G[Update Cache]
-    G --> H[End]
+    F --> G[Queue Write Work]
+    G --> H[Update Cache]
+    H --> I[End]
 ```
 
 ### Record Deletion
@@ -484,8 +466,9 @@ flowchart TD
     B -->|Found| C[Remove from In-Memory Structures]
     B -->|Not Found| D[Return Error]
     C --> E[Add Delete Operation to Write Buffer]
-    E --> F[Remove from Cache]
-    F --> G[End]
+    E --> F[Queue Delete Work]
+    F --> G[Remove from Cache]
+    G --> H[End]
 ```
 
 ### Write Buffer Flush
@@ -496,38 +479,44 @@ The write buffer flush flow involves processing entries in the write buffer, wri
 sequenceDiagram
     participant WriteBufferWorker
     participant WriteBuffer
+    participant FlushWorkqueue
     participant Disk
     participant Metadata
 
     WriteBufferWorker->>WriteBuffer: Check Write Buffer Size
     WriteBuffer-->>WriteBufferWorker: Write Buffer Entries
-    WriteBufferWorker->>Disk: Write Records to Disk
-    Disk-->>WriteBufferWorker: Write Complete
-    WriteBufferWorker->>Metadata: Update Metadata
-    Metadata-->>WriteBufferWorker: Metadata Updated
-    WriteBufferWorker->>WriteBuffer: Remove Flushed Entries
+    WriteBufferWorker->>FlushWorkqueue: Queue Flush Work
+    FlushWorkqueue->>Disk: Write Records to Disk
+    Disk-->>FlushWorkqueue: Write Complete
+    FlushWorkqueue->>Metadata: Update Metadata
+    Metadata-->>FlushWorkqueue: Metadata Updated
+    FlushWorkqueue->>WriteBuffer: Remove Flushed Entries
 ```
 
 ### Disk Compaction
-The disk compaction flow involves flushing the write buffer, compacting records on disk, and updating metadata.
+The disk compaction flow involves flushing the write buffer, compacting records on disk, updating the sector bitmap, and updating metadata.
 
 **Disk Compaction Flowchart:**
 ```mermaid
 flowchart TD
     A[Start] --> B[Flush Write Buffer]
     B --> C[Read Sectors]
-    C --> D[Check if Sector is Deleted]
-    D -->|Yes| E[Skip Sector]
-    D -->|No| F[Move Sector to New Location]
-    F --> G[Update In-Memory Record]
-    G --> H[Next Sector]
-    H -->|More Sectors| C
-    H -->|No More Sectors| I[Update Metadata]
-    I --> J[End]
+    C --> D[Check if Sector is Valid]
+    D -->|Yes| E[Move Sector to New Location]
+    D -->|No| F[Skip Sector]
+    E --> G[Update In-Memory Record]
+    G --> H[Update Sector Bitmap]
+    F --> I[Clear Sector in Bitmap]
+    H --> J[Next Sector]
+    I --> J
+    J -->|More Sectors| C
+    J -->|No More Sectors| K[Update Device Size]
+    K --> L[Update Metadata]
+    L --> M[End]
 ```
 
 ### Purge Operation
-The purge operation flow involves clearing in-memory structures, clearing the write buffer, and clearing the disk.
+The purge operation flow involves clearing in-memory structures, clearing the write buffer, clearing the disk, and resetting the sector bitmap.
 
 **Purge Operation Sequence Diagram:**
 ```mermaid
@@ -535,14 +524,20 @@ sequenceDiagram
     participant User
     participant HPKVModule
     participant WriteBuffer
+    participant InMemoryStructures
     participant Disk
+    participant SectorBitmap
     participant Metadata
 
     User->>HPKVModule: IOCTL Purge Command
     HPKVModule->>WriteBuffer: Clear Write Buffer
     WriteBuffer-->>HPKVModule: Write Buffer Cleared
+    HPKVModule->>InMemoryStructures: Clear In-Memory Structures
+    InMemoryStructures-->>HPKVModule: In-Memory Structures Cleared
     HPKVModule->>Disk: Clear Disk Sectors
     Disk-->>HPKVModule: Disk Cleared
+    HPKVModule->>SectorBitmap: Reset Sector Bitmap
+    SectorBitmap-->>HPKVModule: Sector Bitmap Reset
     HPKVModule->>Metadata: Update Metadata
     Metadata-->>HPKVModule: Metadata Updated
     HPKVModule-->>User: Purge Complete
@@ -568,3 +563,49 @@ flowchart TD
     I --> K
     J --> K
 ```
+
+## Logging and Debugging
+
+The HPKV module implements a custom logging system with configurable log levels. This allows for flexible debugging and monitoring of the module's operations.
+
+**Log Levels:**
+1. HPKV_LOG_EMERG (0)
+2. HPKV_LOG_ALERT (1)
+3. HPKV_LOG_CRIT (2)
+4. HPKV_LOG_ERR (3)
+5. HPKV_LOG_WARNING (4)
+6. HPKV_LOG_NOTICE (5)
+7. HPKV_LOG_INFO (6)
+8. HPKV_LOG_DEBUG (7)
+
+The `hpkv_log` macro is used throughout the code to log messages at different levels. The current log level can be set using the `log_level` module parameter.
+
+**Example Usage:**
+```c
+hpkv_log(HPKV_LOG_INFO, "Module loaded successfully\n");
+```
+
+## Module Parameters
+
+The HPKV module supports several configurable parameters that can be set when loading the module:
+
+1. `mount_path`: Path to the block device for persistent storage (default: "/dev/sdb").
+2. `initialize_if_empty`: Initialize the device if it's empty (default: true).
+> [!NOTE]
+>
+> If you set `initialize_if_empty` to `false`, the module will not initialize the disk if it is empty. This means the disk must already be formatted with HPKV.
+3. `force_initialize`: Force initialize the device even if it contains data (default: false).
+> [!WARNING]
+>
+> If you set `force_initialize` to `true`, the module will initialize the disk even if it contains data. This can lead to data loss if the disk is not empty.
+4. `force_read_disk`: Force reading the entire disk even beyond metadata size (default: false).
+> [!NOTE]
+>
+> If you set `force_read_disk` to `true`, the module will read the entire disk even beyond the metadata size. This can be useful if metadata is corrupted or missing.
+5. `log_level`: Logging level (0-7, default: 4).
+> [!NOTE]
+>
+> The logging level determines which messages are logged. For example, setting `log_level` to 4 will log messages with level 4 and above (i.e., WARNING, NOTICE, INFO, and DEBUG). Setting it to 7 will also log function names and line numbers.
+
+These parameters allow for flexible configuration of the HPKV module's behavior during initialization and operation.
+
