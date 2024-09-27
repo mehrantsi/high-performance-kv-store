@@ -56,6 +56,14 @@ Here's a table showing the performance of HPKV for different dataset sizes:
 
 As shown, HPKV maintains **exceptionally low read/write latencies** even as the dataset size increases. Write performance is highly competitive, thanks to the write buffer that batches write operations to reduce latency. This means that it takes more time to persist the data to disk (under 20ms for 100,000 sequential writes), but thanks to in-memory structures, whihch makes inserted/updated records immediately available, the apparent write latency is in the order of a few microseconds.
 
+**Testing Environment**
+- HOST: Parallels VM on MacBook Pro M3 Max
+- VM OS: Ubuntu 22.04 LTS running kernel 6.8.0-45
+- VM CPU: 4 CPU cores
+- VM RAM: 4GB RAM
+- Disk: 4GB Disk
+
+
 ## Advantages
 
 1. **Minimal Latency**: Operating in kernel space eliminates context switching overhead.
