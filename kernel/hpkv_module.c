@@ -59,7 +59,7 @@ static struct record *search_record_in_memory(const char *key);
 static void insert_rb_tree(struct record *record);
 static struct cached_record *cache_get(const char *key);
 static void cache_put(const char *key, const char *value, size_t value_len, sector_t sector);
-static int load_record_from_disk(const char *key, char **value, size_t *value_len);
+static int load_record_from_disk(sector_t sector, char **value, size_t *value_len);
 static void record_free_rcu(struct rcu_head *head);
 static struct record *record_find_rcu(const char *key);
 static int search_record(const char *key, char **value, size_t *value_len);
@@ -360,41 +360,33 @@ add_new_entry:
     spin_unlock(&cache_lock);
 }
 
-static int load_record_from_disk(const char *key, char **value, size_t *value_len)
+static int load_record_from_disk(sector_t sector, char **value, size_t *value_len)
 {
-    struct record *record;
     struct buffer_head *bh;
-    char *buffer;
-    int ret = -ENOENT;
+    int ret = -EIO;
 
-    rcu_read_lock();
-    hash_for_each_possible_rcu(kv_store, record, hash_node, djb2_hash(key, strlen(key))) {
-        if (strcmp(record->key, key) == 0) {
-            bh = __bread(bdev, record->sector, HPKV_BLOCK_SIZE);
-            if (!bh) {
-                ret = -EIO;
-                break;
-            }
-
-            buffer = kmalloc(record->value_len, GFP_KERNEL);
-            if (!buffer) {
-                brelse(bh);
-                ret = -ENOMEM;
-                break;
-            }
-
-            memcpy(buffer, bh->b_data + sizeof(record->key) + sizeof(size_t), record->value_len);
-            *value = buffer;
-            *value_len = record->value_len;
-
-            brelse(bh);
-            ret = 0;
-            break;
-        }
+    bh = __bread(bdev, sector, HPKV_BLOCK_SIZE);
+    if (!bh) {
+        hpkv_log(HPKV_LOG_ERR, "Failed to read sector %llu\n", (unsigned long long)sector);
+        return -EIO;
     }
-    rcu_read_unlock();
 
-    return ret;
+    // Skip the key at the beginning of the block
+    size_t offset = MAX_KEY_SIZE;
+    memcpy(value_len, bh->b_data + offset, sizeof(size_t));
+    offset += sizeof(size_t);
+
+    *value = kmalloc(*value_len + 1, GFP_KERNEL);
+    if (!*value) {
+        brelse(bh);
+        return -ENOMEM;
+    }
+
+    memcpy(*value, bh->b_data + offset, *value_len);
+    (*value)[*value_len] = '\0';
+
+    brelse(bh);
+    return 0;
 }
 
 static void record_free_rcu(struct rcu_head *head)
@@ -429,7 +421,7 @@ static struct record *record_find_rcu(const char *key)
 static int search_record(const char *key, char **value, size_t *value_len)
 {
     struct record *record;
-    struct write_buffer_entry *entry;
+    struct cached_record *cached;
     int ret = -ENOENT;
 
     if (!key || !value || !value_len) {
@@ -439,42 +431,43 @@ static int search_record(const char *key, char **value, size_t *value_len)
 
     hpkv_log(HPKV_LOG_DEBUG, "Searching for key: %s\n", key);
 
-    // First, check in-memory structures
+    // First, check the cache
+    cached = cache_get(key);
+    if (cached) {
+        *value = kmalloc(cached->value_len + 1, GFP_KERNEL);
+        if (!*value) {
+            return -ENOMEM;
+        }
+        memcpy(*value, cached->value, cached->value_len + 1);
+        *value_len = cached->value_len;
+        return 0;
+    }
+
+    // If not in cache, search in-memory structures
     rcu_read_lock();
     record = record_find_rcu(key);
     if (record) {
-        *value = kmalloc(record->value_len + 1, GFP_KERNEL);
-        if (!*value) {
-            hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for value\n");
-            rcu_read_unlock();
-            return -ENOMEM;
+        smp_rmb();  // Ensure we see the latest value of record->value
+        if (record->value) {
+            // Value is still in memory (recently inserted, not yet written to disk)
+            *value = kmalloc(record->value_len + 1, GFP_KERNEL);
+            if (!*value) {
+                rcu_read_unlock();
+                return -ENOMEM;
+            }
+            memcpy(*value, record->value, record->value_len + 1);
+            *value_len = record->value_len;
+            ret = 0;
+        } else {
+            // Value is on disk, need to read it
+            ret = load_record_from_disk(record->sector, value, value_len);
+            if (ret == 0) {
+                // Update cache
+                cache_put(key, *value, *value_len, record->sector);
+            }
         }
-        memcpy(*value, record->value, record->value_len + 1);
-        *value_len = record->value_len;
-        ret = 0;
-        hpkv_log(HPKV_LOG_DEBUG, "Key %s found in memory\n", key);
     }
     rcu_read_unlock();
-
-    if (ret == 0) {
-        if (!*value || *value_len == 0) {
-            hpkv_log(HPKV_LOG_ERR, "Invalid value or value_len in search_record\n");
-            kfree(*value);
-            *value = NULL;
-            return -EFAULT;
-        }
-        cache_put(key, *value, *value_len, record->sector);
-        return ret;
-    }
-
-    // If not found in memory, attempt to load from disk
-    ret = load_record_from_disk(key, value, value_len);
-    if (ret == 0) {
-        hpkv_log(HPKV_LOG_DEBUG, "Key %s loaded from disk\n", key);
-        cache_put(key, *value, *value_len, 0);
-    } else {
-        hpkv_log(HPKV_LOG_DEBUG, "Key %s not found on disk\n", key);
-    }
 
     return ret;
 }
@@ -1009,7 +1002,7 @@ static void write_record_to_disk(struct record *record)
 {
     struct buffer_head *bh;
     loff_t device_size, new_size;
-    int required_sectors;
+    int required_sectors, ret;
 
     if (!record) {
         hpkv_log(HPKV_LOG_ERR, "Attempted to write null record to disk\n");
@@ -1094,9 +1087,14 @@ static void write_record_to_disk(struct record *record)
     set_buffer_uptodate(bh);
     mark_buffer_dirty(bh);
     unlock_buffer(bh);
-
-    if (sync_dirty_buffer(bh) < 0) {
+    ret = sync_dirty_buffer(bh);
+    if (ret < 0) {
         hpkv_log(HPKV_LOG_ERR, "Failed to sync buffer to disk. Key: %s\n", record->key);
+    } else {
+        // Successfully written to disk, now free the in-memory value
+        kfree(record->value);
+        record->value = NULL;
+        smp_wmb();  // Ensure the NULL is visible to other CPUs
     }
 
     brelse(bh);
@@ -1865,36 +1863,29 @@ static int load_indexes(void)
             if (record) {
                 strncpy(record->key, key, MAX_KEY_SIZE);
                 record->key[MAX_KEY_SIZE - 1] = '\0';  // Ensure null-termination
-                record->value = kmalloc(value_len + 1, GFP_KERNEL);
-                if (record->value) {
-                    memcpy(record->value, buffer + sizeof(key) + sizeof(size_t), value_len);
-                    record->value[value_len] = '\0';
-                    record->value_len = value_len;
-                    record->sector = sector;
+                record->value = NULL;  // Value will be loaded from disk on demand
+                record->value_len = value_len;
+                record->sector = sector;
                 
-                    u32 hash = djb2_hash(key, strlen(key));
-                    atomic_set(&record->refcount, 1);
-                    smp_wmb();  // Memory barrier before making the record visible
+                u32 hash = djb2_hash(key, strlen(key));
+                atomic_set(&record->refcount, 1);
+                smp_wmb();  // Memory barrier before making the record visible
 
-                    hash_add_rcu(kv_store, &record->hash_node, hash);
-                    insert_rb_tree(record);
-                    atomic_long_add(value_len, &total_disk_usage);
-                    atomic_inc(&record_count);
+                hash_add_rcu(kv_store, &record->hash_node, hash);
+                insert_rb_tree(record);
+                atomic_long_add(value_len, &total_disk_usage);
+                atomic_inc(&record_count);
                 
-                    // Mark the sectors as allocated in the bitmap
-                    int sectors_used = (value_len + HPKV_BLOCK_SIZE - 1) / HPKV_BLOCK_SIZE;
-                    spin_lock(&sector_allocation_lock);
-                    for (int i = 0; i < sectors_used; i++) {
-                        set_bit(sector + i, allocated_sectors);
-                    }
-                    smp_mb();  // Memory barrier after bit operations
-                    spin_unlock(&sector_allocation_lock);
-                
-                    hpkv_log(HPKV_LOG_INFO, "Added record for key: %s\n", key);
-                } else {
-                    hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for record value\n");
-                    kmem_cache_free(record_cache, record);
+                // Mark the sectors as allocated in the bitmap
+                int sectors_used = (value_len + HPKV_BLOCK_SIZE - 1) / HPKV_BLOCK_SIZE;
+                spin_lock(&sector_allocation_lock);
+                for (int i = 0; i < sectors_used; i++) {
+                    set_bit(sector + i, allocated_sectors);
                 }
+                smp_mb();  // Memory barrier after bit operations
+                spin_unlock(&sector_allocation_lock);
+                
+                hpkv_log(HPKV_LOG_INFO, "Added record for key: %s\n", key);
             } else {
                 hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for record\n");
             }
