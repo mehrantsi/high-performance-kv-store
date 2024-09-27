@@ -2240,7 +2240,7 @@ static int __init hpkv_init(void)
     if (!flush_wq) {
         hpkv_log(HPKV_LOG_ALERT, "Failed to create flush workqueue\n");
         ret = -ENOMEM;
-        goto error_destroy_compact_wq;
+        goto error_put_device;
     }
 
     INIT_WORK(&hpkv_flush_work, flush_work_handler);
@@ -2274,7 +2274,7 @@ static int __init hpkv_init(void)
             ret = initialize_empty_device();
             if (ret < 0) {
                 hpkv_log(HPKV_LOG_ERR, "Failed to initialize device\n");
-                goto error_put_device;
+                goto error_stop_thread;
             }
             // Ensure in-memory structures reflect empty state
             atomic_set(&record_count, 0);
@@ -2288,7 +2288,7 @@ static int __init hpkv_init(void)
                 // TODO: Trigger a repair operation here
             } else if (ret < 0) {
                 hpkv_log(HPKV_LOG_ERR, "Failed to load indexes\n");
-                goto error_put_device;
+                goto error_stop_thread;
             }
         }
     } else if (ret == -EINVAL) {
@@ -2298,7 +2298,7 @@ static int __init hpkv_init(void)
                 ret = initialize_empty_device();
                 if (ret < 0) {
                     hpkv_log(HPKV_LOG_ERR, "Failed to initialize device\n");
-                    goto error_put_device;
+                    goto error_stop_thread;
                 }
                 // Ensure in-memory structures reflect empty state
                 atomic_set(&record_count, 0);
@@ -2306,16 +2306,16 @@ static int __init hpkv_init(void)
             } else {
                 hpkv_log(HPKV_LOG_ERR, "Device contains data but is not HPKV formatted. Refusing to initialize.\n");
                 ret = -ENOTEMPTY;
-                goto error_put_device;
+                goto error_stop_thread;
             }
         } else {
             hpkv_log(HPKV_LOG_ERR, "Device is not formatted for HPKV use and initialize_if_empty is not set\n");
             ret = -ENODEV;
-            goto error_put_device;
+            goto error_stop_thread;
         }
     } else {
         hpkv_log(HPKV_LOG_ERR, "Failed to read metadata\n");
-        goto error_put_device;
+        goto error_stop_thread;
     }
 
     hpkv_log(HPKV_LOG_INFO, "Creating proc entry\n");
@@ -2333,17 +2333,16 @@ static int __init hpkv_init(void)
 
     init_completion(&flush_completion);
 
-
     hpkv_log(HPKV_LOG_INFO, "Module loaded successfully\n");
     hpkv_log(HPKV_LOG_WARNING, "Registered with major number %d\n", major_num);
     return 0;
 
-error_destroy_flush_wq:
-    destroy_workqueue(flush_wq);
-error_destroy_compact_wq:
-    destroy_workqueue(compact_wq);
 error_remove_proc:
     remove_proc_entry(PROC_ENTRY, NULL);
+error_stop_thread:
+    kthread_stop(write_buffer_thread);
+error_destroy_flush_wq:
+    destroy_workqueue(flush_wq);
 error_put_device:
     bdev_release(bdev_handle);
 error_free_rwsem:
@@ -2353,6 +2352,7 @@ error_destroy_cache:
 error_unregister_chrdev:
     unregister_chrdev(major_num, DEVICE_NAME);
 
+    hpkv_log(HPKV_LOG_ALERT, "Module initialization failed with error %d\n", ret);
     return ret;
 }
 
