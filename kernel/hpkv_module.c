@@ -1131,6 +1131,7 @@ static void flush_write_buffer(void)
 {
     struct write_buffer_entry *entry, *tmp;
     LIST_HEAD(local_list);
+    LIST_HEAD(retry_list);
     int records_changed = 0;
     long size_changed = 0;
     unsigned long timeout;
@@ -1184,10 +1185,20 @@ static void flush_write_buffer(void)
                     size_changed -= entry->old_value_len;
                     break;
             }
+            list_del(&entry->list);
+            kfree(entry);
+        } else {
+            // Move failed entries to retry list
+            list_move_tail(&entry->list, &retry_list);
         }
+    }
 
-        list_del(&entry->list);
-        kfree(entry);
+    // Move retry entries back to the write buffer
+    if (!list_empty(&retry_list)) {
+        spin_lock(&write_buffer_lock);
+        list_splice(&retry_list, &write_buffer);
+        spin_unlock(&write_buffer_lock);
+        hpkv_log(HPKV_LOG_WARNING, "Some write operations failed and will be retried\n");
     }
 
     if (records_changed != 0 || size_changed != 0) {
