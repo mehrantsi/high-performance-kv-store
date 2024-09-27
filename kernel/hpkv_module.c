@@ -2269,6 +2269,16 @@ static int __init hpkv_init(void)
             // Ensure in-memory structures reflect empty state
             atomic_set(&record_count, 0);
             atomic_long_set(&total_disk_usage, 0);
+        } else if (force_initialize) {
+            hpkv_log(HPKV_LOG_INFO, "Forcing initialization as empty device\n");
+            ret = initialize_empty_device();
+            if (ret < 0) {
+                hpkv_log(HPKV_LOG_ERR, "Failed to initialize device\n");
+                goto error_put_device;
+            }
+            // Ensure in-memory structures reflect empty state
+            atomic_set(&record_count, 0);
+            atomic_long_set(&total_disk_usage, 0);
         } else {
             hpkv_log(HPKV_LOG_INFO, "Device contains data. Loading indexes.\n");
             ret = load_indexes();
