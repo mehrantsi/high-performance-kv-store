@@ -93,7 +93,6 @@ static void metadata_update_work_func(struct work_struct *work);
 static void release_sectors(sector_t start_sector, size_t size);
 static bool flush_workqueue_timeout(struct workqueue_struct *wq, unsigned long timeout);
 static void force_free_records(void);
-static int check_metadata(struct hpkv_metadata *metadata);
 
 static int major_num;
 static struct kmem_cache *record_cache;
