@@ -472,6 +472,9 @@ static int search_record(const char *key, char **value, size_t *value_len)
             }
         }
     }
+    else {
+        ret = -ENOENT;
+    }
     rcu_read_unlock();
 
     return ret;
