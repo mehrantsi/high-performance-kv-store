@@ -94,8 +94,8 @@ For a detailed technical design of the HPKV module, please refer to the [Technic
 
 1. Clone the repository:
    ```sh
-   git clone https://github.com/mehrantsi/kernel-high-performance-kv-store.git
-   cd kernel-high-performance-kv-store/kernel
+   git clone https://github.com/mehrantsi/high-performance-kv-store.git
+   cd high-performance-kv-store/kernel
    ```
 
 2. Install Essential Packages:
