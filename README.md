@@ -172,6 +172,59 @@ For a detailed technical design of the HPKV module, please refer to the [Technic
 
 After loading the module and creating the device node, you can interact with it through the `/dev/hpkv` device file. Use standard file operations to read and write data.
 
+#### Example Usage in C
+
+```c
+#include <fcntl.h>
+#include <unistd.h>
+#include <string.h>
+#include <stdio.h>
+#include <sys/ioctl.h>
+
+#define HPKV_IOCTL_GET 0
+#define HPKV_IOCTL_DELETE 1
+
+int main() {
+    int fd = open("/dev/hpkv", O_RDWR);
+    if (fd < 0) {
+        perror("Failed to open device");
+        return 1;
+    }
+
+    // Write a key-value pair
+    char *data = "mykey:myvalue";
+    write(fd, data, strlen(data));
+
+    // Read a value by key
+    char buffer[1024];
+    strcpy(buffer, "mykey");
+    if (ioctl(fd, HPKV_IOCTL_GET, buffer) == 0) {
+        printf("Value: %s\n", buffer);
+    }
+
+    // Delete a key-value pair
+    if (ioctl(fd, HPKV_IOCTL_DELETE, "mykey") == 0) {
+        printf("Key 'mykey' deleted successfully\n");
+    } else {
+        perror("Failed to delete key");
+    }
+
+    close(fd);
+    return 0;
+}
+```
+
+Compile and run your program with:
+
+```sh
+gcc -o myprogram myprogram.c
+./myprogram
+```
+
+> [!NOTE]
+>
+> Depending on the permissions you set for the device node, you may need to run the program with sudo.
+
 #### Example Usage from Terminal
 
 1. **Insert/Update a key-value pair:**
@@ -196,48 +249,6 @@ After loading the module and creating the device node, you can interact with it 
    ```sh
    echo -n "mykey:+partialupdate" | sudo dd of=/dev/hpkv
    ```
-
-#### Example Usage in C
-
-```c
-#include <fcntl.h>
-#include <unistd.h>
-#include <string.h>
-#include <stdio.h>
-#include <sys/ioctl.h>
-
-#define HPKV_IOCTL_GET 0
-
-int main() {
-    int fd = open("/dev/hpkv", O_RDWR);
-    if (fd < 0) {
-        perror("Failed to open device");
-        return 1;
-    }
-
-    // Write a key-value pair
-    char *data = "mykey:myvalue";
-    write(fd, data, strlen(data));
-
-    // Read a value by key
-    char buffer[1024];
-    strcpy(buffer, "mykey");
-    if (ioctl(fd, HPKV_IOCTL_GET, buffer) == 0) {
-        printf("Value: %s\n", buffer);
-    }
-
-    close(fd);
-    return 0;
-}
-```
-
-Compile and run your program with:
-```
-gcc -o myprogram myprogram.c
-./myprogram
-```
-
-Note: Depending on the permissions you set for the device node, you may need to run the program with sudo.
 
 ## Contributing
 
