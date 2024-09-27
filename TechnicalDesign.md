@@ -446,14 +446,35 @@ The record insertion/update flow involves finding or creating a record, updating
 ```mermaid
 flowchart TD
     A[Start] --> B[Check if Key Exists]
-    B -->|Yes| C[Find Existing Record]
-    B -->|No| D[Allocate New Record]
-    C --> E[Update Record]
+    B -->|Yes| C[Update Existing Record]
+    B -->|No| D[Create New Record]
+    C --> E[Set Value in Memory]
     D --> E
     E --> F[Add to Write Buffer]
     F --> G[Queue Write Work]
-    G --> H[Update Cache]
-    H --> I[End]
+    G --> H[End]
+```
+### Record Retrieval
+The record retrieval process is optimized to balance performance and memory usage. It involves checking multiple layers of storage: cache, in-memory structures, and disk.
+
+This approach ensures fast access for frequently used data while maintaining memory efficiency for less frequently accessed records.
+
+**Record Retrieval Flowchart:**
+```mermaid
+flowchart TD
+A[Start] --> B{Check Cache}
+B -->|Found| C[Return Cached Value]
+B -->|Not Found| D{Search In-Memory Structures}
+D -->|Found| E{Value in Memory?}
+E -->|Yes| F[Return In-Memory Value]
+E -->|No| G[Read from Disk]
+G --> H[Update Cache]
+H --> I[Return Value]
+D -->|Not Found| J[Return Not Found Error]
+C --> K[End]
+F --> K
+I --> K
+J --> K
 ```
 
 ### Record Deletion
