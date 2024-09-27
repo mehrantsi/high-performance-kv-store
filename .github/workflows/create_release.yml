@@ -25,6 +25,7 @@ jobs:
       run: make
       working-directory: ./kernel
     - name: Create Release (Auto)
+      id: create_release_auto
       if: ${{ inputs.tag_name == '' }}
       uses: actions/create-release@v1
       env:
@@ -35,6 +36,7 @@ jobs:
         draft: false
         prerelease: false
     - name: Create Release (Manual)
+      id: create_release_manual
       if: ${{ inputs.tag_name != '' }}
       uses: actions/create-release@v1
       env:
@@ -44,12 +46,23 @@ jobs:
         release_name: Release ${{ inputs.tag_name }}
         draft: false
         prerelease: false
-    - name: Upload Release Asset
+    - name: Upload Release Asset (Auto)
+      if: ${{ inputs.tag_name == '' }}
       uses: actions/upload-release-asset@v1
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }} # This pulls from the CREATE RELEASE step above, referencing it's ID to get its outputs object, which include a `upload_url`. See this blog post for more info: https://jasonet.co/posts/new-features-of-github-actions/#passing-data-to-future-steps 
+        upload_url: ${{ steps.create_release_auto.outputs.upload_url }} # This pulls from the CREATE RELEASE step above, referencing it's ID to get its outputs object, which include a `upload_url`. See this blog post for more info: https://jasonet.co/posts/new-features-of-github-actions/#passing-data-to-future-steps 
+        asset_path: ./kernel/hpkv_module.ko
+        asset_name: hpkv_module.ko
+        asset_content_type: application/ko-file
+    - name: Upload Release Asset (Manual)
+      if: ${{ inputs.tag_name != '' }}
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release_manual.outputs.upload_url }} # This pulls from the CREATE RELEASE step above, referencing it's ID to get its outputs object, which include a `upload_url`. See this blog post for more info: https://jasonet.co/posts/new-features-of-github-actions/#passing-data-to-future-steps 
         asset_path: ./kernel/hpkv_module.ko
         asset_name: hpkv_module.ko
         asset_content_type: application/ko-file
