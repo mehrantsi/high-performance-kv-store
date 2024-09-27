@@ -2155,11 +2155,6 @@ static bool is_disk_empty(struct block_device *bdev)
     return is_empty;
 }
 
-static void hpkv_rcu_callback(struct rcu_head *head)
-{
-    hpkv_log(HPKV_LOG_INFO, "RCU callback executed\n");
-}
-
 static int check_metadata(struct hpkv_metadata *metadata)
 {
     struct buffer_head *bh;
@@ -2253,9 +2248,6 @@ static int __init hpkv_init(void)
         ret = PTR_ERR(write_buffer_thread);
         goto error_destroy_flush_wq;
     }
-
-    // Schedule an RCU callback
-    //call_rcu(&((struct rcu_head){0}), hpkv_rcu_callback);
     
     // Initialize the allocated_sectors bitmap
     bitmap_zero(allocated_sectors, SECTORS_BITMAP_SIZE);
