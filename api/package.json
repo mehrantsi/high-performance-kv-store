@@ -1,0 +1,16 @@
+{
+  "name": "hpkv-api",
+  "version": "1.0.0",
+  "description": "API for High Performance Key-Value Store",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.17.1",
+    "body-parser": "^1.19.0",
+    "dotenv": "^10.0.0",
+    "express-validator": "^6.12.0",
+    "express-rate-limit": "^5.3.0"
+  }
+}
