@@ -185,7 +185,7 @@ After loading the module and creating the device node, you can interact with it 
    ```sh
    sudo cat /dev/hpkv | grep "mykey:"
    ```
-   > This command will return the entire content of the device, including all key-value pairs. If you have a large dataset, this may take a while.
+   > FOR TESTING PURPOSE ONLY! This command will return the entire content of the device, including all key-value pairs. If you have a large dataset, this may take a while.
 
 3. **Delete a key-value pair:**
 
