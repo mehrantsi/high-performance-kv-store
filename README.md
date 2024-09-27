@@ -1,6 +1,6 @@
 # High-Performance KV Store (HPKV)
 
-HPKV is a high-performance, kernel-space key-value store designed for Linux systems. It offers exceptional read and write performance, especially for datasets ranging from 10,000 to 1,000,000 records.
+HPKV is a high-performance, kernel-space key-value store designed for Linux systems. It offers exceptional read and write performance, especially for datasets ranging from 10,000 to 10,000,000 records.
 
 ## What is HPKV?
 
@@ -81,8 +81,7 @@ For a detailed technical design of the HPKV module, please refer to the [Technic
 ### Prerequisites
 
 - Linux kernel version 6.8+
-- Linux kernel headers
-- GCC-12
+- GCC
 - Make
 - Root access (for loading the module and creating the device node)
 
