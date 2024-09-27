@@ -93,6 +93,7 @@ static void metadata_update_work_func(struct work_struct *work);
 static void release_sectors(sector_t start_sector, size_t size);
 static bool flush_workqueue_timeout(struct workqueue_struct *wq, unsigned long timeout);
 static void force_free_records(void);
+static int check_metadata(struct hpkv_metadata *metadata);
 
 static int major_num;
 static struct kmem_cache *record_cache;
@@ -2160,9 +2161,32 @@ static void hpkv_rcu_callback(struct rcu_head *head)
     hpkv_log(HPKV_LOG_INFO, "RCU callback executed\n");
 }
 
+static int check_metadata(struct hpkv_metadata *metadata)
+{
+    struct buffer_head *bh;
+    int ret = 0;
+
+    bh = __bread(bdev, HPKV_METADATA_BLOCK, HPKV_BLOCK_SIZE);
+    if (!bh) {
+        hpkv_log(HPKV_LOG_ERR, "Failed to read metadata block\n");
+        return -EIO;
+    }
+
+    memcpy(metadata, bh->b_data, sizeof(struct hpkv_metadata));
+    brelse(bh);
+
+    if (memcmp(metadata->signature, HPKV_SIGNATURE, HPKV_SIGNATURE_SIZE) != 0) {
+        hpkv_log(HPKV_LOG_WARNING, "Invalid signature found\n");
+        ret = -EINVAL;
+    }
+
+    return ret;
+}
+
 static int __init hpkv_init(void)
 {
     int ret;
+    struct hpkv_metadata metadata;
 
     hpkv_log(HPKV_LOG_INFO, "Initializing module\n");
     hpkv_log(HPKV_LOG_INFO, "Mount path received: %s\n", mount_path);
@@ -2238,8 +2262,27 @@ static int __init hpkv_init(void)
     set_bit(0, allocated_sectors);  // Mark metadata sector as allocated
     smp_mb();  // Memory barrier after bit operations
 
-    ret = load_indexes();
-    if (ret == -EINVAL) {
+    // Quick metadata check
+    ret = check_metadata(&metadata);
+    if (ret == 0) {
+        if (metadata.total_records == 0 && metadata.total_size == 0 && !force_read_disk) {
+            hpkv_log(HPKV_LOG_INFO, "Device is initialized but empty. Skipping full index load.\n");
+            // Ensure in-memory structures reflect empty state
+            atomic_set(&record_count, 0);
+            atomic_long_set(&total_disk_usage, 0);
+        } else {
+            hpkv_log(HPKV_LOG_INFO, "Device contains data. Loading indexes.\n");
+            ret = load_indexes();
+            if (ret == -EUCLEAN) {
+                hpkv_log(HPKV_LOG_WARNING, "Device requires cleaning or repair. Consider running a repair operation.\n");
+                // For now, we'll continue loading but with a warning
+                // TODO: Trigger a repair operation here
+            } else if (ret < 0) {
+                hpkv_log(HPKV_LOG_ERR, "Failed to load indexes\n");
+                goto error_put_device;
+            }
+        }
+    } else if (ret == -EINVAL) {
         if (initialize_if_empty || force_initialize) {
             if (is_disk_empty(bdev) || force_initialize) {
                 hpkv_log(HPKV_LOG_INFO, "Device is empty or force_initialize is set. Initializing for HPKV use.\n");
@@ -2248,12 +2291,9 @@ static int __init hpkv_init(void)
                     hpkv_log(HPKV_LOG_ERR, "Failed to initialize device\n");
                     goto error_put_device;
                 }
-                // After initialization, try to load indexes again
-                ret = load_indexes();
-                if (ret < 0) {
-                    hpkv_log(HPKV_LOG_ERR, "Failed to load indexes after initialization\n");
-                    goto error_put_device;
-                }
+                // Ensure in-memory structures reflect empty state
+                atomic_set(&record_count, 0);
+                atomic_long_set(&total_disk_usage, 0);
             } else {
                 hpkv_log(HPKV_LOG_ERR, "Device contains data but is not HPKV formatted. Refusing to initialize.\n");
                 ret = -ENOTEMPTY;
@@ -2264,12 +2304,8 @@ static int __init hpkv_init(void)
             ret = -ENODEV;
             goto error_put_device;
         }
-    } else if (ret == -EUCLEAN) {
-        hpkv_log(HPKV_LOG_WARNING, "Device requires cleaning or repair. Consider running a repair operation.\n");
-        // For now, we'll continue loading but with a warning
-        // TODO: Trigger a repair operation here
-    } else if (ret < 0) {
-        hpkv_log(HPKV_LOG_ERR, "Failed to load indexes\n");
+    } else {
+        hpkv_log(HPKV_LOG_ERR, "Failed to read metadata\n");
         goto error_put_device;
     }
 
