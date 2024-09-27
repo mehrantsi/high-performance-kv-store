@@ -37,7 +37,7 @@
 #define HPKV_BLOCK_SIZE 4096
 #define PROC_ENTRY "hpkv_stats"
 #define CACHE_SIZE 1000
-#define COMPACT_INTERVAL (120 * HZ) // Run compaction every 120 seconds
+#define COMPACT_INTERVAL (1800 * HZ) // Run compaction every 30 minutes
 #define HPKV_SIGNATURE "HPKV_V1"
 #define HPKV_SIGNATURE_SIZE 8
 #define HPKV_METADATA_BLOCK 0
@@ -51,7 +51,7 @@
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Mehran Toosi");
 MODULE_DESCRIPTION("High performance KV store kernel module, with advanced features");
-MODULE_VERSION("1.0");
+MODULE_VERSION("1.1");
 
 // Function prototypes
 static u32 djb2_hash(const char *str, size_t len);
