@@ -1,1 +1,5 @@
 .DS_Store
+/api/node_modules
+/api/package-lock.json
+/api/config.json
+/api/.env
