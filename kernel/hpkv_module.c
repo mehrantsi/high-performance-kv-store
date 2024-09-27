@@ -1667,7 +1667,6 @@ static int purge_data(void)
     struct write_buffer_entry *entry, *tmp;
     LIST_HEAD(local_list);
     sector_t last_purged_sector = 0;
-    sector_t total_sectors = i_size_read(bdev->bd_inode) / HPKV_BLOCK_SIZE;
 
     hpkv_log(HPKV_LOG_INFO, "Starting purge operation\n");
 
@@ -1766,9 +1765,8 @@ static int purge_data(void)
         if (sector % 1000 == 0) {  // Sync every 1000 sectors to avoid overwhelming I/O
             sync_dirty_buffer(bh);
             last_purged_sector = sector;
-            hpkv_log(HPKV_LOG_INFO, "Purged %llu sectors (%.2f%%)\n", 
-                     (unsigned long long)sector, 
-                     (float)sector / total_sectors * 100);
+            hpkv_log(HPKV_LOG_INFO, "Purged %llu sectors\n", 
+                     (unsigned long long)sector);
             
             // Allow other processes to run
             percpu_up_write(&rw_sem);
