@@ -2,7 +2,6 @@ require('dotenv').config(); // Load environment variables from .env file
 const express = require('express');
 const bodyParser = require('body-parser');
 const fs = require('fs');
-const { execSync } = require('child_process');
 const { body, param, validationResult } = require('express-validator');
 const rateLimit = require('express-rate-limit');
 const config = require('./config.json'); // Load configuration file
@@ -11,6 +10,12 @@ const os = require('os');
 
 const numCPUs = os.cpus().length;
 const PORT = process.env.PORT || 3000;
+
+// Define ioctl commands
+const HPKV_IOCTL_GET = 0;
+const HPKV_IOCTL_DELETE = 1;
+const HPKV_IOCTL_PARTIAL_UPDATE = 2;
+const HPKV_IOCTL_PURGE = 3;
 
 if (cluster.isMaster) {
     console.log(`Master ${process.pid} is running`);
@@ -49,12 +54,25 @@ if (cluster.isMaster) {
         next();
     });
 
+    // Helper function to perform ioctl operations
+    function hpkvIoctl(cmd, key, value = '') {
+        return new Promise((resolve, reject) => {
+            const fd = fs.openSync('/dev/hpkv', 'r+');
+            const buffer = Buffer.from(`${cmd} ${key} ${value}`);
+            fs.ioctl(fd, cmd, buffer, (err, result) => {
+                fs.closeSync(fd);
+                if (err) reject(err);
+                else resolve(result.toString().trim());
+            });
+        });
+    }
+
     // Insert/Update Record
     app.post('/record', [
-        body('key').isString().isLength({ min: 1, max: 252 }).trim().escape(), // Adjusted length for tenant ID
+        body('key').isString().isLength({ min: 1, max: 252 }).trim().escape(),
         body('value').isString().isLength({ min: 1, max: 1000 }).trim().escape(),
         body('partialUpdate').optional().isBoolean()
-    ], (req, res) => {
+    ], async (req, res) => {
         const errors = validationResult(req);
         if (!errors.isEmpty()) {
             return res.status(400).json({ errors: errors.array() });
@@ -64,8 +82,12 @@ if (cluster.isMaster) {
         const tenantKey = req.tenantId + key;
 
         try {
-            const cmd = `ioctl /dev/hpkv 2 ${tenantKey} ${value}`;
-            execSync(cmd);
+            if (partialUpdate) {
+                await hpkvIoctl(HPKV_IOCTL_PARTIAL_UPDATE, tenantKey, value);
+            } else {
+                // For insert or full update, we write directly to the device
+                fs.writeFileSync('/dev/hpkv', `${tenantKey}:${value}`);
+            }
             res.status(200).json({ message: 'Record inserted/updated successfully' });
         } catch (error) {
             res.status(500).json({ error: 'Failed to insert/update record' });
@@ -75,7 +97,7 @@ if (cluster.isMaster) {
     // Get Record
     app.get('/record/:key', [
         param('key').isString().isLength({ min: 1, max: 252 }).trim().escape() // Adjusted length for tenant ID
-    ], (req, res) => {
+    ], async (req, res) => {
         const errors = validationResult(req);
         if (!errors.isEmpty()) {
             return res.status(400).json({ errors: errors.array() });
@@ -85,8 +107,7 @@ if (cluster.isMaster) {
         const tenantKey = req.tenantId + key;
 
         try {
-            const cmd = `ioctl /dev/hpkv 0 ${tenantKey}`;
-            const value = execSync(cmd).toString();
+            const value = await hpkvIoctl(HPKV_IOCTL_GET, tenantKey);
             res.status(200).json({ key, value });
         } catch (error) {
             res.status(404).json({ error: 'Record not found' });
@@ -96,7 +117,7 @@ if (cluster.isMaster) {
     // Delete Record
     app.delete('/record/:key', [
         param('key').isString().isLength({ min: 1, max: 252 }).trim().escape() // Adjusted length for tenant ID
-    ], (req, res) => {
+    ], async (req, res) => {
         const errors = validationResult(req);
         if (!errors.isEmpty()) {
             return res.status(400).json({ errors: errors.array() });
@@ -106,14 +127,12 @@ if (cluster.isMaster) {
         const tenantKey = req.tenantId + key;
 
         try {
-            const cmd = `ioctl /dev/hpkv 1 ${tenantKey}`;
-            execSync(cmd);
+            await hpkvIoctl(HPKV_IOCTL_DELETE, tenantKey);
             res.status(200).json({ message: 'Record deleted successfully' });
         } catch (error) {
             res.status(500).json({ error: 'Failed to delete record' });
         }
     });
-
 
     // Get Statistics
     app.get('/stats', (req, res) => {
