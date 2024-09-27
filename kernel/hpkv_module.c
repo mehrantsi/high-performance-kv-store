@@ -436,10 +436,12 @@ static int search_record(const char *key, char **value, size_t *value_len)
     if (cached) {
         *value = kmalloc(cached->value_len + 1, GFP_KERNEL);
         if (!*value) {
+            hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for value\n");
             return -ENOMEM;
         }
         memcpy(*value, cached->value, cached->value_len + 1);
         *value_len = cached->value_len;
+        hpkv_log(HPKV_LOG_DEBUG, "Found key %s in cache\n", key);
         return 0;
     }
 
@@ -453,17 +455,20 @@ static int search_record(const char *key, char **value, size_t *value_len)
             *value = kmalloc(record->value_len + 1, GFP_KERNEL);
             if (!*value) {
                 rcu_read_unlock();
+                hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for value\n");
                 return -ENOMEM;
             }
             memcpy(*value, record->value, record->value_len + 1);
             *value_len = record->value_len;
             ret = 0;
+            hpkv_log(HPKV_LOG_DEBUG, "Found key %s in memory\n", key);
         } else {
             // Value is on disk, need to read it
             ret = load_record_from_disk(record->sector, value, value_len);
             if (ret == 0) {
                 // Update cache
                 cache_put(key, *value, *value_len, record->sector);
+                hpkv_log(HPKV_LOG_DEBUG, "Found key %s on disk and updated cache\n", key);
             }
         }
     }
