@@ -1318,7 +1318,7 @@ static void compact_disk(void)
 
 
     if (atomic_read(&purge_in_progress) != 0) {
-        hpkv_log(HPKV_LOG_WARNING, "Purge operation in progress, skipping flush\n");
+        hpkv_log(HPKV_LOG_WARNING, "Purge operation in progress, skipping compact operation\n");
         return;
     }
 
@@ -2173,6 +2173,7 @@ static int check_metadata(struct hpkv_metadata *metadata)
 
     memcpy(metadata, bh->b_data, sizeof(struct hpkv_metadata));
     brelse(bh);
+    bh = NULL;
 
     if (memcmp(metadata->signature, HPKV_SIGNATURE, HPKV_SIGNATURE_SIZE) != 0) {
         hpkv_log(HPKV_LOG_WARNING, "Invalid signature found\n");
@@ -2254,7 +2255,7 @@ static int __init hpkv_init(void)
     }
 
     // Schedule an RCU callback
-    call_rcu(&((struct rcu_head){0}), hpkv_rcu_callback);
+    //call_rcu(&((struct rcu_head){0}), hpkv_rcu_callback);
     
     // Initialize the allocated_sectors bitmap
     bitmap_zero(allocated_sectors, SECTORS_BITMAP_SIZE);
@@ -2262,7 +2263,9 @@ static int __init hpkv_init(void)
     smp_mb();  // Memory barrier after bit operations
 
     // Quick metadata check
+    percpu_down_read(&rw_sem);
     ret = check_metadata(&metadata);
+    percpu_up_read(&rw_sem);
     if (ret == 0) {
         if (metadata.total_records == 0 && metadata.total_size == 0 && !force_read_disk) {
             hpkv_log(HPKV_LOG_INFO, "Device is initialized but empty. Skipping full index load.\n");
@@ -2320,6 +2323,7 @@ static int __init hpkv_init(void)
 
     hpkv_log(HPKV_LOG_INFO, "Creating proc entry\n");
     proc_create(PROC_ENTRY, 0, NULL, &hpkv_proc_fops);
+    hpkv_log(HPKV_LOG_INFO, "Proc entry created successfully\n");
 
     compact_wq = create_singlethread_workqueue("hpkv_compact");
     if (!compact_wq) {
