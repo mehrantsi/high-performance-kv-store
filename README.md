@@ -185,14 +185,10 @@ After loading the module and creating the device node, you can interact with it 
    ```sh
    sudo cat /dev/hpkv | grep "mykey:"
    ```
-   > [!WARNING]
-   >
    > This command will return the entire content of the device, including all key-value pairs. If you have a large dataset, this may take a while.
 
 3. **Delete a key-value pair:**
 
-   > [!NOTE]
-   >
    > This command is executed via ioctl and must be done via a program, not a shell command.
 
 4. **Partial update of a key-value pair:**
