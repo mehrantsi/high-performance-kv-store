@@ -37,7 +37,7 @@ if (cluster.isMaster) {
     // Rate limiting middleware
     const limiter = rateLimit({
         windowMs: 15 * 60 * 1000, // 15 minutes
-        max: 100, // limit each IP to 100 requests per windowMs
+        max: 100000, // limit each IP to 100000 requests per windowMs
         message: { error: 'Too many requests, please try again later.' }
     });
 
@@ -144,7 +144,12 @@ if (cluster.isMaster) {
         }
     });
 
-    app.listen(PORT, () => {
+    // Ping endpoint to check if the server is running
+    app.get('/ping', (req, res) => {
+        res.status(200).send('pong');
+    });
+
+    app.listen(PORT, '0.0.0.0', () => {
         console.log(`Worker ${process.pid} is running on port ${PORT}`);
     });
 }
