@@ -63,15 +63,6 @@ As shown, HPKV maintains **exceptionally low read/write latencies** even as the 
 - VM RAM: 4GB RAM
 - Disk: 4GB Disk
 
-
-## Advantages
-
-1. **Minimal Latency**: Operating in kernel space eliminates context switching overhead.
-2. **High Throughput**: Optimized data structures and kernel-level operations enable high-speed data processing.
-3. **Persistence with Performance**: Combines the speed of in-memory operations with the durability of disk storage.
-4. **Scalability**: Efficiently handles datasets from thousands to millions of records.
-5. **Linux Integration**: Tightly integrated with the Linux kernel for optimal resource utilization.
-
 ## Scalability and Performance
 
 HPKV is designed to **excel in environments requiring low-latency access to medium-sized datasets**. Its performance shines particularly for read-heavy workloads, making it ideal for caching layers and real-time data retrieval scenarios.
