@@ -2,6 +2,7 @@ require('dotenv').config(); // Load environment variables from .env file
 const express = require('express');
 const bodyParser = require('body-parser');
 const fs = require('fs').promises;
+const fsSync = require('fs');
 const { body, param, validationResult } = require('express-validator');
 const rateLimit = require('express-rate-limit');
 const config = require('./config.json'); // Load configuration file
@@ -64,7 +65,7 @@ if (cluster.isMaster) {
             try {
                 const fd = await fs.open('/dev/hpkv', 'r+');
                 const buffer = Buffer.from(`${cmd} ${key} ${value}`);
-                const result = await fd.ioctl(cmd, buffer);
+                const result = await fsSync.ioctl(fd.fd, cmd, buffer);
                 clearTimeout(timer);
                 await fd.close();
                 resolve(result.toString().trim());
