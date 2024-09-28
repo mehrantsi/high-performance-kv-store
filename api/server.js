@@ -2,7 +2,7 @@ require('dotenv').config(); // Load environment variables from .env file
 const express = require('express');
 const bodyParser = require('body-parser');
 const fs = require('fs').promises;
-const fsSync = require('fs');
+const ioctl = require('ioctl');
 const { body, param, validationResult } = require('express-validator');
 const rateLimit = require('express-rate-limit');
 const config = require('./config.json'); // Load configuration file
@@ -57,22 +57,33 @@ if (cluster.isMaster) {
 
     // Helper function to perform ioctl operations with timeout
     function hpkvIoctl(cmd, key, value = '', timeout = 5000) {
-        return new Promise(async (resolve, reject) => {
+        return new Promise((resolve, reject) => {
             const timer = setTimeout(() => {
                 reject(new Error('Operation timed out'));
             }, timeout);
 
-            try {
-                const fd = await fs.open('/dev/hpkv', 'r+');
-                const buffer = Buffer.from(`${cmd} ${key} ${value}`);
-                const result = await fsSync.ioctl(fd.fd, cmd, buffer);
-                clearTimeout(timer);
-                await fd.close();
-                resolve(result.toString().trim());
-            } catch (error) {
-                clearTimeout(timer);
-                reject(error);
-            }
+            fs.open('/dev/hpkv', 'r+')
+                .then(fd => {
+                    const buffer = Buffer.from(`${cmd} ${key} ${value}`);
+                    try {
+                        const result = ioctl(fd.fd, cmd, buffer);
+                        clearTimeout(timer);
+                        fd.close().then(() => {
+                            resolve(result.toString().trim());
+                        }).catch(closeError => {
+                            console.error('Error closing file:', closeError);
+                            resolve(result.toString().trim());
+                        });
+                    } catch (ioctlError) {
+                        clearTimeout(timer);
+                        fd.close().catch(closeError => console.error('Error closing file:', closeError));
+                        reject(ioctlError);
+                    }
+                })
+                .catch(openError => {
+                    clearTimeout(timer);
+                    reject(openError);
+                });
         });
     }
 
