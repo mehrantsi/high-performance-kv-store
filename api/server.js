@@ -64,15 +64,41 @@ if (cluster.isMaster) {
 
             fs.open('/dev/hpkv', 'r+')
                 .then(fd => {
-                    const buffer = Buffer.from(`${cmd} ${key} ${value}`);
+                    let buffer;
+                    switch (cmd) {
+                        case HPKV_IOCTL_GET:
+                        case HPKV_IOCTL_DELETE:
+                            buffer = Buffer.alloc(MAX_KEY_SIZE);
+                            buffer.write(key);
+                            break;
+                        case HPKV_IOCTL_PARTIAL_UPDATE:
+                            buffer = Buffer.alloc(MAX_KEY_SIZE + MAX_VALUE_SIZE);
+                            buffer.write(key);
+                            buffer.write(value, MAX_KEY_SIZE);
+                            break;
+                        case HPKV_IOCTL_PURGE:
+                            buffer = Buffer.alloc(0);  // No data needed for purge
+                            break;
+                        default:
+                            clearTimeout(timer);
+                            fd.close().catch(closeError => console.error('Error closing file:', closeError));
+                            reject(new Error('Invalid ioctl command'));
+                            return;
+                    }
+
                     try {
                         const result = ioctl(fd.fd, cmd, buffer);
                         clearTimeout(timer);
                         fd.close().then(() => {
-                            resolve(result.toString().trim());
+                            if (cmd === HPKV_IOCTL_GET) {
+                                // For GET, we need to trim the result to the actual value length
+                                resolve(result.toString('utf8', 0, result.length));
+                            } else {
+                                resolve(result);
+                            }
                         }).catch(closeError => {
                             console.error('Error closing file:', closeError);
-                            resolve(result.toString().trim());
+                            resolve(result);
                         });
                     } catch (ioctlError) {
                         clearTimeout(timer);
@@ -130,7 +156,12 @@ if (cluster.isMaster) {
             const value = await hpkvIoctl(HPKV_IOCTL_GET, tenantKey);
             res.status(200).json({ key, value });
         } catch (error) {
-            res.status(404).json({ error: 'Record not found' });
+            if (error.message.includes('ENOENT')) {
+                res.status(404).json({ error: 'Record not found' });
+            } else {
+                console.error('Error in GET /record/:key:', error);
+                res.status(500).json({ error: 'Failed to retrieve record' });
+            }
         }
     });
 
@@ -150,6 +181,7 @@ if (cluster.isMaster) {
             await hpkvIoctl(HPKV_IOCTL_DELETE, tenantKey);
             res.status(200).json({ message: 'Record deleted successfully' });
         } catch (error) {
+            console.error('Error in DELETE /record/:key:', error);
             res.status(500).json({ error: 'Failed to delete record' });
         }
     });
