@@ -1,7 +1,7 @@
 require('dotenv').config(); // Load environment variables from .env file
 const express = require('express');
 const bodyParser = require('body-parser');
-const fs = require('fs');
+const fs = require('fs').promises;
 const { body, param, validationResult } = require('express-validator');
 const rateLimit = require('express-rate-limit');
 const config = require('./config.json'); // Load configuration file
@@ -54,16 +54,24 @@ if (cluster.isMaster) {
         next();
     });
 
-    // Helper function to perform ioctl operations
-    function hpkvIoctl(cmd, key, value = '') {
-        return new Promise((resolve, reject) => {
-            const fd = fs.openSync('/dev/hpkv', 'r+');
-            const buffer = Buffer.from(`${cmd} ${key} ${value}`);
-            fs.ioctl(fd, cmd, buffer, (err, result) => {
-                fs.closeSync(fd);
-                if (err) reject(err);
-                else resolve(result.toString().trim());
-            });
+    // Helper function to perform ioctl operations with timeout
+    function hpkvIoctl(cmd, key, value = '', timeout = 5000) {
+        return new Promise(async (resolve, reject) => {
+            const timer = setTimeout(() => {
+                reject(new Error('Operation timed out'));
+            }, timeout);
+
+            try {
+                const fd = await fs.open('/dev/hpkv', 'r+');
+                const buffer = Buffer.from(`${cmd} ${key} ${value}`);
+                const result = await fd.ioctl(cmd, buffer);
+                clearTimeout(timer);
+                await fd.close();
+                resolve(result.toString().trim());
+            } catch (error) {
+                clearTimeout(timer);
+                reject(error);
+            }
         });
     }
 
@@ -85,11 +93,11 @@ if (cluster.isMaster) {
             if (partialUpdate) {
                 await hpkvIoctl(HPKV_IOCTL_PARTIAL_UPDATE, tenantKey, value);
             } else {
-                // For insert or full update, we write directly to the device
-                fs.writeFileSync('/dev/hpkv', `${tenantKey}:${value}`);
+                await fs.writeFile('/dev/hpkv', `${tenantKey}:${value}`);
             }
             res.status(200).json({ message: 'Record inserted/updated successfully' });
         } catch (error) {
+            console.error('Error in POST /record:', error);
             res.status(500).json({ error: 'Failed to insert/update record' });
         }
     });
