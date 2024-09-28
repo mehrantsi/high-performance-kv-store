@@ -2324,7 +2324,7 @@ static int __init hpkv_init(void)
     }
 
     INIT_DELAYED_WORK(&compact_work, compact_work_handler);
-    queue_delayed_work(compact_wq, &compact_work, COMPACT_INTERVAL);
+    //queue_delayed_work(compact_wq, &compact_work, COMPACT_INTERVAL);
 
     init_completion(&flush_completion);
 
