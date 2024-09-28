@@ -2006,7 +2006,7 @@ static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                     return -EFAULT;
                 }
                 kfree(value);
-                return 0;
+                return value_len;  // Return the length of the value
             } else if (ret == -ENOENT) {
                 hpkv_log(HPKV_LOG_DEBUG, "Key not found: %s\n", key);
                 return -ENOENT;
@@ -2016,20 +2016,35 @@ static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             }
         
         case 1:  // Delete by key
-            if (copy_from_user(key, (char __user *)arg, MAX_KEY_SIZE))
+            if (!arg || !access_ok((void __user *)arg, MAX_KEY_SIZE)) {
+                hpkv_log(HPKV_LOG_ERR, "Invalid user space pointer\n");
                 return -EFAULT;
+            }
+            
+            if (copy_from_user(key, (char __user *)arg, MAX_KEY_SIZE)) {
+                hpkv_log(HPKV_LOG_ERR, "Failed to copy key from user space\n");
+                return -EFAULT;
+            }
             
             key[MAX_KEY_SIZE - 1] = '\0';
             return delete_record(key);
 
         case 2:  // Partial update
-            if (copy_from_user(key, (char __user *)arg, MAX_KEY_SIZE))
+            if (!arg || !access_ok((void __user *)arg, MAX_KEY_SIZE + MAX_VALUE_SIZE)) {
+                hpkv_log(HPKV_LOG_ERR, "Invalid user space pointer\n");
                 return -EFAULT;
+            }
+            
+            if (copy_from_user(key, (char __user *)arg, MAX_KEY_SIZE)) {
+                hpkv_log(HPKV_LOG_ERR, "Failed to copy key from user space\n");
+                return -EFAULT;
+            }
             
             key[MAX_KEY_SIZE - 1] = '\0';
             value = kmalloc(MAX_VALUE_SIZE, GFP_KERNEL);
             if (!value)
                 return -ENOMEM;
+            
             if (copy_from_user(value, (char __user *)(arg + MAX_KEY_SIZE), MAX_VALUE_SIZE)) {
                 kfree(value);
                 return -EFAULT;
