@@ -1188,6 +1188,7 @@ static void flush_write_buffer(void)
                 case OP_DELETE:
                     records_changed--;
                     size_changed -= entry->old_value_len;
+                    call_rcu(&entry->record->rcu, record_free_rcu);
                     break;
             }
         }
@@ -1295,7 +1296,6 @@ static void write_record_work(struct work_struct *work)
             break;
         case OP_DELETE:
             mark_sector_as_deleted(entry->record->sector);
-            call_rcu(&entry->record->rcu, record_free_rcu);
             break;
     }
 
