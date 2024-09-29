@@ -1083,7 +1083,6 @@ static void write_record_to_disk(struct record *record)
     memcpy(bh->b_data, record->key, sizeof(record->key));
     memcpy(bh->b_data + sizeof(record->key), &record->value_len, sizeof(size_t));
     
-    // Add this check
     if (!record->value) {
         hpkv_log(HPKV_LOG_ERR, "Record value became null before writing to disk. Key: %s\n", record->key);
         unlock_buffer(bh);
@@ -1100,9 +1099,13 @@ static void write_record_to_disk(struct record *record)
         hpkv_log(HPKV_LOG_ERR, "Failed to sync buffer to disk. Key: %s\n", record->key);
     } else {
         // Successfully written to disk, now free the in-memory value
-        kfree(record->value);
-        record->value = NULL;
-        smp_wmb();  // Ensure the NULL is visible to other CPUs
+        if (record->value) {
+            kfree(record->value);
+            record->value = NULL;
+            smp_wmb();  // Ensure the NULL is visible to other CPUs
+        } else {
+            hpkv_log(HPKV_LOG_WARNING, "Record value unexpectedly NULL after successful write. Key: %s\n", record->key);
+        }
     }
 
     brelse(bh);
@@ -1295,12 +1298,24 @@ static void write_record_work(struct work_struct *work)
             write_record_to_disk(entry->record);
             break;
         case OP_DELETE:
-            mark_sector_as_deleted(entry->record->sector);
+            if (entry->record->sector != 0) {
+                mark_sector_as_deleted(entry->record->sector);
+                // Free the record immediately after marking the sector as deleted
+                if (entry->record->value) {
+                    kfree(entry->record->value);
+                    entry->record->value = NULL;
+                }
+                kmem_cache_free(record_cache, entry->record);
+                entry->record = NULL;
+            } else {
+                hpkv_log(HPKV_LOG_WARNING, "Attempted to delete record with invalid sector\n");
+            }
             break;
     }
 
     if (time_after(jiffies, timeout)) {
-        hpkv_log(HPKV_LOG_WARNING, "Write operation timed out for key: %s\n", entry->record->key);
+        hpkv_log(HPKV_LOG_WARNING, "Write operation timed out for key: %s\n", 
+                 entry->record ? entry->record->key : "unknown");
         atomic_set(&entry->work_status, 3);  // Mark as timed out
     } else {
         atomic_set(&entry->work_status, 2);  // Mark as completed
