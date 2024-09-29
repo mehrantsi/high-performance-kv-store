@@ -100,7 +100,7 @@ if (cluster.isMaster) {
                         if (cmd === HPKV_IOCTL_GET) {
                             const valueLength = buffer.readUInt32LE(MAX_KEY_SIZE);
                             const rawValue = Buffer.from(buffer.buffer, buffer.byteOffset + MAX_KEY_SIZE + 4, valueLength);
-                            const value = rawValue.toString('utf8').replace(/\0/g, '');
+                            const value = rawValue.toString().trim();
                             resolve(value);
                         } else {
                             resolve(result);
