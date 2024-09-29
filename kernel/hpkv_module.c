@@ -397,12 +397,8 @@ static void record_free_rcu(struct rcu_head *head)
             kfree(record->value);
             record->value = NULL;
         }
-        // Use atomic operations to ensure we only free once
-        if (atomic_dec_and_test(&record->refcount)) {
-            kmem_cache_free(record_cache, record);
-        }
+        kmem_cache_free(record_cache, record);
     }
-    hpkv_log(HPKV_LOG_INFO, "RCU callback executed for record\n");
 }
 
 static struct record *record_find_rcu(const char *key)
@@ -1290,14 +1286,21 @@ static void write_record_work(struct work_struct *work)
     struct write_buffer_entry *entry = container_of(work, struct write_buffer_entry, work);
     unsigned long timeout;
     
-    if (!entry || !entry->record) {
-        hpkv_log(HPKV_LOG_ERR, "Invalid entry or record in write_record_work\n");
+    if (!entry) {
+        hpkv_log(HPKV_LOG_ERR, "Invalid entry in write_record_work\n");
         return;
     }
 
     atomic_set(&entry->work_status, 1);  // Mark as in progress
 
     timeout = jiffies + msecs_to_jiffies(5000);  // 5 second timeout
+
+    if (!entry->record) {
+        hpkv_log(HPKV_LOG_ERR, "Invalid record in write_record_work\n");
+        atomic_set(&entry->work_status, 3);  // Mark as failed
+        complete(&entry->work_done);
+        return;
+    }
 
     switch (entry->op) {
         case OP_INSERT:
@@ -1309,11 +1312,8 @@ static void write_record_work(struct work_struct *work)
                 mark_sector_as_deleted(entry->record->sector);
                 // Decrement refcount after marking the sector as deleted
                 if (atomic_dec_and_test(&entry->record->refcount)) {
-                    if (entry->record->value) {
-                        kfree(entry->record->value);
-                        entry->record->value = NULL;
-                    }
-                    kmem_cache_free(record_cache, entry->record);
+                    // Use RCU to free the record
+                    call_rcu(&entry->record->rcu, record_free_rcu);
                     entry->record = NULL;
                 }
             } else {
