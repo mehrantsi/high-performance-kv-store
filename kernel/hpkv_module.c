@@ -1328,10 +1328,6 @@ static void write_record_work(struct work_struct *work)
                 // If refcount is greater than 0, write to disk
                 write_record_to_disk(entry->record);
                 hpkv_log(HPKV_LOG_INFO, "Wrote record to disk: %s\n", entry->record->key);
-            } else {
-                // Free the record
-                call_rcu(&entry->record->rcu, record_free_rcu);
-                hpkv_log(HPKV_LOG_INFO, "Skipping write for deleted or updated record: %s\n", entry->record->key);
             }
             break;
         case OP_DELETE:
