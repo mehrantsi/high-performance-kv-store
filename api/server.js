@@ -73,7 +73,7 @@ if (cluster.isMaster) {
                 switch (cmd) {
                     case HPKV_IOCTL_GET:
                     case HPKV_IOCTL_DELETE:
-                        buffer = Buffer.alloc(MAX_KEY_SIZE + 4 + MAX_VALUE_SIZE);
+                        buffer = Buffer.alloc(MAX_KEY_SIZE + 8 + MAX_VALUE_SIZE); // 8 bytes for size_t
                         buffer.write(key.toString(), 0, MAX_KEY_SIZE);
                         break;
                     case HPKV_IOCTL_PARTIAL_UPDATE:
@@ -94,12 +94,6 @@ if (cluster.isMaster) {
                     const result = ioctl(fd.fd, cmd, buffer);
                     clearTimeout(timer);
                     await fd.close();
-                    
-                    // Log buffer content for debugging
-                    console.log('Buffer content:', buffer.toString('hex'));
-                    console.log('Value length:', buffer.readUInt32LE(MAX_KEY_SIZE));
-                    console.log('Value:', buffer.toString('utf8', MAX_KEY_SIZE + 4, MAX_KEY_SIZE + 4 + buffer.readUInt32LE(MAX_KEY_SIZE)));
-                    
                     resolve(buffer);
                 } catch (ioctlError) {
                     clearTimeout(timer);
@@ -155,8 +149,8 @@ if (cluster.isMaster) {
         try {
             const buffer = await hpkvIoctl(HPKV_IOCTL_GET, tenantKey);
             
-            const valueLength = buffer.readUInt32LE(MAX_KEY_SIZE);
-            const value = buffer.toString('utf8', MAX_KEY_SIZE + 4, MAX_KEY_SIZE + 4 + valueLength);
+            const valueLength = buffer.readBigUInt64LE(MAX_KEY_SIZE); // Read 8-byte BigInt
+            const value = buffer.toString('utf8', MAX_KEY_SIZE + 8, MAX_KEY_SIZE + 8 + Number(valueLength));
 
             res.status(200).json({ key: key, value: value.trim() });
         } catch (error) {
