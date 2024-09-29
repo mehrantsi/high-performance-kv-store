@@ -791,6 +791,10 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
             new_value[new_len] = '\0';
             new_record->value = new_value;
             new_record->value_len = new_len;
+            
+            // Log the partial update
+            hpkv_log(HPKV_LOG_INFO, "Partial update for key: %s, new value: %s, new length: %zu\n", 
+                     key, new_record->value, new_record->value_len);
         } else {
             // Perform regular update
             new_record->value = kmalloc(value_len + 1, GFP_KERNEL);
