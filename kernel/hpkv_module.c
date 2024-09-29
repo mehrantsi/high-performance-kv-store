@@ -392,13 +392,25 @@ static int load_record_from_disk(sector_t sector, char **value, size_t *value_le
 static void record_free_rcu(struct rcu_head *head)
 {
     struct record *record = container_of(head, struct record, rcu);
-    if (record) {
-        if (record->value) {
-            kfree(record->value);
-            record->value = NULL;
-        }
-        kmem_cache_free(record_cache, record);
+    if (!record) {
+        hpkv_log(HPKV_LOG_ERR, "Attempted to free NULL record in record_free_rcu\n");
+        return;
     }
+
+    // Use RCU read-side critical section to safely access record fields
+    rcu_read_lock();
+    if (record->value) {
+        char *value_to_free = rcu_dereference(record->value);
+        if (value_to_free) {
+            kfree(value_to_free);
+        }
+        rcu_assign_pointer(record->value, NULL);
+    }
+    rcu_read_unlock();
+
+    // Use a memory barrier before freeing the record
+    smp_wmb();
+    kmem_cache_free(record_cache, record);
 }
 
 static struct record *record_find_rcu(const char *key)
@@ -2245,7 +2257,7 @@ static int __init hpkv_init(void)
         return major_num;
     }
 
-    record_cache = kmem_cache_create("hpkv_record", sizeof(struct record), 0, SLAB_HWCACHE_ALIGN | SLAB_PANIC, NULL);
+    record_cache = kmem_cache_create("hpkv_record", sizeof(struct record), 0, SLAB_HWCACHE_ALIGN | SLAB_PANIC | SLAB_ACCOUNT, NULL);
     if (!record_cache) {
         hpkv_log(HPKV_LOG_ALERT, "Failed to create record cache\n");
         ret = -ENOMEM;
@@ -2482,7 +2494,6 @@ static void __exit hpkv_exit(void)
     }
 
     // Ensure all RCU callbacks have completed
-    synchronize_rcu();
     rcu_barrier();
 
     // Clear cache
@@ -2515,7 +2526,6 @@ static void __exit hpkv_exit(void)
     msleep(500);
 
     if (record_cache) {
-        kmem_cache_shrink(record_cache);
         kmem_cache_destroy(record_cache);
         record_cache = NULL;
     }
