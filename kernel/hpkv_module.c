@@ -397,7 +397,10 @@ static void record_free_rcu(struct rcu_head *head)
             kfree(record->value);
             record->value = NULL;
         }
-        kmem_cache_free(record_cache, record);
+        // Use atomic operations to ensure we only free once
+        if (atomic_dec_and_test(&record->refcount)) {
+            kmem_cache_free(record_cache, record);
+        }
     }
     hpkv_log(HPKV_LOG_INFO, "RCU callback executed for record\n");
 }
@@ -890,6 +893,9 @@ static int delete_record(const char *key)
     atomic_long_sub(record->value_len, &total_disk_usage);
     atomic_dec(&record_count);
 
+    // Increment refcount before adding to write buffer
+    atomic_inc(&record->refcount);
+
     percpu_up_write(&rw_sem);
 
     // Add delete operation to write buffer
@@ -901,6 +907,7 @@ static int delete_record(const char *key)
         insert_rb_tree(record);
         atomic_long_add(record->value_len, &total_disk_usage);
         atomic_inc(&record_count);
+        atomic_dec(&record->refcount);  // Decrement refcount if we fail to add to write buffer
         percpu_up_write(&rw_sem);
         return -ENOMEM;
     }
@@ -1300,13 +1307,15 @@ static void write_record_work(struct work_struct *work)
         case OP_DELETE:
             if (entry->record->sector != 0) {
                 mark_sector_as_deleted(entry->record->sector);
-                // Free the record immediately after marking the sector as deleted
-                if (entry->record->value) {
-                    kfree(entry->record->value);
-                    entry->record->value = NULL;
+                // Decrement refcount after marking the sector as deleted
+                if (atomic_dec_and_test(&entry->record->refcount)) {
+                    if (entry->record->value) {
+                        kfree(entry->record->value);
+                        entry->record->value = NULL;
+                    }
+                    kmem_cache_free(record_cache, entry->record);
+                    entry->record = NULL;
                 }
-                kmem_cache_free(record_cache, entry->record);
-                entry->record = NULL;
             } else {
                 hpkv_log(HPKV_LOG_WARNING, "Attempted to delete record with invalid sector\n");
             }
