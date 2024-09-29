@@ -1317,7 +1317,7 @@ static void write_record_work(struct work_struct *work)
                     entry->record = NULL;
                 }
             } else {
-                hpkv_log(HPKV_LOG_WARNING, "Attempted to delete record with invalid sector\n");
+                hpkv_log(HPKV_LOG_INFO, "Deleted record that was not yet written to disk: %s\n", entry->record->key);
             }
             break;
     }
