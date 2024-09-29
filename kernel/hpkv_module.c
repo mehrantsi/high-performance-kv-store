@@ -92,7 +92,6 @@ static void write_record_work(struct work_struct *work);
 static void metadata_update_work_func(struct work_struct *work);
 static void release_sectors(sector_t start_sector, size_t size);
 static bool flush_workqueue_timeout(struct workqueue_struct *wq, unsigned long timeout);
-static void force_free_records(void);
 
 static int major_num;
 static struct kmem_cache *record_cache;
@@ -2107,7 +2106,13 @@ static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                 return -EFAULT;
             }
             
+            hpkv_log(HPKV_LOG_INFO, "Received partial update ioctl command for key: %s\n", key);
             ret = insert_or_update_record(key, value, strlen(value), true);
+            if (ret == 0) {
+                hpkv_log(HPKV_LOG_INFO, "Partial update successful for key: %s\n", key);
+            } else {
+                hpkv_log(HPKV_LOG_ERR, "Partial update failed for key: %s, error: %d\n", key, ret);
+            }
             kfree(value);
             return ret;
 
