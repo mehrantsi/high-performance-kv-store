@@ -61,16 +61,13 @@ if (cluster.isMaster) {
 
     // Helper function to perform ioctl operations with timeout
     async function hpkvIoctl(cmd, key, value = '', timeout = 5000) {
-        return new Promise((resolve, reject) => {
+        return new Promise(async (resolve, reject) => {
             const timer = setTimeout(() => {
                 reject(new Error('Operation timed out'));
             }, timeout);
 
-            fs.open('/dev/hpkv', 'r+', (err, fd) => {
-                if (err) {
-                    clearTimeout(timer);
-                    return reject(err);
-                }
+            try {
+                const fd = await fs.open('/dev/hpkv', 'r+');
 
                 let buffer;
                 switch (cmd) {
@@ -89,21 +86,24 @@ if (cluster.isMaster) {
                         break;
                     default:
                         clearTimeout(timer);
-                        fs.close(fd, () => {});
+                        await fd.close();
                         return reject(new Error('Invalid ioctl command'));
                 }
 
                 try {
-                    const result = ioctl(fd, cmd, buffer);
+                    const result = ioctl(fd.fd, cmd, buffer);
                     clearTimeout(timer);
-                    fs.close(fd, () => {});
+                    await fd.close();
                     resolve(result);
                 } catch (ioctlError) {
                     clearTimeout(timer);
-                    fs.close(fd, () => {});
+                    await fd.close();
                     reject(ioctlError);
                 }
-            });
+            } catch (err) {
+                clearTimeout(timer);
+                reject(err);
+            }
         });
     }
 
