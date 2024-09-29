@@ -94,6 +94,12 @@ if (cluster.isMaster) {
                     const result = ioctl(fd.fd, cmd, buffer);
                     clearTimeout(timer);
                     await fd.close();
+                    
+                    // Log buffer content for debugging
+                    console.log('Buffer content:', buffer.toString('hex'));
+                    console.log('Value length:', buffer.readUInt32LE(MAX_KEY_SIZE));
+                    console.log('Value:', buffer.toString('utf8', MAX_KEY_SIZE + 4, MAX_KEY_SIZE + 4 + buffer.readUInt32LE(MAX_KEY_SIZE)));
+                    
                     resolve(buffer);
                 } catch (ioctlError) {
                     clearTimeout(timer);
@@ -150,8 +156,7 @@ if (cluster.isMaster) {
             const buffer = await hpkvIoctl(HPKV_IOCTL_GET, tenantKey);
             
             const valueLength = buffer.readUInt32LE(MAX_KEY_SIZE);
-            const valueBuffer = new Uint8Array(buffer.buffer, buffer.byteOffset + MAX_KEY_SIZE + 4, valueLength);
-            const value = Buffer.from(valueBuffer).toString('utf8');
+            const value = buffer.toString('utf8', MAX_KEY_SIZE + 4, MAX_KEY_SIZE + 4 + valueLength);
 
             res.status(200).json({ key: key, value: value.trim() });
         } catch (error) {
