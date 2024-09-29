@@ -127,8 +127,10 @@ if (cluster.isMaster) {
 
         try {
             if (partialUpdate) {
+                console.log(`Performing partial update for key: ${key}`);
                 await hpkvIoctl(HPKV_IOCTL_PARTIAL_UPDATE, tenantKey, value);
             } else {
+                console.log(`Performing full update for key: ${key}`);
                 await fs.writeFile('/dev/hpkv', `${tenantKey}:${value}`);
             }
             res.status(200).json({ success: true, message: 'Record inserted/updated successfully' });
