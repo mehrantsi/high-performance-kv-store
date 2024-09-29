@@ -95,20 +95,21 @@ if (cluster.isMaster) {
                         fd.close().then(() => {
                             if (cmd === HPKV_IOCTL_GET) {
                                 if (Buffer.isBuffer(result)) {
-                                    // Find the actual length of the value (up to the first null byte or end of buffer)
-                                    const valueLength = result.indexOf(0) !== -1 ? result.indexOf(0) : result.length;
-                                    // Convert only the valid part of the buffer to a string
-                                    resolve(result.toString('utf8', 0, valueLength));
+                                    // Read the value length from the first 4 bytes after the key
+                                    const valueLength = buffer.readUInt32LE(MAX_KEY_SIZE - 4);
+                                    // Extract the value from the buffer
+                                    const value = buffer.toString('utf8', MAX_KEY_SIZE, MAX_KEY_SIZE + valueLength);
+                                    resolve(value);
                                 } else {
                                     console.error('Unexpected result type:', typeof result);
-                                    resolve(result.toString());
+                                    reject(new Error(`Unexpected result type: ${typeof result}`));
                                 }
                             } else {
                                 resolve(result);
                             }
                         }).catch(closeError => {
                             console.error('Error closing file:', closeError);
-                            resolve(result);
+                            reject(closeError);
                         });
                     } catch (ioctlError) {
                         clearTimeout(timer);
@@ -165,7 +166,7 @@ if (cluster.isMaster) {
         try {
             const value = await hpkvIoctl(HPKV_IOCTL_GET, tenantKey);
             // Remove the tenant ID (first 4 characters) from the key in the response
-            res.status(200).json({ key: key, value: value.toString().trim() });
+            res.status(200).json({ key: key, value: value });
         } catch (error) {
             if (error.message.includes('ENOENT')) {
                 res.status(404).json({ error: 'Record not found' });
