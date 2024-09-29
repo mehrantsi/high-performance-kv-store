@@ -904,7 +904,7 @@ static int delete_record(const char *key)
         insert_rb_tree(record);
         atomic_long_add(record->value_len, &total_disk_usage);
         atomic_inc(&record_count);
-        atomic_dec(&record->refcount);  // Decrement refcount if we fail to add to write buffer
+        atomic_set(&record->refcount, 1);
         percpu_up_write(&rw_sem);
         return -ENOMEM;
     }
