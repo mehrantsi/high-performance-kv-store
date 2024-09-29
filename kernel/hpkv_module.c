@@ -743,16 +743,15 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
     if (old_record) {
         hpkv_log(HPKV_LOG_INFO, "Updating existing record for key: %s\n", key);
         
-        // Increment refcount of old_record before removing from in-memory structures
-        atomic_inc(&old_record->refcount);
-
+        // Set refcount to 1 for the new record
+        atomic_set(&new_record->refcount, 1);
+        
         if (is_partial_update) {
             // Perform partial update
             size_t new_len = old_record->value_len + value_len;
             if (new_len > MAX_VALUE_SIZE) {
                 percpu_up_write(&rw_sem);
                 kmem_cache_free(record_cache, new_record);
-                atomic_dec(&old_record->refcount);  // Decrement refcount if we fail
                 hpkv_log(HPKV_LOG_ERR, "Partial update exceeds maximum value size\n");
                 return -EMSGSIZE;
             }
@@ -760,7 +759,6 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
             if (!new_value) {
                 percpu_up_write(&rw_sem);
                 kmem_cache_free(record_cache, new_record);
-                atomic_dec(&old_record->refcount);  // Decrement refcount if we fail
                 hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for partial update\n");
                 return -ENOMEM;
             }
@@ -775,7 +773,6 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
             if (!new_record->value) {
                 percpu_up_write(&rw_sem);
                 kmem_cache_free(record_cache, new_record);
-                atomic_dec(&old_record->refcount);  // Decrement refcount if we fail
                 hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for regular update\n");
                 return -ENOMEM;
             }
@@ -788,14 +785,11 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
         hash_del_rcu(&old_record->hash_node);
         rb_erase(&old_record->tree_node, &records_tree);
         atomic_long_sub(old_record->value_len, &total_disk_usage);
-
-        // Decrement refcount of old_record, potentially scheduling it for deletion
-        if (atomic_dec_and_test(&old_record->refcount)) {
-            call_rcu(&old_record->rcu, record_free_rcu);
-        }
+        atomic_set(&old_record->refcount, 0);
     } else {
         hpkv_log(HPKV_LOG_INFO, "Inserting new record for key: %s\n", key);
-        // New insert
+        // Set refcount to 1 for the new record
+        atomic_set(&new_record->refcount, 1);
         new_record->value = kmalloc(value_len + 1, GFP_KERNEL);
         if (!new_record->value) {
             percpu_up_write(&rw_sem);
@@ -896,8 +890,8 @@ static int delete_record(const char *key)
     atomic_long_sub(record->value_len, &total_disk_usage);
     atomic_dec(&record_count);
 
-    // Increment refcount before adding to write buffer
-    atomic_inc(&record->refcount);
+    // Set refcount to 0 to indicate deletion
+    atomic_set(&record->refcount, 0);
 
     percpu_up_write(&rw_sem);
 
@@ -1308,16 +1302,14 @@ static void write_record_work(struct work_struct *work)
     switch (entry->op) {
         case OP_INSERT:
         case OP_UPDATE:
-            if (atomic_read(&entry->record->refcount) > 1) {
-                // If refcount is greater than 1, it means there's a newer version or update pending
-                atomic_dec(&entry->record->refcount);
-                hpkv_log(HPKV_LOG_INFO, "Skipping write for outdated record: %s\n", entry->record->key);
-            } else if (atomic_cmpxchg(&entry->record->refcount, 1, 0) == 1) {
-                // If we successfully decremented from 1 to 0, write to disk
+            if (atomic_read(&entry->record->refcount) > 0) {
+                // If refcount is greater than 0, write to disk
                 write_record_to_disk(entry->record);
+                hpkv_log(HPKV_LOG_INFO, "Wrote record to disk: %s\n", entry->record->key);
             } else {
-                // If refcount was already 0, it means this record was deleted
-                hpkv_log(HPKV_LOG_INFO, "Skipping write for deleted record: %s\n", entry->record->key);
+                // If refcount is 0, it means this record was deleted or updated
+                call_rcu(&entry->record->rcu, record_free_rcu);
+                hpkv_log(HPKV_LOG_INFO, "Skipping write for deleted or updated record: %s\n", entry->record->key);
             }
             break;
         case OP_DELETE:
@@ -1325,10 +1317,10 @@ static void write_record_work(struct work_struct *work)
                 mark_sector_as_deleted(entry->record->sector);
                 // Release the sectors used by this record
                 release_sectors(entry->record->sector, entry->old_value_len);
-            }
-            // For delete operations, always decrement refcount and potentially free
-            if (atomic_dec_and_test(&entry->record->refcount)) {
+                hpkv_log(HPKV_LOG_INFO, "Marked sector as deleted for key: %s\n", entry->record->key);
+                // Free the record
                 call_rcu(&entry->record->rcu, record_free_rcu);
+                hpkv_log(HPKV_LOG_INFO, "Scheduled record for freeing: %s\n", entry->record->key);
             }
             break;
     }
