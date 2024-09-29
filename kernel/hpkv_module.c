@@ -934,7 +934,7 @@ static int delete_record(const char *key)
     }
     spin_unlock(&cache_lock);
 
-    // Release sectors in write_record_work
+    // Release sectors and free the record in write_record_work
 
     hpkv_log(HPKV_LOG_INFO, "Successfully queued delete operation for key: %s\n", key);
     return ret;
@@ -1307,7 +1307,9 @@ static void write_record_work(struct work_struct *work)
                 write_record_to_disk(entry->record);
                 hpkv_log(HPKV_LOG_INFO, "Wrote record to disk: %s\n", entry->record->key);
             } else {
-                // If refcount is 0, it means this record was deleted or updated
+                // Ensure all RCU readers have finished before we free the record
+                synchronize_rcu();
+                // Free the record
                 call_rcu(&entry->record->rcu, record_free_rcu);
                 hpkv_log(HPKV_LOG_INFO, "Skipping write for deleted or updated record: %s\n", entry->record->key);
             }
@@ -1318,10 +1320,12 @@ static void write_record_work(struct work_struct *work)
                 // Release the sectors used by this record
                 release_sectors(entry->record->sector, entry->old_value_len);
                 hpkv_log(HPKV_LOG_INFO, "Marked sector as deleted for key: %s\n", entry->record->key);
-                // Free the record
-                call_rcu(&entry->record->rcu, record_free_rcu);
-                hpkv_log(HPKV_LOG_INFO, "Scheduled record for freeing: %s\n", entry->record->key);
             }
+            // Ensure all RCU readers have finished before we free the record
+            synchronize_rcu();
+            // Free the record
+            call_rcu(&entry->record->rcu, record_free_rcu);
+            hpkv_log(HPKV_LOG_INFO, "Scheduled record for freeing: %s\n", entry->record->key);
             break;
     }
 
