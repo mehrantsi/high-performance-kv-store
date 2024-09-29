@@ -121,15 +121,11 @@ if (cluster.isMaster) {
         const { key, value, partialUpdate } = req.body;
         const tenantKey = req.tenantId + key;
 
-        console.log(`Received request: key=${key}, value=${value}, partialUpdate=${partialUpdate}`);
-
         try {
             if (partialUpdate) {
-                console.log(`Performing partial update for key: ${key}`);
                 const partialUpdateString = `${tenantKey}:+${value}`;
                 await fs.writeFile('/dev/hpkv', partialUpdateString);
             } else {
-                console.log(`Performing full update for key: ${key}`);
                 await fs.writeFile('/dev/hpkv', `${tenantKey}:${value}`);
             }
             res.status(200).json({ success: true, message: 'Record inserted/updated successfully' });
