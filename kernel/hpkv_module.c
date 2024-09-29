@@ -1711,6 +1711,7 @@ static int purge_data(void)
     struct record *record;
     struct write_buffer_entry *entry, *tmp;
     LIST_HEAD(local_list);
+    sector_t last_purged_sector = 0;
 
     hpkv_log(HPKV_LOG_INFO, "Starting purge operation\n");
 
@@ -1787,6 +1788,12 @@ static int purge_data(void)
 
     // Now clear the disk
     while (sector * HPKV_BLOCK_SIZE < i_size_read(bdev->bd_inode)) {
+        if (signal_pending(current)) {
+            hpkv_log(HPKV_LOG_WARNING, "Purge operation interrupted at sector %llu\n", (unsigned long long)sector);
+            ret = -EINTR;
+            goto out;
+        }
+
         bh = __getblk(bdev, sector, HPKV_BLOCK_SIZE);
         if (!bh) {
             hpkv_log(HPKV_LOG_ERR, "Failed to get block for purging at sector %llu\n", (unsigned long long)sector);
@@ -1802,7 +1809,9 @@ static int purge_data(void)
         
         if (sector % 1000 == 0) {  // Sync every 1000 sectors to avoid overwhelming I/O
             sync_dirty_buffer(bh);
-            hpkv_log(HPKV_LOG_INFO, "Purged %llu sectors\n", (unsigned long long)sector);
+            last_purged_sector = sector;
+            hpkv_log(HPKV_LOG_INFO, "Purged %llu sectors\n", 
+                     (unsigned long long)sector);
             
             // Allow other processes to run
             percpu_up_write(&rw_sem);
@@ -1812,12 +1821,6 @@ static int purge_data(void)
         
         brelse(bh);
         sector++;
-
-        if (signal_pending(current)) {
-            hpkv_log(HPKV_LOG_WARNING, "Purge operation interrupted\n");
-            ret = -EINTR;
-            goto out;
-        }
     }
 
     // Final sync
@@ -1831,6 +1834,11 @@ static int purge_data(void)
     }
 
 out:
+    if (ret == -EINTR) {
+        hpkv_log(HPKV_LOG_WARNING, "Purge operation interrupted. Last purged sector: %llu\n", 
+                 (unsigned long long)last_purged_sector);
+    }
+
     kfree(empty_buffer);
     percpu_up_write(&rw_sem);
     synchronize_rcu();
