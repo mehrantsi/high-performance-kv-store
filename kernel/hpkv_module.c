@@ -808,6 +808,17 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
             new_record->value[value_len] = '\0';
             new_record->value_len = value_len;
         }
+        // Delete the old record
+        percpu_up_write(&rw_sem);
+        ret = delete_record(key);
+        percpu_down_write(&rw_sem);
+        if (ret != 0) {
+            kfree(new_record->value);
+            kmem_cache_free(record_cache, new_record);
+            hpkv_log(HPKV_LOG_ERR, "Failed to delete old record\n");
+            return ret;
+        }
+        atomic_inc(&record_count); // Increment record count because deleting old record decreases it
 
     } else {
         hpkv_log(HPKV_LOG_INFO, "Inserting new record for key: %s\n", key);
@@ -877,16 +888,6 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
     spin_lock(&write_buffer_lock);
     list_add_tail(&wb_entry->list, &write_buffer);
     spin_unlock(&write_buffer_lock);
-
-    // Delete the old record
-    ret = delete_record(key);
-    if (ret != 0) {
-        kfree(new_record->value);
-        kmem_cache_free(record_cache, new_record);
-        hpkv_log(HPKV_LOG_ERR, "Failed to delete old record\n");
-        return ret;
-    }
-    atomic_inc(&record_count); // Increment record count because deleting old record decreases it
     
     wake_up(&write_buffer_wait);
 
