@@ -94,6 +94,8 @@ if (cluster.isMaster) {
                     const result = ioctl(fd.fd, cmd, buffer);
                     clearTimeout(timer);
                     await fd.close();
+                    // Log buffer content for debugging
+                    console.log('Buffer content:', buffer.toString('hex'));
                     resolve(buffer);
                 } catch (ioctlError) {
                     clearTimeout(timer);
