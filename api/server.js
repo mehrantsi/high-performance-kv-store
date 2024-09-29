@@ -96,6 +96,8 @@ if (cluster.isMaster) {
                     await fd.close();
                     // Log buffer content for debugging
                     console.log('Buffer content:', buffer.toString('hex'));
+                    console.log('Value length:', buffer.readBigUInt64LE(MAX_KEY_SIZE));
+                    console.log('Value:', buffer.toString('utf8', MAX_KEY_SIZE + 8, MAX_KEY_SIZE + 8 + Number(buffer.readBigUInt64LE(MAX_KEY_SIZE))));
                     resolve(buffer);
                 } catch (ioctlError) {
                     clearTimeout(timer);
