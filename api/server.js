@@ -18,6 +18,9 @@ const HPKV_IOCTL_DELETE = 1;
 const HPKV_IOCTL_PARTIAL_UPDATE = 2;
 const HPKV_IOCTL_PURGE = 3;
 
+const MAX_KEY_SIZE = 256;
+const MAX_VALUE_SIZE = 1000;
+
 if (cluster.isMaster) {
     console.log(`Master ${process.pid} is running`);
 
@@ -115,8 +118,8 @@ if (cluster.isMaster) {
 
     // Insert/Update Record
     app.post('/record', [
-        body('key').isString().isLength({ min: 1, max: 252 }).trim().escape(),
-        body('value').isString().isLength({ min: 1, max: 1000 }).trim().escape(),
+        body('key').isString().isLength({ min: 1, max: MAX_KEY_SIZE - 4 }).trim().escape(),
+        body('value').isString().isLength({ min: 1, max: MAX_VALUE_SIZE }).trim().escape(),
         body('partialUpdate').optional().isBoolean()
     ], async (req, res) => {
         const errors = validationResult(req);
@@ -142,7 +145,7 @@ if (cluster.isMaster) {
 
     // Get Record
     app.get('/record/:key', [
-        param('key').isString().isLength({ min: 1, max: 252 }).trim().escape() // Adjusted length for tenant ID
+        param('key').isString().isLength({ min: 1, max: MAX_KEY_SIZE - 4 }).trim().escape()
     ], async (req, res) => {
         const errors = validationResult(req);
         if (!errors.isEmpty()) {
@@ -154,7 +157,8 @@ if (cluster.isMaster) {
 
         try {
             const value = await hpkvIoctl(HPKV_IOCTL_GET, tenantKey);
-            res.status(200).json({ key, value });
+            // Remove the tenant ID (first 4 characters) from the key in the response
+            res.status(200).json({ key: key, value });
         } catch (error) {
             if (error.message.includes('ENOENT')) {
                 res.status(404).json({ error: 'Record not found' });
@@ -167,7 +171,7 @@ if (cluster.isMaster) {
 
     // Delete Record
     app.delete('/record/:key', [
-        param('key').isString().isLength({ min: 1, max: 252 }).trim().escape() // Adjusted length for tenant ID
+        param('key').isString().isLength({ min: 1, max: MAX_KEY_SIZE - 4 }).trim().escape()
     ], async (req, res) => {
         const errors = validationResult(req);
         if (!errors.isEmpty()) {
