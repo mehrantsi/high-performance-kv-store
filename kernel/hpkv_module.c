@@ -51,7 +51,7 @@
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Mehran Toosi");
 MODULE_DESCRIPTION("High performance KV store kernel module, with advanced features");
-MODULE_VERSION("1.1");
+MODULE_VERSION("1.2");
 
 // Function prototypes
 static u32 djb2_hash(const char *str, size_t len);
