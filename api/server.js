@@ -100,7 +100,7 @@ if (cluster.isMaster) {
                         if (cmd === HPKV_IOCTL_GET) {
                             const valueLength = buffer.readUInt32LE(MAX_KEY_SIZE);
                             const rawValue = Buffer.from(buffer.buffer, buffer.byteOffset + MAX_KEY_SIZE + 4, valueLength);
-                            const value = rawValue.toString().trim();
+                            const value = rawValue.toString('utf8').replace(/\0/g, '');
                             resolve(value);
                         } else {
                             resolve(result);
@@ -159,8 +159,9 @@ if (cluster.isMaster) {
 
         try {
             const value = await hpkvIoctl(HPKV_IOCTL_GET, tenantKey);
-            // Remove the tenant ID (first 4 characters) from the key in the response
-            res.status(200).json({ key: key, value: value.trim() });  // Add .trim() here
+            const valueLength = value.readUInt32LE(0);
+            const actualValue = value.slice(4, 4 + valueLength).toString('utf8');
+            res.status(200).json({ key: key, value: actualValue.trim() });  // Add .trim() here
         } catch (error) {
             if (error.message.includes('ENOENT')) {
                 res.status(404).json({ error: 'Record not found' });
