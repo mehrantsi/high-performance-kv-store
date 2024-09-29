@@ -815,6 +815,7 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
             hpkv_log(HPKV_LOG_ERR, "Failed to delete old record\n");
             return ret;
         }
+        atomic_inc(&record_count); // Increment record count because deleting old record decreases it
     } else {
         hpkv_log(HPKV_LOG_INFO, "Inserting new record for key: %s\n", key);
         // Set refcount to 1 for the new record
