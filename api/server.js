@@ -126,10 +126,8 @@ if (cluster.isMaster) {
         try {
             if (partialUpdate) {
                 console.log(`Performing partial update for key: ${key}`);
-                const buffer = Buffer.alloc(MAX_KEY_SIZE + MAX_VALUE_SIZE);
-                buffer.write(tenantKey, 0, MAX_KEY_SIZE);
-                buffer.write(value, MAX_KEY_SIZE);
-                await hpkvIoctl(HPKV_IOCTL_PARTIAL_UPDATE, buffer);
+                const partialUpdateString = `${tenantKey}:+${value}`;
+                await fs.writeFile('/dev/hpkv', partialUpdateString);
             } else {
                 console.log(`Performing full update for key: ${key}`);
                 await fs.writeFile('/dev/hpkv', `${tenantKey}:${value}`);
