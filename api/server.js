@@ -8,6 +8,7 @@ const rateLimit = require('express-rate-limit');
 const config = require('./config.json'); // Load configuration file
 const cluster = require('cluster');
 const os = require('os');
+const fsSync = require('fs');
 
 const numCPUs = os.cpus().length;
 const PORT = process.env.PORT || 3000;
@@ -71,7 +72,7 @@ if (cluster.isMaster) {
                     switch (cmd) {
                         case HPKV_IOCTL_GET:
                         case HPKV_IOCTL_DELETE:
-                            buffer = Buffer.alloc(MAX_KEY_SIZE + sizeof(size_t) + MAX_VALUE_SIZE);
+                            buffer = Buffer.alloc(MAX_KEY_SIZE + 4 + MAX_VALUE_SIZE); // 4 bytes for size_t
                             buffer.write(key);
                             break;
                         case HPKV_IOCTL_PARTIAL_UPDATE:
@@ -198,7 +199,7 @@ if (cluster.isMaster) {
     // Get Statistics
     app.get('/stats', (req, res) => {
         try {
-            const stats = fs.readFileSync('/proc/hpkv_stats', 'utf8');
+            const stats = fsSync.readFileSync('/proc/hpkv_stats', 'utf8');
             const parsedStats = {};
             stats.split('\n').forEach(line => {
                 const [key, value] = line.split(':');
