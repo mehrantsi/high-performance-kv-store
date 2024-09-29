@@ -811,6 +811,7 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
         // Remove old record from in-memory structures
         hash_del_rcu(&old_record->hash_node);
         rb_erase(&old_record->tree_node, &records_tree);
+        atomic_set(&old_record->refcount, 0);
         smp_wmb();
         atomic_long_sub(old_record->value_len, &total_disk_usage);
     } else {
@@ -850,6 +851,7 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
             // Restore old record
             hash_add_rcu(kv_store, &old_record->hash_node, hash);
             insert_rb_tree(old_record);
+            atomic_set(&old_record->refcount, 1);
             smp_wmb();
             atomic_long_add(old_record->value_len, &total_disk_usage);
         } else {
