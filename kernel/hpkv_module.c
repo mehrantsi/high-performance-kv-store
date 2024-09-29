@@ -940,11 +940,7 @@ static int delete_record(const char *key)
     }
     spin_unlock(&cache_lock);
 
-    // Release the sectors used by this record
-    release_sectors(record->sector, record->value_len);
-
-    // Register RCU callback to free the record
-    call_rcu(&record->rcu, record_free_rcu);
+    // Release sectors in write_record_work
 
     hpkv_log(HPKV_LOG_INFO, "Successfully queued delete operation for key: %s\n", key);
     return ret;
@@ -1312,8 +1308,8 @@ static void write_record_work(struct work_struct *work)
     switch (entry->op) {
         case OP_INSERT:
         case OP_UPDATE:
-            // Ensure the record hasn't been freed
-            if (atomic_read(&entry->record->refcount) > 0) {
+            // Ensure the record hasn't been freed and has a valid sector
+            if (atomic_read(&entry->record->refcount) > 0 && entry->record->sector != 0) {
                 write_record_to_disk(entry->record);
                 // After writing, decrement the refcount
                 if (atomic_dec_and_test(&entry->record->refcount)) {
@@ -1321,12 +1317,16 @@ static void write_record_work(struct work_struct *work)
                     call_rcu(&entry->record->rcu, record_free_rcu);
                 }
             } else {
-                hpkv_log(HPKV_LOG_WARNING, "Skipping write for record with zero refcount: %s\n", entry->record->key);
+                hpkv_log(HPKV_LOG_WARNING, "Skipping write for record: %s (refcount: %d, sector: %llu)\n", 
+                         entry->record->key, atomic_read(&entry->record->refcount), 
+                         (unsigned long long)entry->record->sector);
             }
             break;
         case OP_DELETE:
             if (entry->record->sector != 0) {
                 mark_sector_as_deleted(entry->record->sector);
+                // Release the sectors used by this record
+                release_sectors(entry->record->sector, entry->old_value_len);
             }
             // For delete operations, always decrement refcount and potentially free
             if (atomic_dec_and_test(&entry->record->refcount)) {
