@@ -2029,19 +2029,22 @@ static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                     return -EINVAL;
                 }
                 
-                if (copy_to_user((char __user *)(arg + MAX_KEY_SIZE), value, value_len)) {
-                    hpkv_log(HPKV_LOG_ERR, "Failed to copy value to user space\n");
-                    kfree(value);
-                    return -EFAULT;
-                }
                 // Copy the value length to the first 4 bytes after the key
-                if (copy_to_user((char __user *)(arg + MAX_KEY_SIZE - sizeof(size_t)), &value_len, sizeof(size_t))) {
+                if (copy_to_user((char __user *)(arg + MAX_KEY_SIZE), &value_len, sizeof(size_t))) {
                     hpkv_log(HPKV_LOG_ERR, "Failed to copy value length to user space\n");
                     kfree(value);
                     return -EFAULT;
                 }
+                
+                // Copy the actual value after the value length
+                if (copy_to_user((char __user *)(arg + MAX_KEY_SIZE + sizeof(size_t)), value, value_len)) {
+                    hpkv_log(HPKV_LOG_ERR, "Failed to copy value to user space\n");
+                    kfree(value);
+                    return -EFAULT;
+                }
+                
                 kfree(value);
-                return 0;  // Return success instead of value_len
+                return 0;  // Return success
             } else if (ret == -ENOENT) {
                 hpkv_log(HPKV_LOG_DEBUG, "Key not found: %s\n", key);
                 return -ENOENT;

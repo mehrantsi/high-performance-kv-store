@@ -71,7 +71,7 @@ if (cluster.isMaster) {
                     switch (cmd) {
                         case HPKV_IOCTL_GET:
                         case HPKV_IOCTL_DELETE:
-                            buffer = Buffer.alloc(MAX_KEY_SIZE);
+                            buffer = Buffer.alloc(MAX_KEY_SIZE + sizeof(size_t) + MAX_VALUE_SIZE);
                             buffer.write(key);
                             break;
                         case HPKV_IOCTL_PARTIAL_UPDATE:
@@ -94,16 +94,11 @@ if (cluster.isMaster) {
                         clearTimeout(timer);
                         fd.close().then(() => {
                             if (cmd === HPKV_IOCTL_GET) {
-                                if (Buffer.isBuffer(result)) {
-                                    // Read the value length from the first 4 bytes after the key
-                                    const valueLength = buffer.readUInt32LE(MAX_KEY_SIZE - 4);
-                                    // Extract the value from the buffer
-                                    const value = buffer.toString('utf8', MAX_KEY_SIZE, MAX_KEY_SIZE + valueLength);
-                                    resolve(value);
-                                } else {
-                                    console.error('Unexpected result type:', typeof result);
-                                    reject(new Error(`Unexpected result type: ${typeof result}`));
-                                }
+                                // Read the value length from the first 4 bytes after the key
+                                const valueLength = buffer.readUInt32LE(MAX_KEY_SIZE);
+                                // Extract the value from the buffer
+                                const value = buffer.toString('utf8', MAX_KEY_SIZE + 4, MAX_KEY_SIZE + 4 + valueLength);
+                                resolve(value);
                             } else {
                                 resolve(result);
                             }
