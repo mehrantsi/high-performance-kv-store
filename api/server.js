@@ -94,10 +94,6 @@ if (cluster.isMaster) {
                     const result = ioctl(fd.fd, cmd, buffer);
                     clearTimeout(timer);
                     await fd.close();
-                    // Log buffer content for debugging
-                    console.log('Buffer content:', buffer.toString('hex'));
-                    console.log('Value length:', buffer.readBigUInt64LE(MAX_KEY_SIZE));
-                    console.log('Value:', buffer.toString('utf8', MAX_KEY_SIZE + 8, MAX_KEY_SIZE + 8 + Number(buffer.readBigUInt64LE(MAX_KEY_SIZE))));
                     resolve(buffer);
                 } catch (ioctlError) {
                     clearTimeout(timer);
@@ -130,7 +126,10 @@ if (cluster.isMaster) {
         try {
             if (partialUpdate) {
                 console.log(`Performing partial update for key: ${key}`);
-                await hpkvIoctl(HPKV_IOCTL_PARTIAL_UPDATE, tenantKey, value);
+                const buffer = Buffer.alloc(MAX_KEY_SIZE + MAX_VALUE_SIZE);
+                buffer.write(tenantKey, 0, MAX_KEY_SIZE);
+                buffer.write(value, MAX_KEY_SIZE);
+                await hpkvIoctl(HPKV_IOCTL_PARTIAL_UPDATE, buffer);
             } else {
                 console.log(`Performing full update for key: ${key}`);
                 await fs.writeFile('/dev/hpkv', `${tenantKey}:${value}`);
