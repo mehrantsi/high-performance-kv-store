@@ -782,9 +782,10 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
         }
 
         // Delete the old record
+        percpu_up_write(&rw_sem);
         ret = delete_record(key);
+        percpu_down_write(&rw_sem);
         if (ret != 0) {
-            percpu_up_write(&rw_sem);
             kfree(new_record->value);
             kmem_cache_free(record_cache, new_record);
             hpkv_log(HPKV_LOG_ERR, "Failed to delete old record\n");
