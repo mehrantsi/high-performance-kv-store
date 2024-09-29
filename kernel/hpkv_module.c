@@ -736,6 +736,9 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
     strncpy(new_record->key, key, MAX_KEY_SIZE - 1);
     new_record->key[MAX_KEY_SIZE - 1] = '\0';
 
+    // Initialize refcount for new record
+    atomic_set(&new_record->refcount, 1);
+
     // Update in-memory data structures
     percpu_down_write(&rw_sem);
 
@@ -743,8 +746,8 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
     if (old_record) {
         hpkv_log(HPKV_LOG_INFO, "Updating existing record for key: %s\n", key);
         
-        // Instead of freeing the old record immediately, we'll let the write buffer handle it
-        atomic_inc(&old_record->refcount);  // Increase refcount to prevent premature freeing
+        // Increment refcount of old_record before removing from in-memory structures
+        atomic_inc(&old_record->refcount);
 
         if (is_partial_update) {
             // Perform partial update
@@ -789,7 +792,7 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
         rb_erase(&old_record->tree_node, &records_tree);
         atomic_long_sub(old_record->value_len, &total_disk_usage);
 
-        // The old record will be freed when its refcount reaches zero
+        // The old record will be freed when its refcount reaches zero in write_record_work
     } else {
         hpkv_log(HPKV_LOG_INFO, "Inserting new record for key: %s\n", key);
         // New insert
@@ -805,9 +808,6 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
         new_record->value_len = value_len;
         atomic_inc(&record_count);
     }
-
-    // Initialize refcount for new record
-    atomic_set(&new_record->refcount, 1);
 
     // Insert new record
     if (new_record) {
@@ -1308,18 +1308,13 @@ static void write_record_work(struct work_struct *work)
     switch (entry->op) {
         case OP_INSERT:
         case OP_UPDATE:
-            // Ensure the record hasn't been freed and has a valid sector
-            if (atomic_read(&entry->record->refcount) > 0 && entry->record->sector != 0) {
-                write_record_to_disk(entry->record);
-                // After writing, decrement the refcount
-                if (atomic_dec_and_test(&entry->record->refcount)) {
-                    // If this was the last reference, schedule it for freeing
-                    call_rcu(&entry->record->rcu, record_free_rcu);
-                }
+            if (atomic_dec_and_test(&entry->record->refcount)) {
+                // If this was the last reference, schedule it for freeing
+                call_rcu(&entry->record->rcu, record_free_rcu);
+                hpkv_log(HPKV_LOG_INFO, "Record %s scheduled for freeing without disk write\n", entry->record->key);
             } else {
-                hpkv_log(HPKV_LOG_WARNING, "Skipping write for record: %s (refcount: %d, sector: %llu)\n", 
-                         entry->record->key, atomic_read(&entry->record->refcount), 
-                         (unsigned long long)entry->record->sector);
+                // Still has references, write to disk
+                write_record_to_disk(entry->record);
             }
             break;
         case OP_DELETE:
