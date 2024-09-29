@@ -94,8 +94,10 @@ if (cluster.isMaster) {
                         clearTimeout(timer);
                         fd.close().then(() => {
                             if (cmd === HPKV_IOCTL_GET) {
-                                // For GET, we need to trim the result to the actual value length
-                                resolve(result.toString('utf8', 0, result.length));
+                                // Find the actual length of the value (up to the first null byte or end of buffer)
+                                const valueLength = result.indexOf(0) !== -1 ? result.indexOf(0) : result.length;
+                                // Convert only the valid part of the buffer to a string
+                                resolve(result.toString('utf8', 0, valueLength));
                             } else {
                                 resolve(result);
                             }
@@ -164,6 +166,8 @@ if (cluster.isMaster) {
                 res.status(404).json({ error: 'Record not found' });
             } else {
                 console.error('Error in GET /record/:key:', error);
+                console.error('Tenant Key:', tenantKey);
+                console.error('Error Stack:', error.stack);
                 res.status(500).json({ error: 'Failed to retrieve record' });
             }
         }
