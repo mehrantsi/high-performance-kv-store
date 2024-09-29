@@ -6,6 +6,7 @@
 #include <sys/ioctl.h>
 #include <time.h>
 #include <math.h>
+#include <errno.h>
 
 #define DEVICE_FILE "/dev/hpkv"
 #define MAX_KEY_SIZE 256
@@ -78,18 +79,29 @@ void insert_record(int fd, const char* key, const char* value, Latencies* write_
 }
 
 void retrieve_record(int fd, const char* key, Latencies* read_latencies) {
-    char value[MAX_VALUE_SIZE];
-    strncpy(value, key, MAX_KEY_SIZE);
+    char buffer[MAX_KEY_SIZE + sizeof(size_t) + MAX_VALUE_SIZE];
+    size_t value_len;
+    
+    // Copy the key to the buffer
+    strncpy(buffer, key, MAX_KEY_SIZE);
     
     struct timespec start, end;
     clock_gettime(CLOCK_MONOTONIC, &start);
     
-    if (ioctl(fd, IOCTL_GET, value) == 0) {
+    if (ioctl(fd, IOCTL_GET, buffer) == 0) {
         clock_gettime(CLOCK_MONOTONIC, &end);
+        
+        // Extract the value length
+        memcpy(&value_len, buffer + MAX_KEY_SIZE, sizeof(size_t));
+        
         double latency = (end.tv_sec - start.tv_sec) * 1000.0 + (end.tv_nsec - start.tv_nsec) / NANO_TO_MILLI;
         read_latencies->data[read_latencies->size++] = latency;
     } else {
-        perror("Failed to retrieve record");
+        if (errno == ENOENT) {
+            printf("Record not found for key: %s\n", key);
+        } else {
+            perror("Failed to retrieve record");
+        }
     }
 }
 
@@ -158,6 +170,9 @@ int main() {
     
     for (int i = 0; i < num_samples; i++) {
         run_test(fd, sample_sizes[i]);
+        
+        // Add a small delay between tests
+        usleep(100000);  // 100ms delay
     }
     
     purge_data(fd);

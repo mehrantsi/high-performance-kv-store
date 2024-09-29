@@ -27,12 +27,27 @@ void insert_record(int fd, const char *key, const char *value) {
 }
 
 void retrieve_record(int fd, const char *key) {
-    char value[MAX_VALUE_SIZE];
-    strncpy(value, key, MAX_KEY_SIZE);
-    if (ioctl(fd, IOCTL_GET, value) == 0) {
-        printf("Retrieved record - Key: %s, Value: %s\n", key, value);
+    char buffer[MAX_KEY_SIZE + sizeof(size_t) + MAX_VALUE_SIZE];
+    size_t value_len;
+    
+    // Copy the key to the buffer
+    strncpy(buffer, key, MAX_KEY_SIZE);
+    
+    if (ioctl(fd, IOCTL_GET, buffer) == 0) {
+        // Extract the value length
+        memcpy(&value_len, buffer + MAX_KEY_SIZE, sizeof(size_t));
+        
+        // Null-terminate the value
+        buffer[MAX_KEY_SIZE + sizeof(size_t) + value_len] = '\0';
+        
+        printf("Retrieved record - Key: %s, Value: %s, Length: %zu\n", 
+               key, buffer + MAX_KEY_SIZE + sizeof(size_t), value_len);
     } else {
-        printf("Failed to retrieve record for key: %s\n", key);
+        if (errno == ENOENT) {
+            printf("Record not found for key: %s\n", key);
+        } else {
+            perror("Failed to retrieve record");
+        }
     }
 }
 

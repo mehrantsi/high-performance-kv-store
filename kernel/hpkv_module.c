@@ -51,7 +51,7 @@
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Mehran Toosi");
 MODULE_DESCRIPTION("High performance KV store kernel module, with advanced features");
-MODULE_VERSION("1.1");
+MODULE_VERSION("1.2");
 
 // Function prototypes
 static u32 djb2_hash(const char *str, size_t len);
@@ -92,7 +92,6 @@ static void write_record_work(struct work_struct *work);
 static void metadata_update_work_func(struct work_struct *work);
 static void release_sectors(sector_t start_sector, size_t size);
 static bool flush_workqueue_timeout(struct workqueue_struct *wq, unsigned long timeout);
-static void force_free_records(void);
 
 static int major_num;
 static struct kmem_cache *record_cache;
@@ -391,15 +390,38 @@ static int load_record_from_disk(sector_t sector, char **value, size_t *value_le
 
 static void record_free_rcu(struct rcu_head *head)
 {
-    struct record *record = container_of(head, struct record, rcu);
-    if (record) {
-        if (record->value) {
-            kfree(record->value);
-            record->value = NULL;
-        }
-        kmem_cache_free(record_cache, record);
+    struct record *record;
+    char *value_to_free = NULL;
+
+    if (!head) {
+        hpkv_log(HPKV_LOG_ERR, "Null RCU head passed to record_free_rcu\n");
+        return;
     }
-    hpkv_log(HPKV_LOG_INFO, "RCU callback executed for record\n");
+
+    record = container_of(head, struct record, rcu);
+    if (!record) {
+        hpkv_log(HPKV_LOG_ERR, "Failed to obtain record from RCU head in record_free_rcu\n");
+        return;
+    }
+
+    rcu_read_lock();
+    if (record->value) {
+        value_to_free = rcu_dereference(record->value);
+        rcu_assign_pointer(record->value, NULL);
+    }
+    rcu_read_unlock();
+
+    // Free the value outside the RCU read-side critical section
+    if (value_to_free) {
+        kfree(value_to_free);
+    }
+
+    // Use a memory barrier before freeing the record
+    smp_wmb();
+
+    // Free the record
+    kmem_cache_free(record_cache, record);
+    hpkv_log(HPKV_LOG_DEBUG, "Record freed in RCU callback\n");
 }
 
 static struct record *record_find_rcu(const char *key)
@@ -469,10 +491,13 @@ static int search_record(const char *key, char **value, size_t *value_len)
                 // Update cache
                 cache_put(key, *value, *value_len, record->sector);
                 hpkv_log(HPKV_LOG_DEBUG, "Found key %s on disk and updated cache\n", key);
+            } else {
+                hpkv_log(HPKV_LOG_ERR, "Failed to load record from disk for key %s\n", key);
             }
         }
     }
     else {
+        hpkv_log(HPKV_LOG_DEBUG, "Key %s not found in memory or cache\n", key);
         ret = -ENOENT;
     }
     rcu_read_unlock();
@@ -706,7 +731,7 @@ static int update_metadata_size(loff_t new_size)
 static int insert_or_update_record(const char *key, const char *value, size_t value_len, bool is_partial_update)
 {
     struct record *new_record, *old_record;
-    struct write_buffer_entry *wb_entry;
+    struct write_buffer_entry *wb_entry, *wb_delete_entry;
     int ret = 0;
     u32 hash;
 
@@ -723,7 +748,7 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
     hash = djb2_hash(key, strlen(key));
 
     // Allocate memory for new_record using GFP_KERNEL flag
-    new_record = kmem_cache_alloc(record_cache, GFP_KERNEL);
+    new_record = kmem_cache_zalloc(record_cache, GFP_KERNEL);
     if (!new_record) {
         hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for new record\n");
         return -ENOMEM;
@@ -739,6 +764,11 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
 
     old_record = record_find_rcu(key);
     if (old_record) {
+        hpkv_log(HPKV_LOG_INFO, "Updating existing record for key: %s\n", key);
+        
+        // Set refcount to 1 for the new record
+        atomic_set(&new_record->refcount, 1);
+        
         if (is_partial_update) {
             // Perform partial update
             size_t new_len = old_record->value_len + value_len;
@@ -774,19 +804,16 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
             new_record->value_len = value_len;
         }
 
-        // Remove old record
+        // Remove old record from in-memory structures
         hash_del_rcu(&old_record->hash_node);
         rb_erase(&old_record->tree_node, &records_tree);
+        atomic_set(&old_record->refcount, 0);
+        smp_wmb();
         atomic_long_sub(old_record->value_len, &total_disk_usage);
-        if (atomic_dec_and_test(&old_record->refcount)) {
-            kfree(old_record->value);
-            kmem_cache_free(record_cache, old_record);
-        }
-
-        // Release the sectors used by the old record
-        release_sectors(old_record->sector, old_record->value_len);
     } else {
-        // New insert
+        hpkv_log(HPKV_LOG_INFO, "Inserting new record for key: %s\n", key);
+        // Set refcount to 1 for the new record
+        atomic_set(&new_record->refcount, 1);
         new_record->value = kmalloc(value_len + 1, GFP_KERNEL);
         if (!new_record->value) {
             percpu_up_write(&rw_sem);
@@ -800,40 +827,15 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
         atomic_inc(&record_count);
     }
 
-    // Initialize refcount for new record
-    atomic_set(&new_record->refcount, 1);
-
     // Insert new record
-    if (new_record) {
-        hash_add_rcu(kv_store, &new_record->hash_node, hash);
-        insert_rb_tree(new_record);
-        smp_wmb();  // Ensure all previous writes are visible before updating counters
-        atomic_long_add(new_record->value_len, &total_disk_usage);
-    } else {
-        hpkv_log(HPKV_LOG_ERR, "Attempted to insert a null record. Key: %s\n", key);
-        percpu_up_write(&rw_sem);
-        return -EINVAL;
-    }
+    hash_add_rcu(kv_store, &new_record->hash_node, hash);
+    insert_rb_tree(new_record);
+    smp_wmb();  // Ensure all previous writes are visible before updating counters
+    atomic_long_add(new_record->value_len, &total_disk_usage);
 
     percpu_up_write(&rw_sem);
 
-    if (!new_record->value || new_record->value_len == 0) {
-        hpkv_log(HPKV_LOG_ERR, "Attempted to insert/update record with null or zero-length value. Key: %s\n", key);
-        percpu_down_write(&rw_sem);
-        hash_del_rcu(&new_record->hash_node);
-        rb_erase(&new_record->tree_node, &records_tree);
-        atomic_long_sub(new_record->value_len, &total_disk_usage);
-        if (!old_record) {
-            atomic_dec(&record_count);
-        }
-        percpu_up_write(&rw_sem);
-
-        kfree(new_record->value);
-        kmem_cache_free(record_cache, new_record);
-        return -EINVAL;
-    }
-
-    // Add to write buffer
+    // Add new record to write buffer
     wb_entry = kmalloc(sizeof(*wb_entry), GFP_KERNEL);
     if (!wb_entry) {
         // Rollback changes if we can't add to write buffer
@@ -841,7 +843,14 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
         hash_del_rcu(&new_record->hash_node);
         rb_erase(&new_record->tree_node, &records_tree);
         atomic_long_sub(new_record->value_len, &total_disk_usage);
-        if (!old_record) {
+        if (old_record) {
+            // Restore old record
+            hash_add_rcu(kv_store, &old_record->hash_node, hash);
+            insert_rb_tree(old_record);
+            atomic_set(&old_record->refcount, 1);
+            smp_wmb();
+            atomic_long_add(old_record->value_len, &total_disk_usage);
+        } else {
             atomic_dec(&record_count);
         }
         percpu_up_write(&rw_sem);
@@ -859,8 +868,23 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
 
     spin_lock(&write_buffer_lock);
     list_add_tail(&wb_entry->list, &write_buffer);
-    spin_unlock(&write_buffer_lock);
 
+    // If there was an old record, add a separate delete entry to the write buffer
+    if (old_record) {
+        wb_delete_entry = kmalloc(sizeof(*wb_delete_entry), GFP_KERNEL);
+        if (wb_delete_entry) {
+            wb_delete_entry->op = OP_DELETE;
+            wb_delete_entry->record = old_record;
+            wb_delete_entry->old_value_len = old_record->value_len;
+            INIT_WORK(&wb_delete_entry->work, write_record_work);
+            list_add_tail(&wb_delete_entry->list, &write_buffer);
+        } else {
+            hpkv_log(HPKV_LOG_WARNING, "Failed to allocate memory for delete write buffer entry\n");
+        }
+    }
+
+    spin_unlock(&write_buffer_lock);
+    
     wake_up(&write_buffer_wait);
 
     // Update cache with the new value
@@ -890,6 +914,9 @@ static int delete_record(const char *key)
     atomic_long_sub(record->value_len, &total_disk_usage);
     atomic_dec(&record_count);
 
+    // Set refcount to 0 to indicate deletion
+    atomic_set(&record->refcount, 0);
+
     percpu_up_write(&rw_sem);
 
     // Add delete operation to write buffer
@@ -901,6 +928,7 @@ static int delete_record(const char *key)
         insert_rb_tree(record);
         atomic_long_add(record->value_len, &total_disk_usage);
         atomic_inc(&record_count);
+        atomic_set(&record->refcount, 1);
         percpu_up_write(&rw_sem);
         return -ENOMEM;
     }
@@ -930,11 +958,7 @@ static int delete_record(const char *key)
     }
     spin_unlock(&cache_lock);
 
-    // Release the sectors used by this record
-    release_sectors(record->sector, record->value_len);
-
-    // Register RCU callback to free the record
-    call_rcu(&record->rcu, record_free_rcu);
+    // Release sectors and free the record in write_record_work
 
     hpkv_log(HPKV_LOG_INFO, "Successfully queued delete operation for key: %s\n", key);
     return ret;
@@ -1083,7 +1107,6 @@ static void write_record_to_disk(struct record *record)
     memcpy(bh->b_data, record->key, sizeof(record->key));
     memcpy(bh->b_data + sizeof(record->key), &record->value_len, sizeof(size_t));
     
-    // Add this check
     if (!record->value) {
         hpkv_log(HPKV_LOG_ERR, "Record value became null before writing to disk. Key: %s\n", record->key);
         unlock_buffer(bh);
@@ -1100,9 +1123,13 @@ static void write_record_to_disk(struct record *record)
         hpkv_log(HPKV_LOG_ERR, "Failed to sync buffer to disk. Key: %s\n", record->key);
     } else {
         // Successfully written to disk, now free the in-memory value
-        kfree(record->value);
-        record->value = NULL;
-        smp_wmb();  // Ensure the NULL is visible to other CPUs
+        if (record->value) {
+            kfree(record->value);
+            record->value = NULL;
+            smp_wmb();  // Ensure the NULL is visible to other CPUs
+        } else {
+            hpkv_log(HPKV_LOG_WARNING, "Record value unexpectedly NULL after successful write. Key: %s\n", record->key);
+        }
     }
 
     brelse(bh);
@@ -1279,8 +1306,8 @@ static void write_record_work(struct work_struct *work)
     struct write_buffer_entry *entry = container_of(work, struct write_buffer_entry, work);
     unsigned long timeout;
     
-    if (!entry || !entry->record) {
-        hpkv_log(HPKV_LOG_ERR, "Invalid entry or record in write_record_work\n");
+    if (!entry) {
+        hpkv_log(HPKV_LOG_ERR, "Invalid entry in write_record_work\n");
         return;
     }
 
@@ -1288,14 +1315,32 @@ static void write_record_work(struct work_struct *work)
 
     timeout = jiffies + msecs_to_jiffies(5000);  // 5 second timeout
 
+    if (!entry->record) {
+        hpkv_log(HPKV_LOG_ERR, "Invalid record in write_record_work\n");
+        atomic_set(&entry->work_status, 3);  // Mark as failed
+        complete(&entry->work_done);
+        return;
+    }
+
     switch (entry->op) {
         case OP_INSERT:
         case OP_UPDATE:
-            write_record_to_disk(entry->record);
+            if (atomic_read(&entry->record->refcount) > 0) {
+                // If refcount is greater than 0, write to disk
+                write_record_to_disk(entry->record);
+                hpkv_log(HPKV_LOG_INFO, "Wrote record to disk: %s\n", entry->record->key);
+            }
             break;
         case OP_DELETE:
-            mark_sector_as_deleted(entry->record->sector);
+            if (entry->record->sector != 0) {
+                mark_sector_as_deleted(entry->record->sector);
+                // Release the sectors used by this record
+                release_sectors(entry->record->sector, entry->old_value_len);
+                hpkv_log(HPKV_LOG_INFO, "Marked sector as deleted for key: %s\n", entry->record->key);
+            }
+            // Free the record
             call_rcu(&entry->record->rcu, record_free_rcu);
+            hpkv_log(HPKV_LOG_INFO, "Scheduled record for freeing: %s\n", entry->record->key);
             break;
     }
 
@@ -1973,7 +2018,7 @@ static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
     switch (cmd) {
         case 0:  // Get by exact key
-            if (!arg || !access_ok((void __user *)arg, MAX_KEY_SIZE)) {
+            if (!arg || !access_ok((void __user *)arg, MAX_KEY_SIZE + sizeof(size_t) + MAX_VALUE_SIZE)) {
                 hpkv_log(HPKV_LOG_ERR, "Invalid user space pointer\n");
                 return -EFAULT;
             }
@@ -2000,13 +2045,22 @@ static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                     return -EINVAL;
                 }
                 
-                if (copy_to_user((void __user *)arg, value, value_len)) {
+                // Copy the value length to the first 4 bytes after the key
+                if (copy_to_user((char __user *)(arg + MAX_KEY_SIZE), &value_len, sizeof(size_t))) {
+                    hpkv_log(HPKV_LOG_ERR, "Failed to copy value length to user space\n");
+                    kfree(value);
+                    return -EFAULT;
+                }
+                
+                // Copy the actual value after the value length
+                if (copy_to_user((char __user *)(arg + MAX_KEY_SIZE + sizeof(size_t)), value, value_len)) {
                     hpkv_log(HPKV_LOG_ERR, "Failed to copy value to user space\n");
                     kfree(value);
                     return -EFAULT;
                 }
+                
                 kfree(value);
-                return 0;
+                return 0;  // Return success
             } else if (ret == -ENOENT) {
                 hpkv_log(HPKV_LOG_DEBUG, "Key not found: %s\n", key);
                 return -ENOENT;
@@ -2016,26 +2070,47 @@ static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             }
         
         case 1:  // Delete by key
-            if (copy_from_user(key, (char __user *)arg, MAX_KEY_SIZE))
+            if (!arg || !access_ok((void __user *)arg, MAX_KEY_SIZE)) {
+                hpkv_log(HPKV_LOG_ERR, "Invalid user space pointer\n");
                 return -EFAULT;
+            }
+            
+            if (copy_from_user(key, (char __user *)arg, MAX_KEY_SIZE)) {
+                hpkv_log(HPKV_LOG_ERR, "Failed to copy key from user space\n");
+                return -EFAULT;
+            }
             
             key[MAX_KEY_SIZE - 1] = '\0';
             return delete_record(key);
 
         case 2:  // Partial update
-            if (copy_from_user(key, (char __user *)arg, MAX_KEY_SIZE))
+            if (!arg || !access_ok((void __user *)arg, MAX_KEY_SIZE + MAX_VALUE_SIZE)) {
+                hpkv_log(HPKV_LOG_ERR, "Invalid user space pointer\n");
                 return -EFAULT;
+            }
+            
+            if (copy_from_user(key, (char __user *)arg, MAX_KEY_SIZE)) {
+                hpkv_log(HPKV_LOG_ERR, "Failed to copy key from user space\n");
+                return -EFAULT;
+            }
             
             key[MAX_KEY_SIZE - 1] = '\0';
             value = kmalloc(MAX_VALUE_SIZE, GFP_KERNEL);
             if (!value)
                 return -ENOMEM;
+            
             if (copy_from_user(value, (char __user *)(arg + MAX_KEY_SIZE), MAX_VALUE_SIZE)) {
                 kfree(value);
                 return -EFAULT;
             }
             
+            hpkv_log(HPKV_LOG_INFO, "Received partial update ioctl command for key: %s\n", key);
             ret = insert_or_update_record(key, value, strlen(value), true);
+            if (ret == 0) {
+                hpkv_log(HPKV_LOG_INFO, "Partial update successful for key: %s\n", key);
+            } else {
+                hpkv_log(HPKV_LOG_ERR, "Partial update failed for key: %s, error: %d\n", key, ret);
+            }
             kfree(value);
             return ret;
 
@@ -2060,6 +2135,7 @@ static int hpkv_proc_show(struct seq_file *m, void *v)
 {
     seq_printf(m, "Total records: %d\n", atomic_read(&record_count));
     seq_printf(m, "Total disk usage: %ld bytes\n", atomic_long_read(&total_disk_usage));
+    seq_printf(m, "Device size: %lld bytes\n", i_size_read(bdev->bd_inode));
     return 0;
 }
 
@@ -2324,7 +2400,7 @@ static int __init hpkv_init(void)
     }
 
     INIT_DELAYED_WORK(&compact_work, compact_work_handler);
-    queue_delayed_work(compact_wq, &compact_work, COMPACT_INTERVAL);
+    //queue_delayed_work(compact_wq, &compact_work, COMPACT_INTERVAL);
 
     init_completion(&flush_completion);
 
@@ -2428,7 +2504,6 @@ static void __exit hpkv_exit(void)
     }
 
     // Ensure all RCU callbacks have completed
-    synchronize_rcu();
     rcu_barrier();
 
     // Clear cache
