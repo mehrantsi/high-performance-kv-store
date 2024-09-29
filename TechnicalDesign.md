@@ -46,6 +46,7 @@ The HPKV module consists of several key components that work together to provide
 5. **Metadata**: The metadata stored on disk that includes information about the total number of records, total size, device size, and version.
 6. **Workqueues**: Separate workqueues for flushing the write buffer and performing disk compaction.
 7. **Bitmap**: A bitmap to track allocated sectors on the disk.
+8. **Red-Black Tree**: An in-memory red-black tree for efficient key-based lookups.
 
 The following diagram provides a high-level overview of the HPKV module's architecture:
 
@@ -61,6 +62,7 @@ graph TD
     B --> H[Flush Workqueue]
     B --> I[Compact Workqueue]
     B --> J[Sector Bitmap]
+    B --> K[Red-Black Tree]
     C -->|Allocate/Free| B
     D -->|Buffer Writes| B
     E -->|Cache Access| B
@@ -69,18 +71,19 @@ graph TD
     H -->|Flush to Disk| D
     I -->|Optimize Disk| F
     J -->|Track Sectors| F
+    K -->|Efficient Lookup| B
 ```
 
 ## Data Structures
 
 ### Record Structure
-The `record` structure represents a key-value pair stored in memory and on disk. It includes fields for the key, value, value length, and various pointers for hash table and red-black tree management.
+The `record` structure represents a key-value pair stored in memory and on disk. It includes fields for the key, value, value length, and various pointers for hash table and red-black tree management. The `tree_node` field is particularly important for maintaining the red-black tree structure for efficient key-based lookups.
 
 **Structure Definition:**
 ```c
 struct record {
     char key[MAX_KEY_SIZE];
-    char *value;
+    char value;
     size_t value_len;
     struct hlist_node hash_node;
     struct rb_node tree_node;
@@ -173,7 +176,7 @@ Slab allocation is used for frequently allocated and deallocated objects, such a
 
 **Example:**
 ```c
-record_cache = kmem_cache_create("hpkv_record", sizeof(struct record), 0, SLAB_HWCACHE_ALIGN | SLAB_PANIC, NULL);
+record_cache = kmem_cache_create("hpkv_record", sizeof(struct record), 0, SLAB_HWCACHE_ALIGN | SLAB_PANIC | SLAB_ACCOUNT, NULL);
 ```
 
 #### kmalloc
@@ -409,9 +412,11 @@ This dynamic extension allows the HPKV store to grow as needed, up to a maximum 
 ## Code Flows
 
 ### Initialization
+
 The initialization flow involves registering the character device, creating the record cache, opening the block device, and loading indexes from disk.
 
 **Initialization Sequence Diagram:**
+
 ```mermaid
 sequenceDiagram
     participant User
@@ -440,79 +445,206 @@ sequenceDiagram
 ```
 
 ### Record Insertion/Update
-The record insertion/update flow involves finding or creating a record, updating in-memory structures, adding the record to the write buffer, and updating the cache.
 
-**Record Insertion/Update Flowchart:**
+The `insert_or_update_record` function handles both new insertions and updates (partial or full) to existing records.
+
+**Record Insertion/Update Sequence Diagram:**
+
 ```mermaid
-flowchart TD
-    A[Start] --> B[Check if Key Exists]
-    B -->|Yes| C[Update Existing Record]
-    B -->|No| D[Create New Record]
-    C --> E[Set Value in Memory]
-    D --> E
-    E --> F[Add to Write Buffer]
-    F --> G[Queue Write Work]
-    G --> H[End]
+sequenceDiagram
+    participant C as Client
+    participant HPKV as HPKV Module
+    participant M as Memory Structures
+    participant WB as Write Buffer
+    participant Cache
+
+    C->>HPKV: insert_or_update_record(key, value, is_partial)
+    HPKV->>M: Check if key exists
+    alt Key exists
+        M-->>HPKV: Record found
+        alt Is partial update
+            HPKV->>HPKV: Combine old and new values
+            HPKV->>HPKV: Check combined length
+        else Full update
+            HPKV->>HPKV: Replace old value
+        end
+    else Key doesn't exist
+        HPKV->>HPKV: Create new record
+    end
+    HPKV->>HPKV: Allocate memory for value
+    alt Memory allocation failed
+        HPKV-->>C: Return -ENOMEM
+    end
+    HPKV->>M: Remove old record (if update)
+    HPKV->>M: Insert new record
+    HPKV->>WB: Create write buffer entry
+    alt Write buffer entry creation failed
+        HPKV->>M: Rollback changes
+        HPKV-->>C: Return error
+    end
+    HPKV->>WB: Add new record entry
+    alt Is update
+        HPKV->>WB: Create and add delete entry for old record
+    end
+    HPKV->>WB: Wake up write buffer thread
+    HPKV->>Cache: Update cache
+    HPKV-->>C: Return success
 ```
+
 ### Record Retrieval
-The record retrieval process is optimized to balance performance and memory usage. It involves checking multiple layers of storage: cache, in-memory structures, and disk.
 
-This approach ensures fast access for frequently used data while maintaining memory efficiency for less frequently accessed records.
+The record retrieval process in HPKV is optimized for performance and memory efficiency. It involves a multi-tiered approach to find the requested key-value pair.
 
-**Record Retrieval Flowchart:**
+**Record Retrieval Sequence Diagram:**
+
 ```mermaid
-flowchart TD
-A[Start] --> B{Check Cache}
-B -->|Found| C[Return Cached Value]
-B -->|Not Found| D{Search In-Memory Structures}
-D -->|Found| E{Value in Memory?}
-E -->|Yes| F[Return In-Memory Value]
-E -->|No| G[Read from Disk]
-G --> H[Update Cache]
-H --> I[Return Value]
-D -->|Not Found| J[Return Not Found Error]
-C --> K[End]
-F --> K
-I --> K
-J --> K
+sequenceDiagram
+    participant C as Client
+    participant HPKV as HPKV Module
+    participant Cache
+    participant M as Memory Structures
+    participant D as Disk
+
+    C->>HPKV: search_record(key)
+    HPKV->>Cache: Check cache
+    alt Found in cache
+        Cache-->>HPKV: Return cached value
+        HPKV-->>C: Return value
+    else Not in cache
+        HPKV->>M: Search in-memory structures
+        alt Record found
+            M-->>HPKV: Record found
+            alt Value in memory
+                HPKV-->>C: Return in-memory value
+            else Value not in memory
+                HPKV->>D: Load from disk
+                D-->>HPKV: Value loaded
+                HPKV->>Cache: Update cache
+                HPKV-->>C: Return value
+            end
+        else Record not found
+            HPKV-->>C: Return -ENOENT
+        end
+    end
 ```
 
 ### Record Deletion
-The record deletion flow involves finding the record, removing it from in-memory structures, adding a delete operation to the write buffer, and removing the record from the cache.
 
-**Record Deletion Flowchart:**
+The `delete_record` function handles the removal of a record from the HPKV store. This process involves several steps to ensure data consistency across in-memory structures and persistent storage.
+
+**Record Deletion Sequence Diagram:**
+
 ```mermaid
-flowchart TD
-    A[Start] --> B[Find Record by Key]
-    B -->|Found| C[Remove from In-Memory Structures]
-    B -->|Not Found| D[Return Error]
-    C --> E[Add Delete Operation to Write Buffer]
-    E --> F[Queue Delete Work]
-    F --> G[Remove from Cache]
-    G --> H[End]
+sequenceDiagram
+    participant C as Client
+    participant HPKV as HPKV Module
+    participant M as Memory Structures
+    participant WB as Write Buffer
+    participant Cache
+
+    C->>HPKV: delete_record(key)
+    HPKV->>M: Find record by key
+    alt Record not found
+        HPKV-->>C: Return -ENOENT
+    else Record found
+        HPKV->>HPKV: Acquire write lock
+        HPKV->>M: Remove from hash table
+        HPKV->>M: Remove from red-black tree
+        HPKV->>HPKV: Update total disk usage
+        HPKV->>HPKV: Decrement record count
+        HPKV->>HPKV: Set refcount to 0
+        HPKV->>HPKV: Release write lock
+        HPKV->>WB: Create delete write buffer entry
+        alt Write buffer entry creation failed
+            HPKV->>M: Rollback changes
+            HPKV-->>C: Return error
+        end
+        HPKV->>WB: Add to write buffer
+        HPKV->>WB: Wake write buffer thread
+        HPKV->>Cache: Remove from cache
+        HPKV-->>C: Return success
+    end
 ```
 
 ### Write Buffer Flush
+
 The write buffer flush flow involves processing entries in the write buffer, writing records to disk, and updating metadata.
 
 **Write Buffer Flush Sequence Diagram:**
+
 ```mermaid
 sequenceDiagram
-    participant WriteBufferWorker
-    participant WriteBuffer
-    participant FlushWorkqueue
+    participant WBW as WriteBufferWorker
+    participant FWB as flush_write_buffer
+    participant WB as WriteBuffer
+    participant FWQ as FlushWorkqueue
+    participant WRW as write_record_work
     participant Disk
     participant Metadata
 
-    WriteBufferWorker->>WriteBuffer: Check Write Buffer Size
-    WriteBuffer-->>WriteBufferWorker: Write Buffer Entries
-    WriteBufferWorker->>FlushWorkqueue: Queue Flush Work
-    FlushWorkqueue->>Disk: Write Records to Disk
-    Disk-->>FlushWorkqueue: Write Complete
-    FlushWorkqueue->>Metadata: Update Metadata
-    Metadata-->>FlushWorkqueue: Metadata Updated
-    FlushWorkqueue->>WriteBuffer: Remove Flushed Entries
+    WBW->>FWB: Initiate flush
+    FWB->>FWB: Check if flush already running
+    alt Flush already running
+    FWB->>FWB: Wait for completion (with timeout)
+    else Flush not running
+    FWB->>FWB: Set flush_running flag
+    FWB->>FWB: Initialize completion
+    FWB->>WB: Move entries to local list
+    loop For each entry in local list
+    FWB->>FWQ: Queue work (write_record_work)
+    FWQ->>WRW: Execute write_record_work
+    alt Insert/Update operation
+    WRW->>WRW: Check record refcount
+    WRW->>Disk: Write record to disk
+    else Delete operation
+    WRW->>Disk: Mark sector as deleted
+    end
+
+    WRW->>WRW: Update work status
+    WRW->>WRW: Complete work
+    end
+
+    FWB->>FWB: Wait for all work items (with timeout)
+    FWB->>Metadata: Update metadata
+    FWB->>FWB: Clear flush_running flag
+    FWB->>FWB: Complete flush operation
+    end
+
+    FWB->>WBW: Flush complete
 ```
+
+Key aspects of the write buffer flush process:
+
+1. **Concurrency Control**:
+   - Uses atomic operations to ensure only one flush operation runs at a time.
+   - Implements a timeout mechanism for waiting on ongoing flushes.
+
+2. **Batch Processing**:
+   - Moves all entries from the write buffer to a local list for processing.
+
+3. **Work Queueing**:
+   - Each write buffer entry is processed as a separate work item (`write_record_work`).
+   - Work items are queued to the flush workqueue for parallel processing.
+
+4. **Record Processing** (`write_record_work`):
+   - Handles both insert/update and delete operations.
+   - For insert/update: Writes the record to disk if its refcount is greater than 0.
+   - For delete: Marks the sector as deleted on disk.
+   - Updates the work status and completes the work item.
+
+5. **Disk Operations**:
+   - Writes new/updated records to disk.
+   - Marks deleted records' sectors as deleted.
+
+6. **Metadata Update**:
+   - Updates the metadata on disk to reflect changes in record count and total size.
+
+7. **Error Handling**:
+   - Implements timeouts for individual work items and the overall flush operation.
+   - Handles potential errors during the flush operation.
+
+8. **Completion Notification**:
+   - Uses a completion mechanism to signal when the flush operation is finished.
 
 ### Disk Compaction
 The disk compaction flow involves flushing the write buffer, compacting records on disk, updating the sector bitmap, and updating metadata.
@@ -629,4 +761,3 @@ The HPKV module supports several configurable parameters that can be set when lo
 > The logging level determines which messages are logged. For example, setting `log_level` to 4 will log messages with level 4 and above (i.e., WARNING, NOTICE, INFO, and DEBUG). Setting it to 7 will also log function names and line numbers.
 
 These parameters allow for flexible configuration of the HPKV module's behavior during initialization and operation.
-
