@@ -125,6 +125,8 @@ if (cluster.isMaster) {
         const { key, value, partialUpdate } = req.body;
         const tenantKey = req.tenantId + key;
 
+        console.log(`Received request: key=${key}, value=${value}, partialUpdate=${partialUpdate}`);
+
         try {
             if (partialUpdate) {
                 console.log(`Performing partial update for key: ${key}`);
