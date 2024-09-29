@@ -736,9 +736,6 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
     strncpy(new_record->key, key, MAX_KEY_SIZE - 1);
     new_record->key[MAX_KEY_SIZE - 1] = '\0';
 
-    // Initialize refcount for new record
-    atomic_set(&new_record->refcount, 1);
-
     // Update in-memory data structures
     percpu_down_write(&rw_sem);
 
@@ -792,7 +789,10 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
         rb_erase(&old_record->tree_node, &records_tree);
         atomic_long_sub(old_record->value_len, &total_disk_usage);
 
-        // The old record will be freed when its refcount reaches zero in write_record_work
+        // Decrement refcount of old_record, potentially scheduling it for deletion
+        if (atomic_dec_and_test(&old_record->refcount)) {
+            call_rcu(&old_record->rcu, record_free_rcu);
+        }
     } else {
         hpkv_log(HPKV_LOG_INFO, "Inserting new record for key: %s\n", key);
         // New insert
@@ -1308,13 +1308,16 @@ static void write_record_work(struct work_struct *work)
     switch (entry->op) {
         case OP_INSERT:
         case OP_UPDATE:
-            if (atomic_dec_and_test(&entry->record->refcount)) {
-                // If this was the last reference, schedule it for freeing
-                call_rcu(&entry->record->rcu, record_free_rcu);
-                hpkv_log(HPKV_LOG_INFO, "Record %s scheduled for freeing without disk write\n", entry->record->key);
-            } else {
-                // Still has references, write to disk
+            if (atomic_read(&entry->record->refcount) > 1) {
+                // If refcount is greater than 1, it means there's a newer version or update pending
+                atomic_dec(&entry->record->refcount);
+                hpkv_log(HPKV_LOG_INFO, "Skipping write for outdated record: %s\n", entry->record->key);
+            } else if (atomic_cmpxchg(&entry->record->refcount, 1, 0) == 1) {
+                // If we successfully decremented from 1 to 0, write to disk
                 write_record_to_disk(entry->record);
+            } else {
+                // If refcount was already 0, it means this record was deleted
+                hpkv_log(HPKV_LOG_INFO, "Skipping write for deleted record: %s\n", entry->record->key);
             }
             break;
         case OP_DELETE:
