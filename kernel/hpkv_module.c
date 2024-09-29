@@ -781,11 +781,15 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
             new_record->value_len = value_len;
         }
 
-        // Remove old record from in-memory structures
-        hash_del_rcu(&old_record->hash_node);
-        rb_erase(&old_record->tree_node, &records_tree);
-        atomic_long_sub(old_record->value_len, &total_disk_usage);
-        atomic_set(&old_record->refcount, 0);
+        // Delete the old record
+        ret = delete_record(key);
+        if (ret != 0) {
+            percpu_up_write(&rw_sem);
+            kfree(new_record->value);
+            kmem_cache_free(record_cache, new_record);
+            hpkv_log(HPKV_LOG_ERR, "Failed to delete old record\n");
+            return ret;
+        }
     } else {
         hpkv_log(HPKV_LOG_INFO, "Inserting new record for key: %s\n", key);
         // Set refcount to 1 for the new record
@@ -804,16 +808,10 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
     }
 
     // Insert new record
-    if (new_record) {
-        hash_add_rcu(kv_store, &new_record->hash_node, hash);
-        insert_rb_tree(new_record);
-        smp_wmb();  // Ensure all previous writes are visible before updating counters
-        atomic_long_add(new_record->value_len, &total_disk_usage);
-    } else {
-        hpkv_log(HPKV_LOG_ERR, "Attempted to insert a null record. Key: %s\n", key);
-        percpu_up_write(&rw_sem);
-        return -EINVAL;
-    }
+    hash_add_rcu(kv_store, &new_record->hash_node, hash);
+    insert_rb_tree(new_record);
+    smp_wmb();  // Ensure all previous writes are visible before updating counters
+    atomic_long_add(new_record->value_len, &total_disk_usage);
 
     percpu_up_write(&rw_sem);
 
