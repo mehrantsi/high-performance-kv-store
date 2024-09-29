@@ -732,7 +732,7 @@ static int update_metadata_size(loff_t new_size)
 static int insert_or_update_record(const char *key, const char *value, size_t value_len, bool is_partial_update)
 {
     struct record *new_record, *old_record;
-    struct write_buffer_entry *wb_entry;
+    struct write_buffer_entry *wb_entry, *wb_delete_entry;
     int ret = 0;
     u32 hash;
 
@@ -808,18 +808,12 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
             new_record->value[value_len] = '\0';
             new_record->value_len = value_len;
         }
-        // Delete the old record
-        percpu_up_write(&rw_sem);
-        ret = delete_record(key);
-        percpu_down_write(&rw_sem);
-        if (ret != 0) {
-            kfree(new_record->value);
-            kmem_cache_free(record_cache, new_record);
-            hpkv_log(HPKV_LOG_ERR, "Failed to delete old record\n");
-            return ret;
-        }
-        atomic_inc(&record_count); // Increment record count because deleting old record decreases it
 
+        // Remove old record from in-memory structures
+        hash_del_rcu(&old_record->hash_node);
+        rb_erase(&old_record->tree_node, &records_tree);
+        smp_wmb();
+        atomic_long_sub(old_record->value_len, &total_disk_usage);
     } else {
         hpkv_log(HPKV_LOG_INFO, "Inserting new record for key: %s\n", key);
         // Set refcount to 1 for the new record
@@ -845,23 +839,7 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
 
     percpu_up_write(&rw_sem);
 
-    if (!new_record->value || new_record->value_len == 0) {
-        hpkv_log(HPKV_LOG_ERR, "Attempted to insert/update record with null or zero-length value. Key: %s\n", key);
-        percpu_down_write(&rw_sem);
-        hash_del_rcu(&new_record->hash_node);
-        rb_erase(&new_record->tree_node, &records_tree);
-        atomic_long_sub(new_record->value_len, &total_disk_usage);
-        if (!old_record) {
-            atomic_dec(&record_count);
-        }
-        percpu_up_write(&rw_sem);
-
-        kfree(new_record->value);
-        kmem_cache_free(record_cache, new_record);
-        return -EINVAL;
-    }
-
-    // Add to write buffer
+    // Add new record to write buffer
     wb_entry = kmalloc(sizeof(*wb_entry), GFP_KERNEL);
     if (!wb_entry) {
         // Rollback changes if we can't add to write buffer
@@ -869,7 +847,13 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
         hash_del_rcu(&new_record->hash_node);
         rb_erase(&new_record->tree_node, &records_tree);
         atomic_long_sub(new_record->value_len, &total_disk_usage);
-        if (!old_record) {
+        if (old_record) {
+            // Restore old record
+            hash_add_rcu(kv_store, &old_record->hash_node, hash);
+            insert_rb_tree(old_record);
+            smp_wmb();
+            atomic_long_add(old_record->value_len, &total_disk_usage);
+        } else {
             atomic_dec(&record_count);
         }
         percpu_up_write(&rw_sem);
@@ -887,6 +871,21 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
 
     spin_lock(&write_buffer_lock);
     list_add_tail(&wb_entry->list, &write_buffer);
+
+    // If there was an old record, add a separate delete entry to the write buffer
+    if (old_record) {
+        wb_delete_entry = kmalloc(sizeof(*wb_delete_entry), GFP_KERNEL);
+        if (wb_delete_entry) {
+            wb_delete_entry->op = OP_DELETE;
+            wb_delete_entry->record = old_record;
+            wb_delete_entry->old_value_len = old_record->value_len;
+            INIT_WORK(&wb_delete_entry->work, write_record_work);
+            list_add_tail(&wb_delete_entry->list, &write_buffer);
+        } else {
+            hpkv_log(HPKV_LOG_WARNING, "Failed to allocate memory for delete write buffer entry\n");
+        }
+    }
+
     spin_unlock(&write_buffer_lock);
     
     wake_up(&write_buffer_wait);
