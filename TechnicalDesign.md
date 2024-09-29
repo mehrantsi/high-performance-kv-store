@@ -176,7 +176,7 @@ Slab allocation is used for frequently allocated and deallocated objects, such a
 
 **Example:**
 ```c
-record_cache = kmem_cache_create("hpkv_record", sizeof(struct record), 0, SLAB_HWCACHE_ALIGN | SLAB_PANIC | SLAB_ACCOUNT, NULL);
+record_cache = kmem_cache_create("hpkv_record", sizeof(struct record), 0, SLAB_HWCACHE_ALIGN | SLAB_PANIC, NULL);
 ```
 
 #### kmalloc

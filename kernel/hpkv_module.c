@@ -2267,7 +2267,7 @@ static int __init hpkv_init(void)
         return major_num;
     }
 
-    record_cache = kmem_cache_create("hpkv_record", sizeof(struct record), 0, SLAB_HWCACHE_ALIGN | SLAB_PANIC | SLAB_ACCOUNT, NULL);
+    record_cache = kmem_cache_create("hpkv_record", sizeof(struct record), 0, SLAB_HWCACHE_ALIGN | SLAB_PANIC, NULL);
     if (!record_cache) {
         hpkv_log(HPKV_LOG_ALERT, "Failed to create record cache\n");
         ret = -ENOMEM;
