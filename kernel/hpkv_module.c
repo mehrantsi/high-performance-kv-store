@@ -405,7 +405,6 @@ static void record_free_rcu(struct rcu_head *head)
         return;
     }
 
-    // Use RCU read-side critical section to safely access record fields
     rcu_read_lock();
     if (record->value) {
         value_to_free = rcu_dereference(record->value);
@@ -1215,7 +1214,6 @@ static void flush_write_buffer(void)
                 case OP_DELETE:
                     records_changed--;
                     size_changed -= entry->old_value_len;
-                    call_rcu(&entry->record->rcu, record_free_rcu);
                     break;
             }
         }
