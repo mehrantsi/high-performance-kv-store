@@ -2526,6 +2526,7 @@ static void __exit hpkv_exit(void)
     msleep(500);
 
     if (record_cache) {
+        kmem_cache_shrink(record_cache);
         kmem_cache_destroy(record_cache);
         record_cache = NULL;
     }
