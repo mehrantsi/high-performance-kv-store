@@ -61,16 +61,16 @@ if (cluster.isMaster) {
 
     // Helper function to perform ioctl operations with timeout
     async function hpkvIoctl(cmd, key, value = '', timeout = 5000) {
-        let fd;
+        let fileHandle;
         return new Promise((resolve, reject) => {
             const timer = setTimeout(() => {
-                if (fd) fs.close(fd).catch(console.error);
+                if (fileHandle) fileHandle.close().catch(console.error);
                 reject(new Error('Operation timed out'));
             }, timeout);
 
             fs.open('/dev/hpkv', 'r+')
-                .then(fileHandle => {
-                    fd = fileHandle.fd;
+                .then(fh => {
+                    fileHandle = fh;
                     let buffer;
                     switch (cmd) {
                         case HPKV_IOCTL_GET:
@@ -88,15 +88,15 @@ if (cluster.isMaster) {
                             break;
                         default:
                             clearTimeout(timer);
-                            fs.close(fd).catch(console.error);
+                            fileHandle.close().catch(console.error);
                             reject(new Error('Invalid ioctl command'));
                             return;
                     }
 
                     try {
-                        const result = ioctl(fd, cmd, buffer);
+                        const result = ioctl(fileHandle.fd, cmd, buffer);
                         clearTimeout(timer);
-                        fs.close(fd).catch(console.error);
+                        fileHandle.close().catch(console.error);
                         if (cmd === HPKV_IOCTL_GET) {
                             const valueLength = buffer.readUInt32LE(MAX_KEY_SIZE);
                             const value = buffer.toString('utf8', MAX_KEY_SIZE + 4, MAX_KEY_SIZE + 4 + valueLength);
@@ -106,7 +106,7 @@ if (cluster.isMaster) {
                         }
                     } catch (ioctlError) {
                         clearTimeout(timer);
-                        fs.close(fd).catch(console.error);
+                        fileHandle.close().catch(console.error);
                         reject(ioctlError);
                     }
                 })
