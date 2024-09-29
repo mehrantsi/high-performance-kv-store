@@ -74,12 +74,12 @@ if (cluster.isMaster) {
                     case HPKV_IOCTL_GET:
                     case HPKV_IOCTL_DELETE:
                         buffer = Buffer.alloc(MAX_KEY_SIZE + 4 + MAX_VALUE_SIZE);
-                        buffer.write(key);
+                        buffer.write(key.toString(), 0, MAX_KEY_SIZE);
                         break;
                     case HPKV_IOCTL_PARTIAL_UPDATE:
                         buffer = Buffer.alloc(MAX_KEY_SIZE + MAX_VALUE_SIZE);
-                        buffer.write(key);
-                        buffer.write(value, MAX_KEY_SIZE);
+                        buffer.write(key.toString(), 0, MAX_KEY_SIZE);
+                        buffer.write(value.toString(), MAX_KEY_SIZE);
                         break;
                     case HPKV_IOCTL_PURGE:
                         buffer = Buffer.alloc(0);
@@ -94,7 +94,7 @@ if (cluster.isMaster) {
                     const result = ioctl(fd.fd, cmd, buffer);
                     clearTimeout(timer);
                     await fd.close();
-                    resolve(result);
+                    resolve(buffer);
                 } catch (ioctlError) {
                     clearTimeout(timer);
                     await fd.close();
@@ -147,10 +147,7 @@ if (cluster.isMaster) {
         const tenantKey = req.tenantId + key;
 
         try {
-            const buffer = Buffer.alloc(MAX_KEY_SIZE + 4 + MAX_VALUE_SIZE);
-            buffer.write(tenantKey);
-
-            await hpkvIoctl(HPKV_IOCTL_GET, buffer);
+            const buffer = await hpkvIoctl(HPKV_IOCTL_GET, tenantKey);
             
             const valueLength = buffer.readUInt32LE(MAX_KEY_SIZE);
             const valueBuffer = new Uint8Array(buffer.buffer, buffer.byteOffset + MAX_KEY_SIZE + 4, valueLength);
