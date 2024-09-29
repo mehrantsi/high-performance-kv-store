@@ -468,10 +468,13 @@ static int search_record(const char *key, char **value, size_t *value_len)
                 // Update cache
                 cache_put(key, *value, *value_len, record->sector);
                 hpkv_log(HPKV_LOG_DEBUG, "Found key %s on disk and updated cache\n", key);
+            } else {
+                hpkv_log(HPKV_LOG_ERR, "Failed to load record from disk for key %s\n", key);
             }
         }
     }
     else {
+        hpkv_log(HPKV_LOG_DEBUG, "Key %s not found in memory or cache\n", key);
         ret = -ENOENT;
     }
     rcu_read_unlock();
@@ -722,7 +725,7 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
     hash = djb2_hash(key, strlen(key));
 
     // Allocate memory for new_record using GFP_KERNEL flag
-    new_record = kmem_cache_alloc(record_cache, GFP_KERNEL);
+    new_record = kmem_cache_zalloc(record_cache, GFP_KERNEL);
     if (!new_record) {
         hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for new record\n");
         return -ENOMEM;
@@ -738,6 +741,7 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
 
     old_record = record_find_rcu(key);
     if (old_record) {
+        hpkv_log(HPKV_LOG_INFO, "Updating existing record for key: %s\n", key);
         if (is_partial_update) {
             // Perform partial update
             size_t new_len = old_record->value_len + value_len;
@@ -785,6 +789,7 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
         // Release the sectors used by the old record
         release_sectors(old_record->sector, old_record->value_len);
     } else {
+        hpkv_log(HPKV_LOG_INFO, "Inserting new record for key: %s\n", key);
         // New insert
         new_record->value = kmalloc(value_len + 1, GFP_KERNEL);
         if (!new_record->value) {

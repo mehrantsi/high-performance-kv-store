@@ -143,7 +143,7 @@ if (cluster.isMaster) {
             } else {
                 await fs.writeFile('/dev/hpkv', `${tenantKey}:${value}`);
             }
-            res.status(200).json({ message: 'Record inserted/updated successfully' });
+            res.status(200).json({ success: true, message: 'Record inserted/updated successfully' });
         } catch (error) {
             console.error('Error in POST /record:', error);
             res.status(500).json({ error: 'Failed to insert/update record' });
@@ -192,7 +192,7 @@ if (cluster.isMaster) {
 
         try {
             await hpkvIoctl(HPKV_IOCTL_DELETE, tenantKey);
-            res.status(200).json({ message: 'Record deleted successfully' });
+            res.status(200).json({ success: true, message: 'Record deleted successfully' });
         } catch (error) {
             console.error('Error in DELETE /record/:key:', error);
             res.status(500).json({ error: 'Failed to delete record' });
