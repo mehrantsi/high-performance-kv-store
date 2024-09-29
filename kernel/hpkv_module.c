@@ -2022,7 +2022,7 @@ static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
     switch (cmd) {
         case 0:  // Get by exact key
-            if (!arg || !access_ok((void __user *)arg, MAX_KEY_SIZE + MAX_VALUE_SIZE)) {
+            if (!arg || !access_ok((void __user *)arg, MAX_KEY_SIZE + sizeof(size_t) + MAX_VALUE_SIZE)) {
                 hpkv_log(HPKV_LOG_ERR, "Invalid user space pointer\n");
                 return -EFAULT;
             }
