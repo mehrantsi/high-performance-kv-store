@@ -61,60 +61,49 @@ if (cluster.isMaster) {
 
     // Helper function to perform ioctl operations with timeout
     async function hpkvIoctl(cmd, key, value = '', timeout = 5000) {
-        let fileHandle;
         return new Promise((resolve, reject) => {
             const timer = setTimeout(() => {
-                if (fileHandle) fileHandle.close().catch(console.error);
                 reject(new Error('Operation timed out'));
             }, timeout);
 
-            fs.open('/dev/hpkv', 'r+')
-                .then(fh => {
-                    fileHandle = fh;
-                    let buffer;
-                    switch (cmd) {
-                        case HPKV_IOCTL_GET:
-                        case HPKV_IOCTL_DELETE:
-                            buffer = Buffer.alloc(MAX_KEY_SIZE + 4 + MAX_VALUE_SIZE); // 4 bytes for size_t
-                            buffer.write(key);
-                            break;
-                        case HPKV_IOCTL_PARTIAL_UPDATE:
-                            buffer = Buffer.alloc(MAX_KEY_SIZE + MAX_VALUE_SIZE);
-                            buffer.write(key);
-                            buffer.write(value, MAX_KEY_SIZE);
-                            break;
-                        case HPKV_IOCTL_PURGE:
-                            buffer = Buffer.alloc(0);  // No data needed for purge
-                            break;
-                        default:
-                            clearTimeout(timer);
-                            fileHandle.close().catch(console.error);
-                            reject(new Error('Invalid ioctl command'));
-                            return;
-                    }
-
-                    try {
-                        const result = ioctl(fileHandle.fd, cmd, buffer);
-                        clearTimeout(timer);
-                        fileHandle.close().catch(console.error);
-                        if (cmd === HPKV_IOCTL_GET) {
-                            const valueLength = buffer.readUInt32LE(MAX_KEY_SIZE);
-                            const rawValue = Buffer.from(buffer.buffer, buffer.byteOffset + MAX_KEY_SIZE + 4, valueLength);
-                            const value = rawValue.toString('utf8').replace(/\0/g, '');
-                            resolve(value);
-                        } else {
-                            resolve(result);
-                        }
-                    } catch (ioctlError) {
-                        clearTimeout(timer);
-                        fileHandle.close().catch(console.error);
-                        reject(ioctlError);
-                    }
-                })
-                .catch(openError => {
+            fs.open('/dev/hpkv', 'r+', (err, fd) => {
+                if (err) {
                     clearTimeout(timer);
-                    reject(openError);
-                });
+                    return reject(err);
+                }
+
+                let buffer;
+                switch (cmd) {
+                    case HPKV_IOCTL_GET:
+                    case HPKV_IOCTL_DELETE:
+                        buffer = Buffer.alloc(MAX_KEY_SIZE + 4 + MAX_VALUE_SIZE);
+                        buffer.write(key);
+                        break;
+                    case HPKV_IOCTL_PARTIAL_UPDATE:
+                        buffer = Buffer.alloc(MAX_KEY_SIZE + MAX_VALUE_SIZE);
+                        buffer.write(key);
+                        buffer.write(value, MAX_KEY_SIZE);
+                        break;
+                    case HPKV_IOCTL_PURGE:
+                        buffer = Buffer.alloc(0);
+                        break;
+                    default:
+                        clearTimeout(timer);
+                        fs.close(fd, () => {});
+                        return reject(new Error('Invalid ioctl command'));
+                }
+
+                try {
+                    const result = ioctl(fd, cmd, buffer);
+                    clearTimeout(timer);
+                    fs.close(fd, () => {});
+                    resolve(result);
+                } catch (ioctlError) {
+                    clearTimeout(timer);
+                    fs.close(fd, () => {});
+                    reject(ioctlError);
+                }
+            });
         });
     }
 
@@ -158,7 +147,15 @@ if (cluster.isMaster) {
         const tenantKey = req.tenantId + key;
 
         try {
-            const value = await hpkvIoctl(HPKV_IOCTL_GET, tenantKey);
+            const buffer = Buffer.alloc(MAX_KEY_SIZE + 4 + MAX_VALUE_SIZE);
+            buffer.write(tenantKey);
+
+            await hpkvIoctl(HPKV_IOCTL_GET, buffer);
+            
+            const valueLength = buffer.readUInt32LE(MAX_KEY_SIZE);
+            const valueBuffer = new Uint8Array(buffer.buffer, buffer.byteOffset + MAX_KEY_SIZE + 4, valueLength);
+            const value = Buffer.from(valueBuffer).toString('utf8');
+
             res.status(200).json({ key: key, value: value.trim() });
         } catch (error) {
             if (error.message.includes('ENOENT')) {
