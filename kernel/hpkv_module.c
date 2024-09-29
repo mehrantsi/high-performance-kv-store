@@ -391,26 +391,39 @@ static int load_record_from_disk(sector_t sector, char **value, size_t *value_le
 
 static void record_free_rcu(struct rcu_head *head)
 {
-    struct record *record = container_of(head, struct record, rcu);
+    struct record *record;
+    char *value_to_free = NULL;
+
+    if (!head) {
+        hpkv_log(HPKV_LOG_ERR, "Null RCU head passed to record_free_rcu\n");
+        return;
+    }
+
+    record = container_of(head, struct record, rcu);
     if (!record) {
-        hpkv_log(HPKV_LOG_ERR, "Attempted to free NULL record in record_free_rcu\n");
+        hpkv_log(HPKV_LOG_ERR, "Failed to obtain record from RCU head in record_free_rcu\n");
         return;
     }
 
     // Use RCU read-side critical section to safely access record fields
     rcu_read_lock();
     if (record->value) {
-        char *value_to_free = rcu_dereference(record->value);
-        if (value_to_free) {
-            kfree(value_to_free);
-        }
+        value_to_free = rcu_dereference(record->value);
         rcu_assign_pointer(record->value, NULL);
     }
     rcu_read_unlock();
 
+    // Free the value outside the RCU read-side critical section
+    if (value_to_free) {
+        kfree(value_to_free);
+    }
+
     // Use a memory barrier before freeing the record
     smp_wmb();
+
+    // Free the record
     kmem_cache_free(record_cache, record);
+    hpkv_log(HPKV_LOG_DEBUG, "Record freed in RCU callback\n");
 }
 
 static struct record *record_find_rcu(const char *key)
@@ -1318,8 +1331,6 @@ static void write_record_work(struct work_struct *work)
                 write_record_to_disk(entry->record);
                 hpkv_log(HPKV_LOG_INFO, "Wrote record to disk: %s\n", entry->record->key);
             } else {
-                // Ensure all RCU readers have finished before we free the record
-                synchronize_rcu();
                 // Free the record
                 call_rcu(&entry->record->rcu, record_free_rcu);
                 hpkv_log(HPKV_LOG_INFO, "Skipping write for deleted or updated record: %s\n", entry->record->key);
@@ -1332,8 +1343,6 @@ static void write_record_work(struct work_struct *work)
                 release_sectors(entry->record->sector, entry->old_value_len);
                 hpkv_log(HPKV_LOG_INFO, "Marked sector as deleted for key: %s\n", entry->record->key);
             }
-            // Ensure all RCU readers have finished before we free the record
-            synchronize_rcu();
             // Free the record
             call_rcu(&entry->record->rcu, record_free_rcu);
             hpkv_log(HPKV_LOG_INFO, "Scheduled record for freeing: %s\n", entry->record->key);
