@@ -159,9 +159,7 @@ if (cluster.isMaster) {
 
         try {
             const value = await hpkvIoctl(HPKV_IOCTL_GET, tenantKey);
-            const valueLength = value.readUInt32LE(0);
-            const actualValue = value.slice(4, 4 + valueLength).toString('utf8');
-            res.status(200).json({ key: key, value: actualValue.trim() });  // Add .trim() here
+            res.status(200).json({ key: key, value: value.trim() });
         } catch (error) {
             if (error.message.includes('ENOENT')) {
                 res.status(404).json({ error: 'Record not found' });
