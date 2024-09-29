@@ -742,12 +742,17 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
     old_record = record_find_rcu(key);
     if (old_record) {
         hpkv_log(HPKV_LOG_INFO, "Updating existing record for key: %s\n", key);
+        
+        // Instead of freeing the old record immediately, we'll let the write buffer handle it
+        atomic_inc(&old_record->refcount);  // Increase refcount to prevent premature freeing
+
         if (is_partial_update) {
             // Perform partial update
             size_t new_len = old_record->value_len + value_len;
             if (new_len > MAX_VALUE_SIZE) {
                 percpu_up_write(&rw_sem);
                 kmem_cache_free(record_cache, new_record);
+                atomic_dec(&old_record->refcount);  // Decrement refcount if we fail
                 hpkv_log(HPKV_LOG_ERR, "Partial update exceeds maximum value size\n");
                 return -EMSGSIZE;
             }
@@ -755,6 +760,7 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
             if (!new_value) {
                 percpu_up_write(&rw_sem);
                 kmem_cache_free(record_cache, new_record);
+                atomic_dec(&old_record->refcount);  // Decrement refcount if we fail
                 hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for partial update\n");
                 return -ENOMEM;
             }
@@ -769,6 +775,7 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
             if (!new_record->value) {
                 percpu_up_write(&rw_sem);
                 kmem_cache_free(record_cache, new_record);
+                atomic_dec(&old_record->refcount);  // Decrement refcount if we fail
                 hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for regular update\n");
                 return -ENOMEM;
             }
@@ -777,17 +784,12 @@ static int insert_or_update_record(const char *key, const char *value, size_t va
             new_record->value_len = value_len;
         }
 
-        // Remove old record
+        // Remove old record from in-memory structures
         hash_del_rcu(&old_record->hash_node);
         rb_erase(&old_record->tree_node, &records_tree);
         atomic_long_sub(old_record->value_len, &total_disk_usage);
-        if (atomic_dec_and_test(&old_record->refcount)) {
-            kfree(old_record->value);
-            kmem_cache_free(record_cache, old_record);
-        }
 
-        // Release the sectors used by the old record
-        release_sectors(old_record->sector, old_record->value_len);
+        // The old record will be freed when its refcount reaches zero
     } else {
         hpkv_log(HPKV_LOG_INFO, "Inserting new record for key: %s\n", key);
         // New insert
@@ -1310,26 +1312,31 @@ static void write_record_work(struct work_struct *work)
     switch (entry->op) {
         case OP_INSERT:
         case OP_UPDATE:
-            write_record_to_disk(entry->record);
+            // Ensure the record hasn't been freed
+            if (atomic_read(&entry->record->refcount) > 0) {
+                write_record_to_disk(entry->record);
+                // After writing, decrement the refcount
+                if (atomic_dec_and_test(&entry->record->refcount)) {
+                    // If this was the last reference, schedule it for freeing
+                    call_rcu(&entry->record->rcu, record_free_rcu);
+                }
+            } else {
+                hpkv_log(HPKV_LOG_WARNING, "Skipping write for record with zero refcount: %s\n", entry->record->key);
+            }
             break;
         case OP_DELETE:
             if (entry->record->sector != 0) {
                 mark_sector_as_deleted(entry->record->sector);
-                // Decrement refcount after marking the sector as deleted
-                if (atomic_dec_and_test(&entry->record->refcount)) {
-                    // Use RCU to free the record
-                    call_rcu(&entry->record->rcu, record_free_rcu);
-                    entry->record = NULL;
-                }
-            } else {
-                hpkv_log(HPKV_LOG_INFO, "Deleted record that was not yet written to disk: %s\n", entry->record->key);
+            }
+            // For delete operations, always decrement refcount and potentially free
+            if (atomic_dec_and_test(&entry->record->refcount)) {
+                call_rcu(&entry->record->rcu, record_free_rcu);
             }
             break;
     }
 
     if (time_after(jiffies, timeout)) {
-        hpkv_log(HPKV_LOG_WARNING, "Write operation timed out for key: %s\n", 
-                 entry->record ? entry->record->key : "unknown");
+        hpkv_log(HPKV_LOG_WARNING, "Write operation timed out for key: %s\n", entry->record->key);
         atomic_set(&entry->work_status, 3);  // Mark as timed out
     } else {
         atomic_set(&entry->work_status, 2);  // Mark as completed
