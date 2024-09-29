@@ -60,14 +60,17 @@ if (cluster.isMaster) {
     });
 
     // Helper function to perform ioctl operations with timeout
-    function hpkvIoctl(cmd, key, value = '', timeout = 5000) {
+    async function hpkvIoctl(cmd, key, value = '', timeout = 5000) {
+        let fd;
         return new Promise((resolve, reject) => {
             const timer = setTimeout(() => {
+                if (fd) fs.close(fd).catch(console.error);
                 reject(new Error('Operation timed out'));
             }, timeout);
 
             fs.open('/dev/hpkv', 'r+')
-                .then(fd => {
+                .then(fileHandle => {
+                    fd = fileHandle.fd;
                     let buffer;
                     switch (cmd) {
                         case HPKV_IOCTL_GET:
@@ -85,31 +88,25 @@ if (cluster.isMaster) {
                             break;
                         default:
                             clearTimeout(timer);
-                            fd.close().catch(closeError => console.error('Error closing file:', closeError));
+                            fs.close(fd).catch(console.error);
                             reject(new Error('Invalid ioctl command'));
                             return;
                     }
 
                     try {
-                        const result = ioctl(fd.fd, cmd, buffer);
+                        const result = ioctl(fd, cmd, buffer);
                         clearTimeout(timer);
-                        fd.close().then(() => {
-                            if (cmd === HPKV_IOCTL_GET) {
-                                // Read the value length from the first 4 bytes after the key
-                                const valueLength = buffer.readUInt32LE(MAX_KEY_SIZE);
-                                // Extract the value from the buffer
-                                const value = buffer.toString('utf8', MAX_KEY_SIZE + 4, MAX_KEY_SIZE + 4 + valueLength);
-                                resolve(value);
-                            } else {
-                                resolve(result);
-                            }
-                        }).catch(closeError => {
-                            console.error('Error closing file:', closeError);
-                            reject(closeError);
-                        });
+                        fs.close(fd).catch(console.error);
+                        if (cmd === HPKV_IOCTL_GET) {
+                            const valueLength = buffer.readUInt32LE(MAX_KEY_SIZE);
+                            const value = buffer.toString('utf8', MAX_KEY_SIZE + 4, MAX_KEY_SIZE + 4 + valueLength);
+                            resolve(value);
+                        } else {
+                            resolve(result);
+                        }
                     } catch (ioctlError) {
                         clearTimeout(timer);
-                        fd.close().catch(closeError => console.error('Error closing file:', closeError));
+                        fs.close(fd).catch(console.error);
                         reject(ioctlError);
                     }
                 })
