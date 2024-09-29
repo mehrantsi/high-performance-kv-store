@@ -71,7 +71,7 @@ if (cluster.isMaster) {
                     switch (cmd) {
                         case HPKV_IOCTL_GET:
                         case HPKV_IOCTL_DELETE:
-                            buffer = Buffer.alloc(MAX_KEY_SIZE + MAX_VALUE_SIZE);
+                            buffer = Buffer.alloc(MAX_KEY_SIZE);
                             buffer.write(key);
                             break;
                         case HPKV_IOCTL_PARTIAL_UPDATE:
@@ -165,7 +165,7 @@ if (cluster.isMaster) {
         try {
             const value = await hpkvIoctl(HPKV_IOCTL_GET, tenantKey);
             // Remove the tenant ID (first 4 characters) from the key in the response
-            res.status(200).json({ key: key, value });
+            res.status(200).json({ key: key, value: value.toString().trim() });
         } catch (error) {
             if (error.message.includes('ENOENT')) {
                 res.status(404).json({ error: 'Record not found' });
@@ -203,8 +203,16 @@ if (cluster.isMaster) {
     app.get('/stats', (req, res) => {
         try {
             const stats = fs.readFileSync('/proc/hpkv_stats', 'utf8');
-            res.status(200).json({ stats });
+            const parsedStats = {};
+            stats.split('\n').forEach(line => {
+                const [key, value] = line.split(':');
+                if (key && value) {
+                    parsedStats[key.trim()] = value.trim();
+                }
+            });
+            res.status(200).json(parsedStats);
         } catch (error) {
+            console.error('Error in GET /stats:', error);
             res.status(500).json({ error: 'Failed to get statistics' });
         }
     });

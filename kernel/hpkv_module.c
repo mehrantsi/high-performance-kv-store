@@ -1997,7 +1997,7 @@ static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
     switch (cmd) {
         case 0:  // Get by exact key
-            if (!arg || !access_ok((void __user *)arg, MAX_KEY_SIZE)) {
+            if (!arg || !access_ok((void __user *)arg, MAX_KEY_SIZE + MAX_VALUE_SIZE)) {
                 hpkv_log(HPKV_LOG_ERR, "Invalid user space pointer\n");
                 return -EFAULT;
             }
@@ -2024,7 +2024,7 @@ static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
                     return -EINVAL;
                 }
                 
-                if (copy_to_user((void __user *)arg, value, value_len)) {
+                if (copy_to_user((char __user *)(arg + MAX_KEY_SIZE), value, value_len)) {
                     hpkv_log(HPKV_LOG_ERR, "Failed to copy value to user space\n");
                     kfree(value);
                     return -EFAULT;
@@ -2099,6 +2099,7 @@ static int hpkv_proc_show(struct seq_file *m, void *v)
 {
     seq_printf(m, "Total records: %d\n", atomic_read(&record_count));
     seq_printf(m, "Total disk usage: %ld bytes\n", atomic_long_read(&total_disk_usage));
+    seq_printf(m, "Device size: %lld bytes\n", i_size_read(bdev->bd_inode));
     return 0;
 }
 
