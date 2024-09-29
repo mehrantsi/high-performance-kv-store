@@ -4,3 +4,4 @@
 /api/package-lock.json
 /api/config.json
 /api/.env
+/user/config.py
