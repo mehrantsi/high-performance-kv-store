@@ -54,7 +54,7 @@ Here's a table showing the performance of HPKV for different dataset sizes:
 | 10,000            | 0.002              | 0.019              | 0.001             | 0.039              |
 | 100,000           | 0.002              | 0.023              | 0.001             | 1.517              |
 
-As shown, HPKV maintains **exceptionally low read/write latencies** even as the dataset size increases. Write performance is highly competitive, thanks to the write buffer that batches write operations to reduce latency. This means that it takes more time to persist the data to disk (under 20ms for 100,000 sequential writes), but thanks to in-memory structures, whihch makes inserted/updated records immediately available, the apparent write latency is in the order of a few microseconds.
+As shown, HPKV maintains **exceptionally low read/write latencies** even as the dataset size increases. Write performance is highly competitive, thanks to the write buffer that batches write operations to reduce latency. This means that it takes more time to persist the data to disk (under 20ms for 100,000 sequential writes), but thanks to in-memory structures, which makes inserted/updated records immediately available, the apparent write latency is in the order of a few microseconds.
 
 **Testing Environment**
 - HOST: Parallels VM on MacBook Pro M3 Max
