@@ -126,6 +126,47 @@ pm2 start npm --name "hpkv-api" -- start
 
 Refer to the API documentation for detailed information on request/response formats and authentication requirements.
 
+## API Usage Examples
+
+Here are some curl examples to demonstrate how to use the API:
+
+1. Insert or update a record:
+
+```bash
+curl -X POST http://localhost:3000/record \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-api-key-1" \
+  -d '{"key": "example_key", "value": "example_value"}'
+```
+
+2. Retrieve a record:
+
+```bash
+curl -X GET http://localhost:3000/record/example_key \
+  -H "X-API-Key: your-api-key-1"
+```
+
+3. Delete a record:
+
+```bash
+curl -X DELETE http://localhost:3000/record/example_key \
+  -H "X-API-Key: your-api-key-1"
+```
+
+4. Get system statistics:
+
+```bash
+curl -X GET http://localhost:3000/stats \
+  -H "X-API-Key: your-api-key-1"
+```
+
+5. Perform a health check:
+
+```bash
+curl -X GET http://localhost:3000/ping \
+  -H "X-API-Key: your-api-key-1"
+```
+
 ## Performance Considerations
 
 - The API server uses cluster mode to leverage multiple CPU cores.
