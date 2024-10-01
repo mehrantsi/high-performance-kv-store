@@ -32,5 +32,22 @@ insmod hpkv_module.ko mount_path=$LOOP_DEVICE
 cd /app/api
 node server.js &
 
-# Keep the container running
-tail -f /dev/null
+# Function to handle cleanup
+cleanup() {
+    echo "Cleaning up..."
+    # Stop the Node.js server
+    pkill -f "node server.js"
+    # Unload the kernel module
+    rmmod hpkv_module
+    # Remove any leftover loop devices
+    losetup -D
+}
+
+# Set up trap to call cleanup function on exit
+trap cleanup EXIT
+
+# Wait for any process to exit
+wait -n
+
+# Exit with status of process that exited first
+exit $?
