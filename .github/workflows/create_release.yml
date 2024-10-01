@@ -30,14 +30,14 @@ jobs:
     - name: Build Docker Image (Auto)
       if: ${{ inputs.tag_name == '' }}
       run: |
-        docker build -t hpkv-image:${{ github.ref_name }} .
-        docker save hpkv-image:${{ github.ref_name }} > hpkv-image.tar
+        docker build --platform linux/arm64 -t hpkv-image:${{ github.ref_name }} .
+        docker save hpkv-image:${{ github.ref_name }} > hpkv-image-arm64.tar
     
     - name: Build Docker Image (Manual)
       if: ${{ inputs.tag_name != '' }}
       run: |
-        docker build -t hpkv-image:${{ inputs.tag_name }} .
-        docker save hpkv-image:${{ inputs.tag_name }} > hpkv-image.tar
+        docker build --platform linux/arm64 -t hpkv-image:${{ inputs.tag_name }} .
+        docker save hpkv-image:${{ inputs.tag_name }} > hpkv-image-arm64.tar
     
     - name: Create Release (Auto)
       id: create_release_auto
@@ -92,8 +92,8 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         upload_url: ${{ steps.create_release_auto.outputs.upload_url }}
-        asset_path: ./hpkv-image.tar
-        asset_name: hpkv-image.tar
+        asset_path: ./hpkv-image-arm64.tar
+        asset_name: hpkv-image-arm64.tar
         asset_content_type: application/x-tar
     
     - name: Upload Docker Image (Manual)
@@ -103,7 +103,7 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         upload_url: ${{ steps.create_release_manual.outputs.upload_url }}
-        asset_path: ./hpkv-image.tar
-        asset_name: hpkv-image.tar
+        asset_path: ./hpkv-image-arm64.tar
+        asset_name: hpkv-image-arm64.tar
         asset_content_type: application/x-tar
 
