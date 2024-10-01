@@ -35,9 +35,8 @@ jobs:
 
     - name: Setup ARM64 Kernel Headers
       run: |
-        wget http://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/linux-headers-6.8.0-45-generic_6.8.0-45.45_arm64.deb
-        dpkg-deb -x linux-headers-6.8.0-45-generic_6.8.0-45.45_arm64.deb arm64-headers
-        echo "KDIR_ARM64=$PWD/arm64-headers/usr/src/linux-headers-6.8.0-45-generic" >> $GITHUB_ENV
+        sudo apt-get install linux-headers-generic-arm64
+        echo "KDIR_ARM64=/usr/src/linux-headers-generic-arm64" >> $GITHUB_ENV
 
     - name: Build ARM64 Kernel Module
       run: |
