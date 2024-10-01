@@ -27,16 +27,24 @@ jobs:
       run: make
       working-directory: ./kernel
     
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v2
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v2
+
     - name: Build Docker Image (Auto)
       if: ${{ inputs.tag_name == '' }}
       run: |
-        docker buildx build --platform linux/arm64 -t hpkv-image:${{ github.ref_name }} .
+        docker buildx create --use
+        docker buildx build --platform linux/arm64 --load -t hpkv-image:${{ github.ref_name }} .
         docker save hpkv-image:${{ github.ref_name }} > hpkv-image-arm64.tar
-    
+
     - name: Build Docker Image (Manual)
       if: ${{ inputs.tag_name != '' }}
       run: |
-        docker buildx build --platform linux/arm64 -t hpkv-image:${{ inputs.tag_name }} .
+        docker buildx create --use
+        docker buildx build --platform linux/arm64 --load -t hpkv-image:${{ inputs.tag_name }} .
         docker save hpkv-image:${{ inputs.tag_name }} > hpkv-image-arm64.tar
     
     - name: Create Release (Auto)
