@@ -30,13 +30,13 @@ jobs:
     - name: Build Docker Image (Auto)
       if: ${{ inputs.tag_name == '' }}
       run: |
-        docker build --platform linux/arm64 -t hpkv-image:${{ github.ref_name }} .
+        docker buildx build --platform linux/arm64 -t hpkv-image:${{ github.ref_name }} .
         docker save hpkv-image:${{ github.ref_name }} > hpkv-image-arm64.tar
     
     - name: Build Docker Image (Manual)
       if: ${{ inputs.tag_name != '' }}
       run: |
-        docker build --platform linux/arm64 -t hpkv-image:${{ inputs.tag_name }} .
+        docker buildx build --platform linux/arm64 -t hpkv-image:${{ inputs.tag_name }} .
         docker save hpkv-image:${{ inputs.tag_name }} > hpkv-image-arm64.tar
     
     - name: Create Release (Auto)
