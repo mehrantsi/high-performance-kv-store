@@ -36,7 +36,7 @@ jobs:
     - name: Setup ARM64 Kernel Headers
       run: |
         sudo apt-get install linux-kernel-headers-arm64-cross
-        echo "KDIR_ARM64=/usr/src/linux-headers-arm64-cross" >> $GITHUB_ENV
+        echo "KDIR_ARM64=/usr/src/linux-headers-$(uname -r)" >> $GITHUB_ENV
 
     - name: Build ARM64 Kernel Module
       run: |
