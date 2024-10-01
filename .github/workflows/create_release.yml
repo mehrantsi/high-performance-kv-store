@@ -17,13 +17,21 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    
     - name: Setup Dependencies
       run: |
         sudo apt-get update
         sudo apt-get install build-essential linux-headers-$(uname -r)
-    - name: Build
+    
+    - name: Build Kernel Module
       run: make
       working-directory: ./kernel
+    
+    - name: Build Docker Image
+      run: |
+        docker build -t hpkv-image:${{ github.ref_name || inputs.tag_name }} .
+        docker save hpkv-image:${{ github.ref_name || inputs.tag_name }} > hpkv-image.tar
+    
     - name: Create Release (Auto)
       id: create_release_auto
       if: ${{ inputs.tag_name == '' }}
@@ -35,6 +43,7 @@ jobs:
         release_name: Release ${{ github.ref_name }}
         draft: false
         prerelease: false
+    
     - name: Create Release (Manual)
       id: create_release_manual
       if: ${{ inputs.tag_name != '' }}
@@ -46,24 +55,48 @@ jobs:
         release_name: Release ${{ inputs.tag_name }}
         draft: false
         prerelease: false
-    - name: Upload Release Asset (Auto)
+    
+    - name: Upload Kernel Module (Auto)
       if: ${{ inputs.tag_name == '' }}
       uses: actions/upload-release-asset@v1
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        upload_url: ${{ steps.create_release_auto.outputs.upload_url }} # This pulls from the CREATE RELEASE step above, referencing it's ID to get its outputs object, which include a `upload_url`. See this blog post for more info: https://jasonet.co/posts/new-features-of-github-actions/#passing-data-to-future-steps 
+        upload_url: ${{ steps.create_release_auto.outputs.upload_url }}
         asset_path: ./kernel/hpkv_module.ko
         asset_name: hpkv_module.ko
-        asset_content_type: application/ko-file
-    - name: Upload Release Asset (Manual)
+        asset_content_type: application/octet-stream
+    
+    - name: Upload Kernel Module (Manual)
       if: ${{ inputs.tag_name != '' }}
       uses: actions/upload-release-asset@v1
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        upload_url: ${{ steps.create_release_manual.outputs.upload_url }} # This pulls from the CREATE RELEASE step above, referencing it's ID to get its outputs object, which include a `upload_url`. See this blog post for more info: https://jasonet.co/posts/new-features-of-github-actions/#passing-data-to-future-steps 
+        upload_url: ${{ steps.create_release_manual.outputs.upload_url }}
         asset_path: ./kernel/hpkv_module.ko
         asset_name: hpkv_module.ko
-        asset_content_type: application/ko-file
-      
+        asset_content_type: application/octet-stream
+    
+    - name: Upload Docker Image (Auto)
+      if: ${{ inputs.tag_name == '' }}
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release_auto.outputs.upload_url }}
+        asset_path: ./hpkv-image.tar
+        asset_name: hpkv-image.tar
+        asset_content_type: application/x-tar
+    
+    - name: Upload Docker Image (Manual)
+      if: ${{ inputs.tag_name != '' }}
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release_manual.outputs.upload_url }}
+        asset_path: ./hpkv-image.tar
+        asset_name: hpkv-image.tar
+        asset_content_type: application/x-tar
+
