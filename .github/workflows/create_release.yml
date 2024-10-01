@@ -19,18 +19,29 @@ jobs:
     - name: Setup Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install build-essential linux-headers-$(uname -r) gcc-aarch64-linux-gnu
+        sudo apt-get install build-essential gcc-aarch64-linux-gnu
+
+    - name: Setup x86_64 Kernel Headers
+      run: |
+        sudo apt-get install linux-headers-$(uname -r)
+        echo "KDIR_X86=/usr/src/linux-headers-$(uname -r)" >> $GITHUB_ENV
 
     - name: Build x86-64 Kernel Module
       run: |
-        make x86_64
+        make x86_64 KDIR=${{ env.KDIR_X86 }}
         mv hpkv_module_x86_64.ko ../
         make clean
       working-directory: ./kernel
 
+    - name: Setup ARM64 Kernel Headers
+      run: |
+        wget http://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/linux-headers-6.8.0-45-generic_6.8.0-45.45_arm64.deb
+        dpkg-deb -x linux-headers-6.8.0-45-generic_6.8.0-45.45_arm64.deb arm64-headers
+        echo "KDIR_ARM64=$PWD/arm64-headers/usr/src/linux-headers-6.8.0-45-generic" >> $GITHUB_ENV
+
     - name: Build ARM64 Kernel Module
       run: |
-        make arm64
+        make arm64 KDIR=${{ env.KDIR_ARM64 }}
         mv hpkv_module_arm64.ko ../
       working-directory: ./kernel
     
