@@ -22,12 +22,22 @@ jobs:
         sudo apt-get install build-essential linux-headers-$(uname -r) gcc-aarch64-linux-gnu
 
     - name: Build x86-64 Kernel Module
-      run: make x86_64
+      run: |
+        make x86_64
+        mv hpkv_module_x86_64.ko ../
+        make clean
       working-directory: ./kernel
 
     - name: Build ARM64 Kernel Module
-      run: make arm64
+      run: |
+        make arm64
+        mv hpkv_module_arm64.ko ../
       working-directory: ./kernel
+    
+    - name: Move Kernel Modules Back
+      run: |
+        mv ../hpkv_module_x86_64.ko ./kernel/
+        mv ../hpkv_module_arm64.ko ./kernel/
     
     - name: Set up QEMU
       uses: docker/setup-qemu-action@v2

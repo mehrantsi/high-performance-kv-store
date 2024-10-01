@@ -15,3 +15,4 @@ arm64:
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
 	rm -f hpkv_module_x86_64.ko hpkv_module_arm64.ko
+	rm -f *.o *.ko *.mod.c *.mod *.symvers *.order
