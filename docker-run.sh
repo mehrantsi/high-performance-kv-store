@@ -19,19 +19,19 @@ case ${ARCH} in
 esac
 
 # Check if the image already exists
-if docker image inspect "hpkv-image:${VERSION}" &> /dev/null; then
-    echo "Docker image hpkv-image:${VERSION} already exists. Skipping download."
+if docker image inspect "hpkv-image:${VERSION}-${DOCKER_ARCH}" &> /dev/null; then
+    echo "Docker image hpkv-image:${VERSION}-${DOCKER_ARCH} already exists. Skipping download."
 else
     # Download the Docker image
     echo "Downloading Docker image..."
-    wget "https://github.com/mehrantsi/high-performance-kv-store/releases/download/${VERSION}/hpkv-image-arm64-amd64.tar.gz"
+    wget "https://github.com/mehrantsi/high-performance-kv-store/releases/download/${VERSION}/hpkv-image-${DOCKER_ARCH}.tar.gz"
 
     # Load the Docker image
     echo "Loading Docker image..."
-    docker load < hpkv-image-arm64-amd64.tar.gz
+    docker load < hpkv-image-${DOCKER_ARCH}.tar.gz
 
     # Clean up the downloaded tar.gz file
-    rm hpkv-image-arm64-amd64.tar.gz
+    rm hpkv-image-${DOCKER_ARCH}.tar.gz
 fi
 
 # Run the Docker container
@@ -41,8 +41,7 @@ docker run --rm \
   --privileged \
   --device /dev/loop-control:/dev/loop-control \
   -p 4242:80 \
-  --platform linux/${DOCKER_ARCH} \
-  "hpkv-image:${VERSION}"
+  "hpkv-image:${VERSION}-${DOCKER_ARCH}"
 
 # The container will be automatically removed when it exits due to the --rm flag
 

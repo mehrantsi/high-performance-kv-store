@@ -37,15 +37,19 @@ jobs:
       if: ${{ inputs.tag_name == '' }}
       run: |
         docker buildx create --use
-        docker buildx build --platform linux/arm64,linux/amd64 --load -t hpkv-image:${{ github.ref_name }} .
-        docker save hpkv-image:${{ github.ref_name }} | gzip > hpkv-image-arm64-amd64.tar.gz
+        docker buildx build --platform linux/arm64 --load -t hpkv-image:${{ github.ref_name }}-arm64 .
+        docker save hpkv-image:${{ github.ref_name }}-arm64 | gzip > hpkv-image-arm64.tar.gz
+        docker buildx build --platform linux/amd64 --load -t hpkv-image:${{ github.ref_name }}-amd64 .
+        docker save hpkv-image:${{ github.ref_name }}-amd64 | gzip > hpkv-image-amd64.tar.gz
 
     - name: Build Docker Images (Manual)
       if: ${{ inputs.tag_name != '' }}
       run: |
         docker buildx create --use
-        docker buildx build --platform linux/arm64,linux/amd64 --load -t hpkv-image:${{ inputs.tag_name }} .
-        docker save hpkv-image:${{ inputs.tag_name }} | gzip > hpkv-image-arm64-amd64.tar.gz
+        docker buildx build --platform linux/arm64 --load -t hpkv-image:${{ inputs.tag_name }}-arm64 .
+        docker save hpkv-image:${{ inputs.tag_name }}-arm64 | gzip > hpkv-image-arm64.tar.gz
+        docker buildx build --platform linux/amd64 --load -t hpkv-image:${{ inputs.tag_name }}-amd64 .
+        docker save hpkv-image:${{ inputs.tag_name }}-amd64 | gzip > hpkv-image-amd64.tar.gz
     
     - name: Create Release (Auto)
       id: create_release_auto
@@ -93,25 +97,47 @@ jobs:
         asset_name: hpkv_module.ko
         asset_content_type: application/octet-stream
     
-    - name: Upload Docker Image (Auto)
+    - name: Upload Docker Image ARM64 (Auto)
       if: ${{ inputs.tag_name == '' }}
       uses: actions/upload-release-asset@v1
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         upload_url: ${{ steps.create_release_auto.outputs.upload_url }}
-        asset_path: ./hpkv-image-arm64-amd64.tar.gz
-        asset_name: hpkv-image-arm64-amd64.tar.gz
+        asset_path: ./hpkv-image-arm64.tar.gz
+        asset_name: hpkv-image-arm64.tar.gz
         asset_content_type: application/gzip
     
-    - name: Upload Docker Image (Manual)
+    - name: Upload Docker Image AMD64 (Auto)
+      if: ${{ inputs.tag_name == '' }}
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release_auto.outputs.upload_url }}
+        asset_path: ./hpkv-image-amd64.tar.gz
+        asset_name: hpkv-image-amd64.tar.gz
+        asset_content_type: application/gzip
+    
+    - name: Upload Docker Image ARM64 (Manual)
       if: ${{ inputs.tag_name != '' }}
       uses: actions/upload-release-asset@v1
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         upload_url: ${{ steps.create_release_manual.outputs.upload_url }}
-        asset_path: ./hpkv-image-arm64-amd64.tar.gz
-        asset_name: hpkv-image-arm64-amd64.tar.gz
+        asset_path: ./hpkv-image-arm64.tar.gz
+        asset_name: hpkv-image-arm64.tar.gz
+        asset_content_type: application/gzip
+    
+    - name: Upload Docker Image AMD64 (Manual)
+      if: ${{ inputs.tag_name != '' }}
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release_manual.outputs.upload_url }}
+        asset_path: ./hpkv-image-amd64.tar.gz
+        asset_name: hpkv-image-amd64.tar.gz
         asset_content_type: application/gzip
 
