@@ -28,11 +28,13 @@ jobs:
       working-directory: ./kernel
     
     - name: Build Docker Image (Auto)
+      if: ${{ inputs.tag_name == '' }}
       run: |
         docker build -t hpkv-image:${{ github.ref_name }} .
         docker save hpkv-image:${{ github.ref_name }} > hpkv-image.tar
     
     - name: Build Docker Image (Manual)
+      if: ${{ inputs.tag_name != '' }}
       run: |
         docker build -t hpkv-image:${{ inputs.tag_name }} .
         docker save hpkv-image:${{ inputs.tag_name }} > hpkv-image.tar
