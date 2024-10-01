@@ -33,19 +33,19 @@ jobs:
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v2
 
-    - name: Build Docker Image (Auto)
+    - name: Build Docker Images (Auto)
       if: ${{ inputs.tag_name == '' }}
       run: |
         docker buildx create --use
-        docker buildx build --platform linux/arm64 --load -t hpkv-image:${{ github.ref_name }} .
-        docker save hpkv-image:${{ github.ref_name }} > hpkv-image-arm64.tar
+        docker buildx build --platform linux/arm64,linux/amd64 --load -t hpkv-image:${{ github.ref_name }} .
+        docker save hpkv-image:${{ github.ref_name }} | gzip > hpkv-image-arm64-amd64.tar.gz
 
-    - name: Build Docker Image (Manual)
+    - name: Build Docker Images (Manual)
       if: ${{ inputs.tag_name != '' }}
       run: |
         docker buildx create --use
-        docker buildx build --platform linux/arm64 --load -t hpkv-image:${{ inputs.tag_name }} .
-        docker save hpkv-image:${{ inputs.tag_name }} > hpkv-image-arm64.tar
+        docker buildx build --platform linux/arm64,linux/amd64 --load -t hpkv-image:${{ inputs.tag_name }} .
+        docker save hpkv-image:${{ inputs.tag_name }} | gzip > hpkv-image-arm64-amd64.tar.gz
     
     - name: Create Release (Auto)
       id: create_release_auto
@@ -100,9 +100,9 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         upload_url: ${{ steps.create_release_auto.outputs.upload_url }}
-        asset_path: ./hpkv-image-arm64.tar
-        asset_name: hpkv-image-arm64.tar
-        asset_content_type: application/x-tar
+        asset_path: ./hpkv-image-arm64-amd64.tar.gz
+        asset_name: hpkv-image-arm64-amd64.tar.gz
+        asset_content_type: application/gzip
     
     - name: Upload Docker Image (Manual)
       if: ${{ inputs.tag_name != '' }}
@@ -111,7 +111,7 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         upload_url: ${{ steps.create_release_manual.outputs.upload_url }}
-        asset_path: ./hpkv-image-arm64.tar
-        asset_name: hpkv-image-arm64.tar
-        asset_content_type: application/x-tar
+        asset_path: ./hpkv-image-arm64-amd64.tar.gz
+        asset_name: hpkv-image-arm64-amd64.tar.gz
+        asset_content_type: application/gzip
 
