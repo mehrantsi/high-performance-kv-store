@@ -29,8 +29,8 @@ jobs:
     
     - name: Build Docker Image
       run: |
-        docker build -t hpkv-image:${{ github.ref_name || inputs.tag_name }} .
-        docker save hpkv-image:${{ github.ref_name || inputs.tag_name }} > hpkv-image.tar
+        docker build -t hpkv-image:${{ inputs.tag_name }} .
+        docker save hpkv-image:${{ inputs.tag_name }} > hpkv-image.tar
     
     - name: Create Release (Auto)
       id: create_release_auto
