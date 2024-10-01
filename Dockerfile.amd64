@@ -9,8 +9,8 @@ RUN make x86_64
 
 FROM ubuntu:latest
 
-COPY --from=builder /app/kernel/hpkv_module.ko /app/kernel/hpkv_module.ko
-COPY --from=builder /app/kernel/hpkv_module.ko /lib/modules/$(uname -r)/kernel/drivers/misc/hpkv_module.ko
+COPY --from=builder /app/kernel/hpkv_module_x86_64.ko /app/kernel/
+COPY --from=builder /app/kernel/hpkv_module_x86_64.ko /lib/modules/$(uname -r)/kernel/drivers/misc/
 
 COPY Dockerfile.base /Dockerfile.base
 RUN sed '/^RUN cd \/app\/kernel/d' /Dockerfile.base > /Dockerfile && \
