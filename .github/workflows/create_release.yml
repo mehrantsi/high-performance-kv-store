@@ -12,19 +12,21 @@ on:
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
-
     steps:
     - uses: actions/checkout@v4
     
     - name: Setup Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install build-essential linux-headers-$(uname -r)
-    
-    - name: Build Kernel Module
-      run: make
+        sudo apt-get install build-essential linux-headers-$(uname -r) gcc-aarch64-linux-gnu
+
+    - name: Build x86-64 Kernel Module
+      run: make x86_64
+      working-directory: ./kernel
+
+    - name: Build ARM64 Kernel Module
+      run: make arm64
       working-directory: ./kernel
     
     - name: Set up QEMU
@@ -37,18 +39,18 @@ jobs:
       if: ${{ inputs.tag_name == '' }}
       run: |
         docker buildx create --use
-        docker buildx build --platform linux/arm64 --load -t hpkv-image:${{ github.ref_name }}-arm64 .
+        docker buildx build --platform linux/arm64 --file Dockerfile.arm64 --load -t hpkv-image:${{ github.ref_name }}-arm64 .
         docker save hpkv-image:${{ github.ref_name }}-arm64 | gzip > hpkv-image-arm64.tar.gz
-        docker buildx build --platform linux/amd64 --load -t hpkv-image:${{ github.ref_name }}-amd64 .
+        docker buildx build --platform linux/amd64 --file Dockerfile.amd64 --load -t hpkv-image:${{ github.ref_name }}-amd64 .
         docker save hpkv-image:${{ github.ref_name }}-amd64 | gzip > hpkv-image-amd64.tar.gz
 
     - name: Build Docker Images (Manual)
       if: ${{ inputs.tag_name != '' }}
       run: |
         docker buildx create --use
-        docker buildx build --platform linux/arm64 --load -t hpkv-image:${{ inputs.tag_name }}-arm64 .
+        docker buildx build --platform linux/arm64 --file Dockerfile.arm64 --load -t hpkv-image:${{ inputs.tag_name }}-arm64 .
         docker save hpkv-image:${{ inputs.tag_name }}-arm64 | gzip > hpkv-image-arm64.tar.gz
-        docker buildx build --platform linux/amd64 --load -t hpkv-image:${{ inputs.tag_name }}-amd64 .
+        docker buildx build --platform linux/amd64 --file Dockerfile.amd64 --load -t hpkv-image:${{ inputs.tag_name }}-amd64 .
         docker save hpkv-image:${{ inputs.tag_name }}-amd64 | gzip > hpkv-image-amd64.tar.gz
     
     - name: Create Release (Auto)
@@ -75,7 +77,7 @@ jobs:
         draft: false
         prerelease: false
     
-    - name: Upload Kernel Module (Auto)
+    - name: Upload x86-64 Kernel Module (Auto)
       if: ${{ inputs.tag_name == '' }}
       uses: actions/upload-release-asset@v1
       env:
@@ -83,10 +85,21 @@ jobs:
       with:
         upload_url: ${{ steps.create_release_auto.outputs.upload_url }}
         asset_path: ./kernel/hpkv_module.ko
-        asset_name: hpkv_module.ko
+        asset_name: hpkv_module_x86_64.ko
+        asset_content_type: application/octet-stream
+
+    - name: Upload ARM64 Kernel Module (Auto)
+      if: ${{ inputs.tag_name == '' }}
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release_auto.outputs.upload_url }}
+        asset_path: ./kernel/hpkv_module.ko
+        asset_name: hpkv_module_arm64.ko
         asset_content_type: application/octet-stream
     
-    - name: Upload Kernel Module (Manual)
+    - name: Upload x86-64 Kernel Module (Manual)
       if: ${{ inputs.tag_name != '' }}
       uses: actions/upload-release-asset@v1
       env:
@@ -94,7 +107,18 @@ jobs:
       with:
         upload_url: ${{ steps.create_release_manual.outputs.upload_url }}
         asset_path: ./kernel/hpkv_module.ko
-        asset_name: hpkv_module.ko
+        asset_name: hpkv_module_x86_64.ko
+        asset_content_type: application/octet-stream
+
+    - name: Upload ARM64 Kernel Module (Manual)
+      if: ${{ inputs.tag_name != '' }}
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release_manual.outputs.upload_url }}
+        asset_path: ./kernel/hpkv_module.ko
+        asset_name: hpkv_module_arm64.ko
         asset_content_type: application/octet-stream
     
     - name: Upload Docker Image ARM64 (Auto)
@@ -140,4 +164,3 @@ jobs:
         asset_path: ./hpkv-image-amd64.tar.gz
         asset_name: hpkv-image-amd64.tar.gz
         asset_content_type: application/gzip
-

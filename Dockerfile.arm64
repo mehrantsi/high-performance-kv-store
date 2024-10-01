@@ -1,0 +1,17 @@
+FROM ubuntu:latest AS builder
+
+RUN apt-get update && \
+    apt-get install -y build-essential linux-headers-generic gcc-aarch64-linux-gnu
+
+COPY kernel /app/kernel
+WORKDIR /app/kernel
+RUN make arm64
+
+FROM ubuntu:latest
+
+COPY --from=builder /app/kernel/hpkv_module.ko /app/kernel/hpkv_module.ko
+COPY --from=builder /app/kernel/hpkv_module.ko /lib/modules/$(uname -r)/kernel/drivers/misc/hpkv_module.ko
+
+COPY Dockerfile.base /Dockerfile.base
+RUN sed '/^RUN cd \/app\/kernel/d' /Dockerfile.base > /Dockerfile && \
+    docker build -f /Dockerfile .
