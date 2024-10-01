@@ -5,12 +5,20 @@ RUN apt-get update && \
 
 COPY kernel /app/kernel
 WORKDIR /app/kernel
-RUN make arm64
+
+# Download ARM64 kernel headers
+RUN apt-get install -y wget && \
+    wget http://ports.ubuntu.com/pool/main/l/linux/linux-headers-5.15.0-1028-generic-64k_5.15.0-1028.31_arm64.deb && \
+    dpkg -x linux-headers-5.15.0-1028-generic-64k_5.15.0-1028.31_arm64.deb /tmp/arm64-headers && \
+    rm linux-headers-5.15.0-1028-generic-64k_5.15.0-1028.31_arm64.deb
+
+# Build the ARM64 kernel module
+RUN make arm64 KDIR=/tmp/arm64-headers/usr/src/linux-headers-5.15.0-1028-generic-64k
 
 FROM ubuntu:latest
 
-COPY --from=builder /app/kernel/hpkv_module.ko /app/kernel/hpkv_module.ko
-COPY --from=builder /app/kernel/hpkv_module.ko /lib/modules/$(uname -r)/kernel/drivers/misc/hpkv_module.ko
+COPY --from=builder /app/kernel/hpkv_module.ko /app/kernel/
+COPY --from=builder /app/kernel/hpkv_module.ko /lib/modules/$(uname -r)/kernel/drivers/misc/
 
 COPY Dockerfile.base /Dockerfile.base
 RUN sed '/^RUN cd \/app\/kernel/d' /Dockerfile.base > /Dockerfile && \
