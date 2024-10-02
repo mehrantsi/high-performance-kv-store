@@ -9,14 +9,15 @@ on:
       tag_name:
         required: false
         type: string
+        description: 'Release tag (e.g., v1.0-preview)'
       kernel_version:
         required: false
         type: string
-        description: 'Generic kernel version (e.g., 6.8.0-45)'
+        description: 'Generic kernel version - arm64 (e.g., 6.8.0-45)'
       azure_kernel_version:
         required: false
         type: string
-        description: 'Azure kernel version (e.g., 6.8.0-1014-azure)'
+        description: 'Azure kernel version - arm64 (e.g., 6.8.0-1014-azure)'
 
 jobs:
   build:
