@@ -15,10 +15,6 @@ RUN KERNEL_VERSION_MAIN=$(echo ${KERNEL_VERSION} | cut -d'-' -f1) && \
 COPY kernel /app/kernel
 WORKDIR /app/kernel
 
-# Debug: List contents of directories
-RUN ls -R /usr/src/linux-headers-${KERNEL_VERSION}-generic && \
-    ls -R /app/kernel
-
 # Attempt to build the module
 RUN make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
     -C /usr/src/linux-headers-${KERNEL_VERSION}-generic \
