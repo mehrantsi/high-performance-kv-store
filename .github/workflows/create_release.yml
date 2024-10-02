@@ -9,6 +9,14 @@ on:
       tag_name:
         required: false
         type: string
+      kernel_version:
+        required: false
+        type: string
+        description: 'Generic kernel version (e.g., 6.8.0-45)'
+      azure_kernel_version:
+        required: false
+        type: string
+        description: 'Azure kernel version (e.g., 6.8.0-1014-azure)'
 
 jobs:
   build:
@@ -40,8 +48,17 @@ jobs:
     - name: Build Docker Images (Auto)
       if: ${{ inputs.tag_name == '' }}
       run: |
+        BUILD_ARGS=""
+        if [ ! -z "${{ inputs.kernel_version }}" ]; then
+          BUILD_ARGS="$BUILD_ARGS --build-arg KERNEL_VERSION=${{ inputs.kernel_version }}"
+        fi
+        if [ ! -z "${{ inputs.azure_kernel_version }}" ]; then
+          BUILD_ARGS="$BUILD_ARGS --build-arg AZURE_KERNEL_VERSION=${{ inputs.azure_kernel_version }}"
+        fi
         docker buildx create --use
-        docker buildx build --platform linux/arm64 --file Dockerfile.arm64 --load -t hpkv-image:${{ github.ref_name }}-arm64 .
+        docker buildx build --platform linux/arm64 --file Dockerfile.arm64 \
+          $BUILD_ARGS \
+          --load -t hpkv-image:${{ github.ref_name }}-arm64 .
         docker save hpkv-image:${{ github.ref_name }}-arm64 | gzip > hpkv-image-arm64.tar.gz
         docker buildx build --platform linux/amd64 --file Dockerfile.amd64 --load -t hpkv-image:${{ github.ref_name }}-amd64 .
         docker save hpkv-image:${{ github.ref_name }}-amd64 | gzip > hpkv-image-amd64.tar.gz
@@ -50,8 +67,17 @@ jobs:
     - name: Build Docker Images (Manual)
       if: ${{ inputs.tag_name != '' }}
       run: |
+        BUILD_ARGS=""
+        if [ ! -z "${{ inputs.kernel_version }}" ]; then
+          BUILD_ARGS="$BUILD_ARGS --build-arg KERNEL_VERSION=${{ inputs.kernel_version }}"
+        fi
+        if [ ! -z "${{ inputs.azure_kernel_version }}" ]; then
+          BUILD_ARGS="$BUILD_ARGS --build-arg AZURE_KERNEL_VERSION=${{ inputs.azure_kernel_version }}"
+        fi
         docker buildx create --use
-        docker buildx build --platform linux/arm64 --file Dockerfile.arm64 --load -t hpkv-image:${{ inputs.tag_name }}-arm64 .
+        docker buildx build --platform linux/arm64 --file Dockerfile.arm64 \
+          $BUILD_ARGS \
+          --load -t hpkv-image:${{ inputs.tag_name }}-arm64 .
         docker save hpkv-image:${{ inputs.tag_name }}-arm64 | gzip > hpkv-image-arm64.tar.gz
         docker buildx build --platform linux/amd64 --file Dockerfile.amd64 --load -t hpkv-image:${{ inputs.tag_name }}-amd64 .
         docker save hpkv-image:${{ inputs.tag_name }}-amd64 | gzip > hpkv-image-amd64.tar.gz

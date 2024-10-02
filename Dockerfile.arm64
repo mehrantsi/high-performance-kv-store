@@ -1,17 +1,31 @@
 FROM ubuntu:latest AS builder
 
+ARG KERNEL_VERSION=6.8.0-45
+ARG AZURE_KERNEL_VERSION=6.8.0-1014-azure
+
 RUN apt-get update && \
-    apt-get install -y build-essential linux-headers-generic gcc-aarch64-linux-gnu
+    apt-get install -y build-essential gcc-aarch64-linux-gnu wget
+
+# Install ARM64 kernel headers
+RUN wget http://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/linux-headers-generic_${KERNEL_VERSION}.47_arm64.deb && \
+    mkdir -p /usr/src/linux-headers-${AZURE_KERNEL_VERSION} && \
+    dpkg -x linux-headers-generic_${KERNEL_VERSION}.47_arm64.deb /usr/src/linux-headers-${AZURE_KERNEL_VERSION} && \
+    rm linux-headers-generic_${KERNEL_VERSION}.47_arm64.deb
 
 COPY kernel /app/kernel
 WORKDIR /app/kernel
-RUN make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -C /usr/src/linux-headers-$(uname -r) M=$(pwd) modules && \
+
+RUN make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+    -C /usr/src/linux-headers-${AZURE_KERNEL_VERSION}/usr/src/linux-headers-${KERNEL_VERSION}-generic \
+    M=$(pwd) modules && \
     mv hpkv_module.ko hpkv_module_arm64.ko
 
 FROM ubuntu:latest
 
+ARG AZURE_KERNEL_VERSION=6.8.0-1014-azure
+
 COPY --from=builder /app/kernel/hpkv_module_arm64.ko /app/kernel/
-COPY --from=builder /app/kernel/hpkv_module_arm64.ko /lib/modules/$(uname -r)/kernel/drivers/misc/
+COPY --from=builder /app/kernel/hpkv_module_arm64.ko /lib/modules/${AZURE_KERNEL_VERSION}/kernel/drivers/misc/
 
 COPY Dockerfile.base /Dockerfile.base
 RUN sed '/^RUN cd \/app\/kernel/d' /Dockerfile.base > /Dockerfile && \
