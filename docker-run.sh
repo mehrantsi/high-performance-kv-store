@@ -40,7 +40,7 @@ docker run --rm \
   --name hpkv-container \
   --privileged \
   --device /dev/loop-control:/dev/loop-control \
-  -p 4242:80 \
+  -p 3000:3000 \
   "hpkv-image:${VERSION}-${DOCKER_ARCH}"
 
 # The container will be automatically removed when it exits due to the --rm flag

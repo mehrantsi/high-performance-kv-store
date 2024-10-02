@@ -53,7 +53,7 @@ cleanup() {
     # Stop the Node.js server
     pkill -f "node server.js"
     # Unload the kernel module
-    rmmod hpkv_module_${MODULE_ARCH}
+    rmmod hpkv_module
     # Remove any leftover loop devices
     losetup -D
 }
