@@ -2,6 +2,6 @@
 /.venv
 /api/node_modules
 /api/package-lock.json
-/api/config.json
+/api/config.local.json
 /api/.env
 /user/config.py

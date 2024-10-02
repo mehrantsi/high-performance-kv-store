@@ -1,0 +1,56 @@
+FROM ubuntu:latest AS builder
+
+ARG KERNEL_VERSION=6.8.0-45
+
+RUN apt-get update && \
+    apt-get install -y build-essential gcc-aarch64-linux-gnu wget linux-headers-generic
+
+# Install ARM64 kernel headers
+RUN KERNEL_VERSION_MAIN=$(echo ${KERNEL_VERSION} | cut -d'-' -f1) && \
+    KERNEL_VERSION_BUILD=$(echo ${KERNEL_VERSION} | cut -d'-' -f2) && \
+    wget "http://ports.ubuntu.com/pool/main/l/linux/linux-headers-${KERNEL_VERSION}-generic_${KERNEL_VERSION}.${KERNEL_VERSION_BUILD}_arm64.deb" && \
+    dpkg -x "linux-headers-${KERNEL_VERSION}-generic_${KERNEL_VERSION}.${KERNEL_VERSION_BUILD}_arm64.deb" /usr/src/linux-headers-${KERNEL_VERSION}-generic && \
+    rm "linux-headers-${KERNEL_VERSION}-generic_${KERNEL_VERSION}.${KERNEL_VERSION_BUILD}_arm64.deb"
+
+COPY kernel /app/kernel
+WORKDIR /app/kernel
+
+# Attempt to build the module
+RUN make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+    -C /usr/src/linux-headers-${KERNEL_VERSION}-generic \
+    M=$(pwd) modules || (echo "Make failed. Listing directory contents:" && ls -R)
+
+# Move the built module if successful
+RUN if [ -f hpkv_module.ko ]; then \
+        mv hpkv_module.ko hpkv_module_arm64.ko; \
+    else \
+        echo "hpkv_module.ko not found. Build likely failed."; \
+        exit 1; \
+    fi
+
+FROM ubuntu:latest
+
+COPY --from=builder /app/kernel/hpkv_module_arm64.ko /app/kernel/
+
+# Copy other necessary files from Dockerfile.base
+COPY api /app/api
+COPY start.sh /app/start.sh
+RUN chmod +x /app/start.sh
+
+# Install necessary packages
+RUN apt-get update && \
+    apt-get install -y nodejs npm kmod util-linux && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Set up working directory
+WORKDIR /app
+
+# Install Node.js dependencies
+RUN cd /app/api && npm install
+
+# Expose the API port
+EXPOSE 80
+
+# Run the startup script
+CMD ["/app/start.sh"]
