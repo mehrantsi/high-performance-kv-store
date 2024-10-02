@@ -14,10 +14,6 @@ on:
         required: false
         type: string
         description: 'Generic kernel version - arm64 (e.g., 6.8.0-45)'
-      azure_kernel_version:
-        required: false
-        type: string
-        description: 'Azure kernel version - arm64 (e.g., 6.8.0-1014-azure)'
 
 jobs:
   build:
@@ -53,9 +49,6 @@ jobs:
         if [ ! -z "${{ inputs.kernel_version }}" ]; then
           BUILD_ARGS="$BUILD_ARGS --build-arg KERNEL_VERSION=${{ inputs.kernel_version }}"
         fi
-        if [ ! -z "${{ inputs.azure_kernel_version }}" ]; then
-          BUILD_ARGS="$BUILD_ARGS --build-arg AZURE_KERNEL_VERSION=${{ inputs.azure_kernel_version }}"
-        fi
         docker buildx create --use
         docker buildx build --platform linux/arm64 --file Dockerfile.arm64 \
           $BUILD_ARGS \
@@ -71,9 +64,6 @@ jobs:
         BUILD_ARGS=""
         if [ ! -z "${{ inputs.kernel_version }}" ]; then
           BUILD_ARGS="$BUILD_ARGS --build-arg KERNEL_VERSION=${{ inputs.kernel_version }}"
-        fi
-        if [ ! -z "${{ inputs.azure_kernel_version }}" ]; then
-          BUILD_ARGS="$BUILD_ARGS --build-arg AZURE_KERNEL_VERSION=${{ inputs.azure_kernel_version }}"
         fi
         docker buildx create --use
         docker buildx build --platform linux/arm64 --file Dockerfile.arm64 \

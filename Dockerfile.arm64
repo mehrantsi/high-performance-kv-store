@@ -1,29 +1,27 @@
 FROM ubuntu:latest AS builder
 
 ARG KERNEL_VERSION=6.8.0-45
-ARG AZURE_KERNEL_VERSION=6.8.0-1014-azure
 
 RUN apt-get update && \
-    apt-get install -y build-essential gcc-aarch64-linux-gnu wget
+    apt-get install -y build-essential gcc-aarch64-linux-gnu wget linux-headers-generic
 
 # Install ARM64 kernel headers
 RUN KERNEL_VERSION_MAIN=$(echo ${KERNEL_VERSION} | cut -d'-' -f1) && \
     KERNEL_VERSION_BUILD=$(echo ${KERNEL_VERSION} | cut -d'-' -f2) && \
     wget "http://ports.ubuntu.com/pool/main/l/linux/linux-headers-${KERNEL_VERSION}-generic_${KERNEL_VERSION}.${KERNEL_VERSION_BUILD}_arm64.deb" && \
-    mkdir -p "/usr/src/linux-headers-${AZURE_KERNEL_VERSION}" && \
-    dpkg -x "linux-headers-${KERNEL_VERSION}-generic_${KERNEL_VERSION}.${KERNEL_VERSION_BUILD}_arm64.deb" "/usr/src/linux-headers-${AZURE_KERNEL_VERSION}" && \
+    dpkg -x "linux-headers-${KERNEL_VERSION}-generic_${KERNEL_VERSION}.${KERNEL_VERSION_BUILD}_arm64.deb" /usr/src/linux-headers-${KERNEL_VERSION}-generic && \
     rm "linux-headers-${KERNEL_VERSION}-generic_${KERNEL_VERSION}.${KERNEL_VERSION_BUILD}_arm64.deb"
 
 COPY kernel /app/kernel
 WORKDIR /app/kernel
 
 # Debug: List contents of directories
-RUN ls -R /usr/src/linux-headers-${AZURE_KERNEL_VERSION} && \
+RUN ls -R /usr/src/linux-headers-${KERNEL_VERSION}-generic && \
     ls -R /app/kernel
 
 # Attempt to build the module
 RUN make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
-    -C "/usr/src/linux-headers-${AZURE_KERNEL_VERSION}/usr/src/linux-headers-${KERNEL_VERSION}-generic" \
+    -C /usr/src/linux-headers-${KERNEL_VERSION}-generic \
     M=$(pwd) modules || (echo "Make failed. Listing directory contents:" && ls -R)
 
 # Move the built module if successful
@@ -36,10 +34,7 @@ RUN if [ -f hpkv_module.ko ]; then \
 
 FROM ubuntu:latest
 
-ARG AZURE_KERNEL_VERSION=6.8.0-1014-azure
-
 COPY --from=builder /app/kernel/hpkv_module_arm64.ko /app/kernel/
-COPY --from=builder /app/kernel/hpkv_module_arm64.ko "/lib/modules/${AZURE_KERNEL_VERSION}/kernel/drivers/misc/"
 
 COPY Dockerfile.base /Dockerfile.base
 RUN sed '/^RUN cd \/app\/kernel/d' /Dockerfile.base > /Dockerfile && \
