@@ -1,7 +1,7 @@
 FROM ubuntu:latest AS builder
 
 RUN apt-get update && \
-    apt-get install -y build-essential linux-headers-generic
+    apt-get install -y build-essential linux-headers-$(uname -r)
 
 COPY kernel /app/kernel
 WORKDIR /app/kernel
