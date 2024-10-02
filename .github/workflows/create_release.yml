@@ -27,8 +27,16 @@ jobs:
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v2
 
-    - name: Build Docker Images (Auto)
-      if: ${{ inputs.tag_name == '' }}
+    - name: Set release tag
+      id: set_tag
+      run: |
+        if [ -n "${{ inputs.tag_name }}" ]; then
+          echo "RELEASE_TAG=${{ inputs.tag_name }}" >> $GITHUB_ENV
+        else
+          echo "RELEASE_TAG=${{ github.ref_name }}" >> $GITHUB_ENV
+        fi
+
+    - name: Build Docker Images
       run: |
         BUILD_ARGS=""
         if [ ! -z "${{ inputs.kernel_version }}" ]; then
@@ -37,138 +45,46 @@ jobs:
         docker buildx create --use
         docker buildx build --platform linux/arm64 --file Dockerfile.arm64 \
           $BUILD_ARGS \
-          --load -t hpkv-image:${{ github.ref_name }}-arm64 .
-        docker save hpkv-image:${{ github.ref_name }}-arm64 | gzip > hpkv-image-arm64.tar.gz
-        docker buildx build --platform linux/amd64 --file Dockerfile.amd64 --load -t hpkv-image:${{ github.ref_name }}-amd64 .
-        docker save hpkv-image:${{ github.ref_name }}-amd64 | gzip > hpkv-image-amd64.tar.gz
-        docker cp $(docker create hpkv-image:${{ github.ref_name }}-arm64):/app/kernel/hpkv_module_arm64.ko ./kernel/
-        docker cp $(docker create hpkv-image:${{ github.ref_name }}-amd64):/app/kernel/hpkv_module_x86_64.ko ./kernel/
+          --load -t hpkv-image:${{ env.RELEASE_TAG }}-arm64 .
+        docker save hpkv-image:${{ env.RELEASE_TAG }}-arm64 | gzip > hpkv-image-arm64.tar.gz
+        docker buildx build --platform linux/amd64 --file Dockerfile.amd64 --load -t hpkv-image:${{ env.RELEASE_TAG }}-amd64 .
+        docker save hpkv-image:${{ env.RELEASE_TAG }}-amd64 | gzip > hpkv-image-amd64.tar.gz
+        docker cp $(docker create hpkv-image:${{ env.RELEASE_TAG }}-arm64):/app/kernel/hpkv_module_arm64.ko ./kernel/
+        docker cp $(docker create hpkv-image:${{ env.RELEASE_TAG }}-amd64):/app/kernel/hpkv_module_x86_64.ko ./kernel/
 
-    - name: Build Docker Images (Manual)
-      if: ${{ inputs.tag_name != '' }}
-      run: |
-        BUILD_ARGS=""
-        if [ ! -z "${{ inputs.kernel_version }}" ]; then
-          BUILD_ARGS="$BUILD_ARGS --build-arg KERNEL_VERSION=${{ inputs.kernel_version }}"
-        fi
-        docker buildx create --use
-        docker buildx build --platform linux/arm64 --file Dockerfile.arm64 \
-          $BUILD_ARGS \
-          --load -t hpkv-image:${{ inputs.tag_name }}-arm64 .
-        docker save hpkv-image:${{ inputs.tag_name }}-arm64 | gzip > hpkv-image-arm64.tar.gz
-        docker buildx build --platform linux/amd64 --file Dockerfile.amd64 --load -t hpkv-image:${{ inputs.tag_name }}-amd64 .
-        docker save hpkv-image:${{ inputs.tag_name }}-amd64 | gzip > hpkv-image-amd64.tar.gz
-        docker cp $(docker create hpkv-image:${{ inputs.tag_name }}-arm64):/app/kernel/hpkv_module_arm64.ko ./kernel/
-        docker cp $(docker create hpkv-image:${{ inputs.tag_name }}-amd64):/app/kernel/hpkv_module_x86_64.ko ./kernel/
-
-    - name: Create Release (Auto)
-      id: create_release_auto
-      if: ${{ inputs.tag_name == '' }}
+    - name: Create Release
+      id: create_release
       uses: actions/create-release@v1
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        tag_name: ${{ github.ref }}
-        release_name: Release ${{ github.ref_name }}
+        tag_name: ${{ env.RELEASE_TAG }}
+        release_name: Release ${{ env.RELEASE_TAG }}
         draft: false
         prerelease: false
-    
-    - name: Create Release (Manual)
-      id: create_release_manual
-      if: ${{ inputs.tag_name != '' }}
-      uses: actions/create-release@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        tag_name: ${{ inputs.tag_name }}
-        release_name: Release ${{ inputs.tag_name }}
-        draft: false
-        prerelease: false
-    
-    - name: Upload x86-64 Kernel Module (Auto)
-      if: ${{ inputs.tag_name == '' }}
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release_auto.outputs.upload_url }}
-        asset_path: ./kernel/hpkv_module_x86_64.ko
-        asset_name: hpkv_module_x86_64.ko
-        asset_content_type: application/octet-stream
 
-    - name: Upload ARM64 Kernel Module (Auto)
-      if: ${{ inputs.tag_name == '' }}
+    - name: Upload Kernel Modules
       uses: actions/upload-release-asset@v1
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        upload_url: ${{ steps.create_release_auto.outputs.upload_url }}
-        asset_path: ./kernel/hpkv_module_arm64.ko
-        asset_name: hpkv_module_arm64.ko
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./kernel/hpkv_module_${{ matrix.arch }}.ko
+        asset_name: hpkv_module_${{ matrix.arch }}.ko
         asset_content_type: application/octet-stream
-    
-    - name: Upload x86-64 Kernel Module (Manual)
-      if: ${{ inputs.tag_name != '' }}
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release_manual.outputs.upload_url }}
-        asset_path: ./kernel/hpkv_module_x86_64.ko
-        asset_name: hpkv_module_x86_64.ko
-        asset_content_type: application/octet-stream
+      strategy:
+        matrix:
+          arch: [x86_64, arm64]
 
-    - name: Upload ARM64 Kernel Module (Manual)
-      if: ${{ inputs.tag_name != '' }}
+    - name: Upload Docker Images
       uses: actions/upload-release-asset@v1
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        upload_url: ${{ steps.create_release_manual.outputs.upload_url }}
-        asset_path: ./kernel/hpkv_module_arm64.ko
-        asset_name: hpkv_module_arm64.ko
-        asset_content_type: application/octet-stream
-    
-    - name: Upload Docker Image ARM64 (Auto)
-      if: ${{ inputs.tag_name == '' }}
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release_auto.outputs.upload_url }}
-        asset_path: ./hpkv-image-arm64.tar.gz
-        asset_name: hpkv-image-arm64.tar.gz
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./hpkv-image-${{ matrix.arch }}.tar.gz
+        asset_name: hpkv-image-${{ matrix.arch }}.tar.gz
         asset_content_type: application/gzip
-    
-    - name: Upload Docker Image AMD64 (Auto)
-      if: ${{ inputs.tag_name == '' }}
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release_auto.outputs.upload_url }}
-        asset_path: ./hpkv-image-amd64.tar.gz
-        asset_name: hpkv-image-amd64.tar.gz
-        asset_content_type: application/gzip
-    
-    - name: Upload Docker Image ARM64 (Manual)
-      if: ${{ inputs.tag_name != '' }}
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release_manual.outputs.upload_url }}
-        asset_path: ./hpkv-image-arm64.tar.gz
-        asset_name: hpkv-image-arm64.tar.gz
-        asset_content_type: application/gzip
-    
-    - name: Upload Docker Image AMD64 (Manual)
-      if: ${{ inputs.tag_name != '' }}
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release_manual.outputs.upload_url }}
-        asset_path: ./hpkv-image-amd64.tar.gz
-        asset_name: hpkv-image-amd64.tar.gz
-        asset_content_type: application/gzip
+      strategy:
+        matrix:
+          arch: [amd64, arm64]
