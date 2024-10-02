@@ -5,13 +5,39 @@ RUN apt-get update && \
 
 COPY kernel /app/kernel
 WORKDIR /app/kernel
-RUN make x86_64
+RUN make ARCH=x86
+
+# Move the built module if successful
+RUN if [ -f hpkv_module.ko ]; then \
+        mv hpkv_module.ko hpkv_module_x86_64.ko; \
+    else \
+        echo "hpkv_module.ko not found. Build likely failed."; \
+        exit 1; \
+    fi
 
 FROM ubuntu:latest
 
 COPY --from=builder /app/kernel/hpkv_module_x86_64.ko /app/kernel/
-COPY --from=builder /app/kernel/hpkv_module_x86_64.ko /lib/modules/$(uname -r)/kernel/drivers/misc/
 
-COPY Dockerfile.base /Dockerfile.base
-RUN sed '/^RUN cd \/app\/kernel/d' /Dockerfile.base > /Dockerfile && \
-    docker build -f /Dockerfile .
+# Copy other necessary files
+COPY api /app/api
+COPY start.sh /app/start.sh
+RUN chmod +x /app/start.sh
+
+# Install necessary packages
+RUN apt-get update && \
+    apt-get install -y nodejs npm kmod util-linux && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
+
+# Set up working directory
+WORKDIR /app
+
+# Install Node.js dependencies
+RUN cd /app/api && npm install
+
+# Expose the API port
+EXPOSE 80
+
+# Run the startup script
+CMD ["/app/start.sh"]

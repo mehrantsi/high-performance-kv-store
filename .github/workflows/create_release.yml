@@ -20,21 +20,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
-    
-    - name: Setup Dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install build-essential
-
-    - name: Setup x86_64 Kernel Headers
-      run: |
-        sudo apt-get install linux-headers-$(uname -r)
-
-    - name: Build x86-64 Kernel Module
-      run: |
-        make ARCH=x86
-        mv hpkv_module.ko hpkv_module_x86_64.ko
-      working-directory: ./kernel
 
     - name: Set up QEMU
       uses: docker/setup-qemu-action@v2
@@ -57,6 +42,7 @@ jobs:
         docker buildx build --platform linux/amd64 --file Dockerfile.amd64 --load -t hpkv-image:${{ github.ref_name }}-amd64 .
         docker save hpkv-image:${{ github.ref_name }}-amd64 | gzip > hpkv-image-amd64.tar.gz
         docker cp $(docker create hpkv-image:${{ github.ref_name }}-arm64):/app/kernel/hpkv_module_arm64.ko ./kernel/
+        docker cp $(docker create hpkv-image:${{ github.ref_name }}-amd64):/app/kernel/hpkv_module_x86_64.ko ./kernel/
 
     - name: Build Docker Images (Manual)
       if: ${{ inputs.tag_name != '' }}
@@ -73,7 +59,8 @@ jobs:
         docker buildx build --platform linux/amd64 --file Dockerfile.amd64 --load -t hpkv-image:${{ inputs.tag_name }}-amd64 .
         docker save hpkv-image:${{ inputs.tag_name }}-amd64 | gzip > hpkv-image-amd64.tar.gz
         docker cp $(docker create hpkv-image:${{ inputs.tag_name }}-arm64):/app/kernel/hpkv_module_arm64.ko ./kernel/
-    
+        docker cp $(docker create hpkv-image:${{ inputs.tag_name }}-amd64):/app/kernel/hpkv_module_x86_64.ko ./kernel/
+
     - name: Create Release (Auto)
       id: create_release_auto
       if: ${{ inputs.tag_name == '' }}
