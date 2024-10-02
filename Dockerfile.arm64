@@ -17,10 +17,22 @@ RUN KERNEL_VERSION_MAIN=$(echo ${KERNEL_VERSION} | cut -d'-' -f1) && \
 COPY kernel /app/kernel
 WORKDIR /app/kernel
 
+# Debug: List contents of directories
+RUN ls -R /usr/src/linux-headers-${AZURE_KERNEL_VERSION} && \
+    ls -R /app/kernel
+
+# Attempt to build the module
 RUN make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
     -C "/usr/src/linux-headers-${AZURE_KERNEL_VERSION}/usr/src/linux-headers-${KERNEL_VERSION}-generic" \
-    M=$(pwd) modules && \
-    mv hpkv_module.ko hpkv_module_arm64.ko
+    M=$(pwd) modules || (echo "Make failed. Listing directory contents:" && ls -R)
+
+# Move the built module if successful
+RUN if [ -f hpkv_module.ko ]; then \
+        mv hpkv_module.ko hpkv_module_arm64.ko; \
+    else \
+        echo "hpkv_module.ko not found. Build likely failed."; \
+        exit 1; \
+    fi
 
 FROM ubuntu:latest
 
