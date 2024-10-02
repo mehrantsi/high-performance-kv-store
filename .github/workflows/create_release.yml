@@ -36,7 +36,9 @@ jobs:
     - name: Setup ARM64 Kernel Headers
       run: |
         wget http://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/linux-headers-6.8.0-45-generic_6.8.0-45.45_arm64.deb
+        wget http://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/linux-headers-6.8.0-45_6.8.0-45.45_all.deb
         mkdir -p arm64-headers
+        dpkg-deb -x linux-headers-6.8.0-45_6.8.0-45.45_all.deb arm64-headers
         dpkg-deb -x linux-headers-6.8.0-45-generic_6.8.0-45.45_arm64.deb arm64-headers
         echo "KDIR_ARM64=$PWD/arm64-headers/usr/src/linux-headers-6.8.0-45-generic" >> $GITHUB_ENV
 
