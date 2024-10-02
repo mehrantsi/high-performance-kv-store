@@ -54,6 +54,16 @@ jobs:
         docker cp $(docker create hpkv-image:${{ env.RELEASE_TAG }}-arm64):/app/kernel/hpkv_module_arm64.ko ./kernel/
         docker cp $(docker create hpkv-image:${{ env.RELEASE_TAG }}-amd64):/app/kernel/hpkv_module_x86_64.ko ./kernel/
 
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v2
+      with:
+        name: release-assets
+        path: |
+          ./kernel/hpkv_module_x86_64.ko
+          ./kernel/hpkv_module_arm64.ko
+          ./hpkv-image-amd64.tar.gz
+          ./hpkv-image-arm64.tar.gz
+
     - name: Create Release
       id: create_release
       uses: actions/create-release@v1
@@ -72,10 +82,10 @@ jobs:
       matrix:
         include:
           - asset_name: hpkv_module_x86_64.ko
-            asset_path: ./kernel/hpkv_module_x86_64.ko
+            asset_path: ./hpkv_module_x86_64.ko
             content_type: application/octet-stream
           - asset_name: hpkv_module_arm64.ko
-            asset_path: ./kernel/hpkv_module_arm64.ko
+            asset_path: ./hpkv_module_arm64.ko
             content_type: application/octet-stream
           - asset_name: hpkv-image-amd64.tar.gz
             asset_path: ./hpkv-image-amd64.tar.gz
@@ -85,6 +95,11 @@ jobs:
             content_type: application/gzip
 
     steps:
+    - name: Download Artifacts
+      uses: actions/download-artifact@v2
+      with:
+        name: release-assets
+
     - name: Upload Release Asset
       uses: actions/upload-release-asset@v1
       env:
