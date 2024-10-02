@@ -82,16 +82,16 @@ jobs:
       matrix:
         include:
           - asset_name: hpkv_module_x86_64.ko
-            asset_path: ./hpkv_module_x86_64.ko
+            asset_path: kernel/hpkv_module_x86_64.ko
             content_type: application/octet-stream
           - asset_name: hpkv_module_arm64.ko
-            asset_path: ./hpkv_module_arm64.ko
+            asset_path: kernel/hpkv_module_arm64.ko
             content_type: application/octet-stream
           - asset_name: hpkv-image-amd64.tar.gz
-            asset_path: ./hpkv-image-amd64.tar.gz
+            asset_path: hpkv-image-amd64.tar.gz
             content_type: application/gzip
           - asset_name: hpkv-image-arm64.tar.gz
-            asset_path: ./hpkv-image-arm64.tar.gz
+            asset_path: hpkv-image-arm64.tar.gz
             content_type: application/gzip
 
     steps:
@@ -99,6 +99,7 @@ jobs:
       uses: actions/download-artifact@v4
       with:
         name: release-assets
+        path: artifacts
 
     - name: Upload Release Asset
       uses: actions/upload-release-asset@v1
@@ -106,6 +107,6 @@ jobs:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
         upload_url: ${{ needs.build.outputs.upload_url }}
-        asset_path: ${{ matrix.asset_path }}
+        asset_path: artifacts/${{ matrix.asset_path }}
         asset_name: ${{ matrix.asset_name }}
         asset_content_type: ${{ matrix.content_type }}
