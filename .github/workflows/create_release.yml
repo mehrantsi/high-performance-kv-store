@@ -33,13 +33,13 @@ jobs:
         make clean
       working-directory: ./kernel
 
-    - name: Setup ARM64 Kernel Sources
+    - name: Setup and Build ARM64 Kernel
       run: |
         wget https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.8.tar.xz
         tar xf linux-6.8.tar.xz
         cd linux-6.8
         make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
-        make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_prepare
+        make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) modules
         echo "KDIR_ARM64=$PWD" >> $GITHUB_ENV
 
     - name: Build ARM64 Kernel Module
