@@ -5,7 +5,6 @@ const fs = require('fs').promises;
 const ioctl = require('ioctl');
 const { body, param, validationResult } = require('express-validator');
 const rateLimit = require('express-rate-limit');
-const config = require('./config.json'); // Load configuration file
 const cluster = require('cluster');
 const os = require('os');
 const fsSync = require('fs');
@@ -36,6 +35,26 @@ if (cluster.isMaster) {
     });
 } else {
     const app = express();
+
+    // Load configuration file
+    let config;
+    try {
+        config = require('./config.local');
+        console.log('Loaded configuration from config.local.json');
+    } catch (error) {
+        if (error.code === 'MODULE_NOT_FOUND') {
+            try {
+                config = require('./config');
+                console.log('Loaded configuration from config.json');
+            } catch (innerError) {
+                console.error('Error loading configuration:', innerError);
+                process.exit(1);
+            }
+        } else {
+            console.error('Error loading configuration:', error);
+            process.exit(1);
+        }
+    }
 
     app.use(bodyParser.json());
 
