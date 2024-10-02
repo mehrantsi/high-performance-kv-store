@@ -18,6 +18,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
     steps:
     - uses: actions/checkout@v4
 
@@ -63,28 +65,32 @@ jobs:
         draft: false
         prerelease: false
 
-    - name: Upload Kernel Modules
-      uses: actions/upload-release-asset@v1
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ./kernel/hpkv_module_${{ matrix.arch }}.ko
-        asset_name: hpkv_module_${{ matrix.arch }}.ko
-        asset_content_type: application/octet-stream
-      strategy:
-        matrix:
-          arch: [x86_64, arm64]
+  upload_assets:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - asset_name: hpkv_module_x86_64.ko
+            asset_path: ./kernel/hpkv_module_x86_64.ko
+            content_type: application/octet-stream
+          - asset_name: hpkv_module_arm64.ko
+            asset_path: ./kernel/hpkv_module_arm64.ko
+            content_type: application/octet-stream
+          - asset_name: hpkv-image-amd64.tar.gz
+            asset_path: ./hpkv-image-amd64.tar.gz
+            content_type: application/gzip
+          - asset_name: hpkv-image-arm64.tar.gz
+            asset_path: ./hpkv-image-arm64.tar.gz
+            content_type: application/gzip
 
-    - name: Upload Docker Images
+    steps:
+    - name: Upload Release Asset
       uses: actions/upload-release-asset@v1
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       with:
-        upload_url: ${{ steps.create_release.outputs.upload_url }}
-        asset_path: ./hpkv-image-${{ matrix.arch }}.tar.gz
-        asset_name: hpkv-image-${{ matrix.arch }}.tar.gz
-        asset_content_type: application/gzip
-      strategy:
-        matrix:
-          arch: [amd64, arm64]
+        upload_url: ${{ needs.build.outputs.upload_url }}
+        asset_path: ${{ matrix.asset_path }}
+        asset_name: ${{ matrix.asset_name }}
+        asset_content_type: ${{ matrix.content_type }}
