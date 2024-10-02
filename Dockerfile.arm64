@@ -5,7 +5,8 @@ RUN apt-get update && \
 
 COPY kernel /app/kernel
 WORKDIR /app/kernel
-RUN make arm64
+RUN make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -C /usr/src/linux-headers-$(uname -r) M=$(pwd) modules && \
+    mv hpkv_module.ko hpkv_module_arm64.ko
 
 FROM ubuntu:latest
 

@@ -1,16 +1,23 @@
 obj-m += hpkv_module.o
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
+ARCH ?= $(shell uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/')
 
-all: x86_64 arm64
+ifeq ($(ARCH),arm64)
+    ifeq ($(shell uname -m),aarch64)
+        # Native ARM64 build
+        CROSS_COMPILE ?=
+    else
+        # Cross-compilation for ARM64
+        CROSS_COMPILE ?= aarch64-linux-gnu-
+    endif
+endif
 
-x86_64:
-	$(MAKE) -C $(KDIR) M=$(PWD) modules
+all: build
 
-arm64:
-	$(MAKE) ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -C $(KDIR) M=$(PWD) modules
+build:
+	$(MAKE) -C $(KDIR) M=$(PWD) ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) modules
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
-	rm -f hpkv_module_x86_64.ko hpkv_module_arm64.ko
 	rm -f *.o *.ko *.mod.c *.mod *.symvers *.order

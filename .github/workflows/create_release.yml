@@ -19,7 +19,7 @@ jobs:
     - name: Setup Dependencies
       run: |
         sudo apt-get update
-        sudo apt-get install build-essential gcc-aarch64-linux-gnu
+        sudo apt-get install build-essential
 
     - name: Setup x86_64 Kernel Headers
       run: |
@@ -27,33 +27,10 @@ jobs:
 
     - name: Build x86-64 Kernel Module
       run: |
-        make x86_64
+        make ARCH=x86
         mv hpkv_module.ko hpkv_module_x86_64.ko
-        mv hpkv_module_x86_64.ko ../
-        make clean
       working-directory: ./kernel
 
-    - name: Setup ARM64 Kernel Headers
-      run: |
-        wget http://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/linux-headers-6.8.0-45-generic_6.8.0-45.45_arm64.deb
-        wget http://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/linux-headers-6.8.0-45_6.8.0-45.45_all.deb
-        mkdir -p arm64-headers
-        dpkg-deb -x linux-headers-6.8.0-45_6.8.0-45.45_all.deb arm64-headers
-        dpkg-deb -x linux-headers-6.8.0-45-generic_6.8.0-45.45_arm64.deb arm64-headers
-        echo "KDIR_ARM64=$PWD/arm64-headers/usr/src/linux-headers-6.8.0-45-generic" >> $GITHUB_ENV
-
-    - name: Build ARM64 Kernel Module
-      run: |
-        make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -C ${{ env.KDIR_ARM64 }} M=$(pwd) modules
-        mv hpkv_module.ko hpkv_module_arm64.ko
-        mv hpkv_module_arm64.ko ../
-      working-directory: ./kernel
-    
-    - name: Move Kernel Modules Back
-      run: |
-        mv ../hpkv_module_x86_64.ko ./kernel/
-        mv ../hpkv_module_arm64.ko ./kernel/
-    
     - name: Set up QEMU
       uses: docker/setup-qemu-action@v2
 
@@ -68,6 +45,7 @@ jobs:
         docker save hpkv-image:${{ github.ref_name }}-arm64 | gzip > hpkv-image-arm64.tar.gz
         docker buildx build --platform linux/amd64 --file Dockerfile.amd64 --load -t hpkv-image:${{ github.ref_name }}-amd64 .
         docker save hpkv-image:${{ github.ref_name }}-amd64 | gzip > hpkv-image-amd64.tar.gz
+        docker cp $(docker create hpkv-image:${{ github.ref_name }}-arm64):/app/kernel/hpkv_module_arm64.ko ./kernel/
 
     - name: Build Docker Images (Manual)
       if: ${{ inputs.tag_name != '' }}
@@ -77,6 +55,7 @@ jobs:
         docker save hpkv-image:${{ inputs.tag_name }}-arm64 | gzip > hpkv-image-arm64.tar.gz
         docker buildx build --platform linux/amd64 --file Dockerfile.amd64 --load -t hpkv-image:${{ inputs.tag_name }}-amd64 .
         docker save hpkv-image:${{ inputs.tag_name }}-amd64 | gzip > hpkv-image-amd64.tar.gz
+        docker cp $(docker create hpkv-image:${{ inputs.tag_name }}-arm64):/app/kernel/hpkv_module_arm64.ko ./kernel/
     
     - name: Create Release (Auto)
       id: create_release_auto
