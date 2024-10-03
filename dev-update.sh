@@ -1,7 +1,12 @@
 #!/bin/bash
 
+# Fetch the latest version from GitHub
+fetch_latest_version() {
+    curl -s https://api.github.com/repos/mehrantsi/high-performance-kv-store/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/'
+}
+
 # Set the default version variable
-DEFAULT_VERSION="v1.2-docker"
+DEFAULT_VERSION=$(fetch_latest_version)
 VERSION=${1:-$DEFAULT_VERSION}
 
 # Determine the host system
@@ -62,7 +67,7 @@ update_in_qemu() {
     fi
 
     echo "Copying files to QEMU VM..."
-    sshpass -p "ubuntu" scp -P 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null kernel/hpkv_module.c kernel/Makefile api/server.js ubuntu@localhost:~
+    sshpass -p "ubuntu" scp -P 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null kernel/hpkv_module.c kernel/Makefile api/server.js start.sh ubuntu@localhost:~
 
     echo "Building kernel module in QEMU VM..."
     sshpass -p "ubuntu" ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o PreferredAuthentications=password -o PubkeyAuthentication=no ubuntu@localhost << EOF

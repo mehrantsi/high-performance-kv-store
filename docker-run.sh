@@ -1,7 +1,12 @@
 #!/bin/bash
 
+# Fetch the latest version from GitHub
+fetch_latest_version() {
+    curl -s https://api.github.com/repos/mehrantsi/high-performance-kv-store/releases/latest | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/'
+}
+
 # Set the default version variable
-DEFAULT_VERSION="v1.2-docker"
+DEFAULT_VERSION=$(fetch_latest_version)
 CLEAN_START=false
 DEV_MODE=false
 
