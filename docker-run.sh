@@ -3,12 +3,17 @@
 # Set the default version variable
 DEFAULT_VERSION="v1.2-docker"
 CLEAN_START=false
+DEV_MODE=false
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
         --clean-start)
             CLEAN_START=true
+            shift
+            ;;
+        --dev-mode)
+            DEV_MODE=true
             shift
             ;;
         *)
@@ -159,7 +164,8 @@ EOF
     trap graceful_shutdown EXIT INT TERM
 
     graceful_shutdown() {
-        echo "Initiating graceful shutdown..."
+
+        echo "Initiating graceful shutdown and cleanup..."
         
         # Stop the Docker container
         sshpass -p "ubuntu" ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@localhost "sudo docker stop hpkv-container" || true
@@ -211,18 +217,8 @@ EOF
 
             # Check if the correct version of the image already exists
             if sudo docker image inspect "hpkv-image:${VERSION}-\${DOCKER_ARCH}" &> /dev/null; then
-                echo "Docker image hpkv-image:${VERSION}-\${DOCKER_ARCH} already exists. Skipping download."
+                echo "Docker image hpkv-image:${VERSION}-\${DOCKER_ARCH} exists locally."
             else
-                # Remove old image if it exists but version or arch doesn't match
-                if sudo docker image inspect "hpkv-image" &> /dev/null; then
-                    OLD_VERSION=\$(sudo docker image inspect -f '{{.RepoTags}}' "hpkv-image" | grep -oP '(?<=:)[^-]+(?=-)')
-                    OLD_ARCH=\$(sudo docker image inspect -f '{{.RepoTags}}' "hpkv-image" | grep -oP '(?<=-)[^]]+(?=])')
-                    if [ "\$OLD_VERSION" != "${VERSION}" ] || [ "\$OLD_ARCH" != "\${DOCKER_ARCH}" ]; then
-                        echo "Removing old image with mismatched version or architecture..."
-                        sudo docker rmi "hpkv-image:\$OLD_VERSION-\$OLD_ARCH" || true
-                    fi
-                fi
-
                 echo "Downloading Docker image..."
                 wget "https://github.com/mehrantsi/high-performance-kv-store/releases/download/${VERSION}/hpkv-image-\${DOCKER_ARCH}.tar.gz"
                 echo "Loading Docker image..."
@@ -230,56 +226,63 @@ EOF
                 rm hpkv-image-\${DOCKER_ARCH}.tar.gz
             fi
 
+            # Always use the latest local image for the specified version
+            LATEST_IMAGE_ID=\$(sudo docker images "hpkv-image:${VERSION}-\${DOCKER_ARCH}" --format "{{.ID}}" | head -n 1)
+            
             # Stop existing container if running
             sudo docker stop hpkv-container || true
+            echo "Waiting for container to stop..."
+            while sudo docker ps | grep -q hpkv-container; do
+                sleep 1
+            done
             sudo docker rm hpkv-container || true
+            echo "Waiting for container to be removed..."
+            while sudo docker ps -a | grep -q hpkv-container; do
+                sleep 1
+            done
 
-            echo "Running Docker container..."
-            sudo docker run --rm \
+            echo "Running Docker container with the latest image..."
+            sudo docker run -d --rm \
               --name hpkv-container \
               --privileged \
               --device /dev/loop-control:/dev/loop-control \
               -p 3000:3000 \
-              "hpkv-image:${VERSION}-\${DOCKER_ARCH}"
+              "\$LATEST_IMAGE_ID"
             
-            # Add this line to detect when the container exits
-            echo "Container has exited."
+            echo "Waiting for container to start..."
+            while ! sudo docker ps | grep -q hpkv-container; do
+                sleep 1
+            done
+
+            if [ ! "$DEV_MODE" ]; then
+                echo "Container started. Attaching to logs..."
+                (sudo docker logs -f hpkv-container & echo $! >&3) 3>docker_logs_pid
+                DOCKER_LOGS_PID=$(cat docker_logs_pid)
+                wait $DOCKER_LOGS_PID
+            fi
 EOF
     }
 
     # Run the setup and container function
     run_setup_and_container
 
-    # Check the exit status of the SSH command
-    SSH_EXIT_STATUS=$?
-
-    if [ $SSH_EXIT_STATUS -eq 1 ]; then
-        echo "VM is rebooting. Waiting for it to come back online..."
-        sleep 30
-        for i in {1..60}; do
-            if sshpass -p "ubuntu" ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@localhost "exit" 2>/dev/null; then
-                echo "VM is back online. Continuing setup..."
-                run_setup_and_container
-                SSH_EXIT_STATUS=$?
-                break
-            fi
-            sleep 5
-        done
-        if [ $i -eq 60 ]; then
-            echo "Failed to reconnect to VM after reboot. Exiting."
-            exit 1
-        fi
-    fi
-
-    if [ $SSH_EXIT_STATUS -eq 0 ]; then
-        echo "Container has exited normally. Initiating cleanup..."
-        graceful_shutdown
-    elif [ $SSH_EXIT_STATUS -eq 255 ]; then
-        echo "SSH connection closed unexpectedly. This might be due to Ctrl+C. Initiating cleanup..."
-        graceful_shutdown
+    if [ $DEV_MODE ]; then
+        echo "Developer mode is active. Entering SSH shell..."
+        sshpass -p "ubuntu" ssh -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null ubuntu@localhost
     else
-        echo "An error occurred. Exit status: $SSH_EXIT_STATUS. Initiating cleanup..."
-        graceful_shutdown
+        # Check the exit status of the SSH command
+        SSH_EXIT_STATUS=$?
+
+        if [ $SSH_EXIT_STATUS -eq 0 ]; then
+            echo "Container has exited normally. Initiating cleanup..."
+            graceful_shutdown
+        elif [ $SSH_EXIT_STATUS -eq 255 ]; then
+            echo "SSH connection closed unexpectedly. This might be due to Ctrl+C. Initiating cleanup..."
+            graceful_shutdown
+        else
+            echo "An error occurred. Exit status: $SSH_EXIT_STATUS. Initiating cleanup..."
+            graceful_shutdown
+        fi
     fi
 
 else
@@ -320,7 +323,15 @@ else
 
     # Stop existing container if running
     docker stop hpkv-container || true
+    echo "Waiting for container to stop..."
+    while docker ps | grep -q hpkv-container; do
+        sleep 1
+    done
     docker rm hpkv-container || true
+    echo "Waiting for container to be removed..."
+    while docker ps -a | grep -q hpkv-container; do
+        sleep 1
+    done
 
     echo "Running Docker container..."
     docker run --rm \
