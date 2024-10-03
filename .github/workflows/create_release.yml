@@ -46,6 +46,13 @@ jobs:
           echo "KERNEL_VERSION=6.8.0-45" >> $GITHUB_ENV
         fi
 
+    # Add these diagnostic steps
+    - name: Check kernel version
+      run: uname -r
+
+    - name: Check GCC version
+      run: gcc --version
+
     - name: Build Docker Images
       run: |
         docker buildx create --use
@@ -59,6 +66,20 @@ jobs:
         docker save hpkv-image:${{ env.RELEASE_TAG }}-amd64 | gzip > hpkv-image-amd64.tar.gz
         docker cp $(docker create hpkv-image:${{ env.RELEASE_TAG }}-arm64):/app/kernel/hpkv_module_arm64.ko ./kernel/
         docker cp $(docker create hpkv-image:${{ env.RELEASE_TAG }}-amd64):/app/kernel/hpkv_module_x86_64.ko ./kernel/
+
+    # Add these steps to print build environment details
+    - name: Print amd64 build environment details
+      run: |
+        docker run --rm hpkv-image:${{ env.RELEASE_TAG }}-amd64 /bin/bash -c "
+          echo 'Build environment:' && 
+          uname -a && 
+          gcc --version && 
+          echo KERNEL_VERSION=\$KERNEL_VERSION
+        "
+
+    - name: Print amd64 module info
+      run: |
+        docker run --rm hpkv-image:${{ env.RELEASE_TAG }}-amd64 modinfo /app/kernel/hpkv_module_x86_64.ko
 
     - name: Upload Artifacts
       uses: actions/upload-artifact@v4
