@@ -48,7 +48,7 @@
 #define SECTORS_BITMAP_SIZE (MAX_DEVICE_SIZE / HPKV_BLOCK_SIZE)
 #define WORK_TIMEOUT_MS 5000  // 5 seconds timeout for individual work items
 
-MODULE_LICENSE("AGPL");
+MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Mehran Toosi");
 MODULE_DESCRIPTION("High performance KV store kernel module, with advanced features");
 MODULE_VERSION("1.2");
