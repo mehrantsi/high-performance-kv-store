@@ -26,9 +26,6 @@ jobs:
     - name: Set up QEMU
       uses: docker/setup-qemu-action@v2
 
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v2
-
     - name: Set release tag and kernel version
       run: |
         if [ -n "${{ inputs.tag_name }}" ]; then
@@ -47,11 +44,9 @@ jobs:
             ubuntu:latest \
             /bin/bash -c "
               apt-get update && apt-get install -y docker.io
-              docker buildx create --name mybuilder || true
-              docker buildx use mybuilder
-              docker buildx build --platform linux/$arch --file Dockerfile.$arch \
+              docker build --platform linux/$arch --file Dockerfile.$arch \
                 --build-arg KERNEL_VERSION=${{ env.KERNEL_VERSION }} \
-                --load -t hpkv-image:${{ env.RELEASE_TAG }}-$arch .
+                -t hpkv-image:${{ env.RELEASE_TAG }}-$arch .
             "
           docker save hpkv-image:${{ env.RELEASE_TAG }}-$arch | gzip > hpkv-image-$arch.tar.gz
         done
