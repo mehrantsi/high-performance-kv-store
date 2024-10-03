@@ -94,6 +94,7 @@ update_in_qemu() {
 
         sudo docker cp hpkv_module_x86_64.ko hpkv-container:/app/kernel/
         sudo docker cp ~/server.js hpkv-container:/app/api/
+        sudo docker cp ~/start.sh hpkv-container:/app/
         sudo docker exec hpkv-container /bin/bash -c "cd /app/api && npm install"
         
         # Remove old images
