@@ -43,6 +43,12 @@ losetup $LOOP_DEVICE /app/hpkv_disk.img
 cd /app/kernel
 insmod hpkv_module_${MODULE_ARCH}.ko mount_path=$LOOP_DEVICE
 
+# Create the device node
+mknod /dev/hpkv c $(cat /proc/devices | grep hpkv | cut -d' ' -f1) 0
+
+# Set permissions for the device node
+chmod 666 /dev/hpkv
+
 # Start the Node.js server
 cd /app/api
 node server.js &
@@ -54,6 +60,8 @@ cleanup() {
     pkill -f "node server.js"
     # Unload the kernel module
     rmmod hpkv_module
+    # Remove the device node
+    rm -f /dev/hpkv
     # Remove any leftover loop devices
     losetup -D
 }
