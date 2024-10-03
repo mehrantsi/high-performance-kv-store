@@ -77,7 +77,128 @@ For a detailed technical design of the HPKV module, please refer to the [Technic
 
 ## Getting Started
 
-### Prerequisites
+### Running with Docker
+
+HPKV can be run using Docker containers, which simplifies setup and ensures consistency across different environments. There are two main scripts to manage the HPKV environment: `docker-run.sh` and `dev-update.sh`.
+
+#### docker-run.sh
+
+This script sets up and runs the HPKV Docker container. It supports both Linux and macOS environments.
+
+##### Basic Usage:
+
+```sh
+./docker-run.sh [VERSION]
+```
+
+If no version is specified, it defaults to the latest version available on GitHub.
+
+##### Options:
+
+- `--clean-start`: Performs a clean start by removing QEMU-related files (macOS only).
+- `--dev-mode`: Enters developer mode, providing an SSH shell for direct interaction with the VM (macOS only).
+
+##### Scenarios:
+
+1. **Standard Run (Linux):**
+   ```sh
+   ./docker-run.sh
+   ```
+   This will download the Docker image (if not present), start the HPKV container, and attach to its logs.
+
+2. **Specific Version (Linux/macOS):**
+   ```sh
+   ./docker-run.sh v1.3-docker
+   ```
+   Runs the specified version of the HPKV image.
+
+3. **Clean Start on macOS:**
+   ```sh
+   ./docker-run.sh --clean-start
+   ```
+   Removes existing QEMU files before starting the VM and container.
+
+4. **Developer Mode on macOS:**
+   ```sh
+   ./docker-run.sh --dev-mode
+   ```
+   Starts the VM and container, then provides an SSH shell for development.
+
+##### macOS Specifics:
+
+On macOS, the script sets up a QEMU VM running Ubuntu, which then hosts the Docker container. This approach allows kernel module development on macOS.
+
+#### dev-update.sh
+
+This script facilitates rapid development by updating the HPKV module and API server without rebuilding the entire Docker image.
+
+##### Usage:
+
+```sh
+./dev-update.sh [VERSION]
+```
+
+If no version is specified, it defaults to the latest version available on GitHub.
+
+##### Functionality:
+
+1. Copies updated `hpkv_module.c`, `Makefile`, `start.sh` and `server.js` files to the container.
+2. Rebuilds the kernel module inside the container.
+3. Updates the API server code.
+4. Commits changes to a new Docker image.
+5. Restarts the container with the updated image.
+
+##### Scenarios:
+
+1. **Quick Update During Development:**
+   After making changes to the kernel module or API server:
+   ```sh
+   ./dev-update.sh
+   ```
+   This updates the running container with your latest changes.
+
+2. **Update Specific Version:**
+   ```sh
+   ./dev-update.sh v1.3-docker
+   ```
+   Updates the specified version of the HPKV image.
+
+#### Kernel Development on macOS
+
+For kernel development on macOS, use the following workflow:
+
+1. Start the environment in dev-mode:
+   ```sh
+   ./docker-run.sh --dev-mode
+   ```
+
+2. Make changes to `kernel/hpkv_module.c` or `api/server.js` on your host machine.
+
+3. Run the dev-update script to apply changes:
+   ```sh
+   ./dev-update.sh
+   ```
+
+4. To view the container logs:
+   ```sh
+   docker logs -f hpkv-container
+   ```
+
+5. To view the kernel module logs:
+   ```sh
+   sudo dmesg --follow
+   ```
+
+##### Notes
+
+- On macOS, the scripts will automatically install necessary dependencies like QEMU and sshpass if they're not present.
+- In developer mode, exiting the SSH shell shuts down the VM and performs an automatic cleanup.
+
+By using these scripts, you can perform rapid development iterations.
+
+### Local Compilation and Installation
+
+#### Prerequisites
 
 - Linux kernel version 6.8.0-xx
 - GCC
@@ -88,7 +209,7 @@ For a detailed technical design of the HPKV module, please refer to the [Technic
 > 
 > HPKV performs low-level disk operations and does not use traditional filesystems. it automatically checks for a valid HPKV signature on the disk and can also initialize the disk if it is empty. Make sure you're attaching a dedicated, unformatted disk to HPKV.
 
-### Compilation and Installation
+#### Compilation and Installation Steps
 
 1. Clone the repository:
    ```sh
@@ -166,92 +287,6 @@ For a detailed technical design of the HPKV module, please refer to the [Technic
    sudo rm /dev/hpkv
    ```
 
-### Usage
-
-After loading the module and creating the device node, you can interact with it through the `/dev/hpkv` device file. Use standard file operations to read and write data.
-
-#### Example Usage in C
-
-```c
-#include <fcntl.h>
-#include <unistd.h>
-#include <string.h>
-#include <stdio.h>
-#include <sys/ioctl.h>
-
-#define HPKV_IOCTL_GET 0
-#define HPKV_IOCTL_DELETE 1
-
-int main() {
-    int fd = open("/dev/hpkv", O_RDWR);
-    if (fd < 0) {
-        perror("Failed to open device");
-        return 1;
-    }
-
-    // Write a key-value pair
-    char *data = "mykey:myvalue";
-    write(fd, data, strlen(data));
-
-    // Read a value by key
-    char buffer[1024];
-    strcpy(buffer, "mykey");
-    if (ioctl(fd, HPKV_IOCTL_GET, buffer) == 0) {
-        printf("Value: %s\n", buffer);
-    }
-
-    // Delete a key-value pair
-    if (ioctl(fd, HPKV_IOCTL_DELETE, "mykey") == 0) {
-        printf("Key 'mykey' deleted successfully\n");
-    } else {
-        perror("Failed to delete key");
-    }
-
-    close(fd);
-    return 0;
-}
-```
-
-Compile and run your program with:
-
-```sh
-gcc -o myprogram myprogram.c
-./myprogram
-```
-
-> [!NOTE]
->
-> Depending on the permissions you set for the device node, you may need to run the program with sudo.
-
-#### Example Usage from Terminal
-
-1. **Insert/Update a key-value pair:**
-
-   ```sh
-   echo -n "mykey:myvalue" | sudo dd of=/dev/hpkv
-   ```
-
-2. **Read a value by key:**
-
-   ```sh
-   sudo cat /dev/hpkv | grep "mykey:"
-   ```
-   > FOR TESTING PURPOSE ONLY! This command will return the entire content of the device, including all key-value pairs. If you have a large dataset, this may take a while.
-
-3. **Delete a key-value pair:**
-
-   > This command is executed via ioctl and must be done via a program, not a shell command.
-
-4. **Partial update of a key-value pair:**
-
-   ```sh
-   echo -n "mykey:+partialupdate" | sudo dd of=/dev/hpkv
-   ```
-
-## Contributing
-
-We welcome contributions!
-
 ## License
 
-HPKV is released under the GNU General Public License v2.0 (GPLv2). See [License](LICENSE) for more details.
+HPKV is released under the GNU AFFERO GENERAL PUBLIC LICENSE (AGPLv3). See [License](LICENSE) for more details.
