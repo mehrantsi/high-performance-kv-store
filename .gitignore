@@ -5,3 +5,11 @@
 /api/config.local.json
 /api/.env
 /user/config.py
+cloud-init.cfg
+cloud-init.iso
+meta-data
+user-data
+ubuntu*
+qemu_output.log
+output.log
+user/__pycache__/config.cpython-312.pyc

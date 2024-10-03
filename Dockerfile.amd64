@@ -1,11 +1,24 @@
 FROM ubuntu:latest AS builder
 
+ARG KERNEL_VERSION=6.8.0-45
+
 RUN apt-get update && \
-    apt-get install -y build-essential linux-headers-$(uname -r)
+    apt-get install -y build-essential gcc wget linux-headers-generic
+
+# Install AMD64 kernel headers
+RUN KERNEL_VERSION_MAIN=$(echo ${KERNEL_VERSION} | cut -d'-' -f1) && \
+    KERNEL_VERSION_BUILD=$(echo ${KERNEL_VERSION} | cut -d'-' -f2) && \
+    wget "http://security.ubuntu.com/ubuntu/pool/main/l/linux/linux-headers-${KERNEL_VERSION}-generic_${KERNEL_VERSION}.${KERNEL_VERSION_BUILD}_amd64.deb" && \
+    dpkg -x "linux-headers-${KERNEL_VERSION}-generic_${KERNEL_VERSION}.${KERNEL_VERSION_BUILD}_amd64.deb" /usr/src/linux-headers-${KERNEL_VERSION}-generic && \
+    rm "linux-headers-${KERNEL_VERSION}-generic_${KERNEL_VERSION}.${KERNEL_VERSION_BUILD}_amd64.deb"
 
 COPY kernel /app/kernel
 WORKDIR /app/kernel
-RUN make ARCH=x86
+
+# Attempt to build the module
+RUN make \
+    -C /usr/src/linux-headers-${KERNEL_VERSION}-generic \
+    M=$(pwd) modules || (echo "Make failed. Listing directory contents:" && ls -R)
 
 # Move the built module if successful
 RUN if [ -f hpkv_module.ko ]; then \
