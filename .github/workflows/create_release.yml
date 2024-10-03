@@ -13,7 +13,7 @@ on:
       kernel_version:
         required: false
         type: string
-        description: 'Generic kernel version - arm64 (e.g., 6.8.0-45)'
+        description: 'Generic kernel version (e.g., 6.8.0-45)'
 
 jobs:
   build:
@@ -38,18 +38,24 @@ jobs:
           echo "RELEASE_TAG=${{ github.ref_name }}" >> $GITHUB_ENV
         fi
 
+    - name: Set kernel version
+      run: |
+        if [ -n "${{ inputs.kernel_version }}" ]; then
+          echo "KERNEL_VERSION=${{ inputs.kernel_version }}" >> $GITHUB_ENV
+        else
+          echo "KERNEL_VERSION=6.8.0-45" >> $GITHUB_ENV
+        fi
+
     - name: Build Docker Images
       run: |
-        BUILD_ARGS=""
-        if [ ! -z "${{ inputs.kernel_version }}" ]; then
-          BUILD_ARGS="$BUILD_ARGS --build-arg KERNEL_VERSION=${{ inputs.kernel_version }}"
-        fi
         docker buildx create --use
         docker buildx build --platform linux/arm64 --file Dockerfile.arm64 \
-          $BUILD_ARGS \
+          --build-arg KERNEL_VERSION=${{ env.KERNEL_VERSION }} \
           --load -t hpkv-image:${{ env.RELEASE_TAG }}-arm64 .
         docker save hpkv-image:${{ env.RELEASE_TAG }}-arm64 | gzip > hpkv-image-arm64.tar.gz
-        docker buildx build --platform linux/amd64 --file Dockerfile.amd64 --load -t hpkv-image:${{ env.RELEASE_TAG }}-amd64 .
+        docker buildx build --platform linux/amd64 --file Dockerfile.amd64 \
+          --build-arg KERNEL_VERSION=${{ env.KERNEL_VERSION }} \
+          --load -t hpkv-image:${{ env.RELEASE_TAG }}-amd64 .
         docker save hpkv-image:${{ env.RELEASE_TAG }}-amd64 | gzip > hpkv-image-amd64.tar.gz
         docker cp $(docker create hpkv-image:${{ env.RELEASE_TAG }}-arm64):/app/kernel/hpkv_module_arm64.ko ./kernel/
         docker cp $(docker create hpkv-image:${{ env.RELEASE_TAG }}-amd64):/app/kernel/hpkv_module_x86_64.ko ./kernel/
