@@ -148,12 +148,12 @@ update_on_linux() {
     done
 
     # Check and remove the kernel module
-    echo "Checking if the kernel module is loaded..."
+    echo "Checking if the kernel module is still running..."
     if lsmod | grep -q hpkv_module; then
         echo "Removing hpkv_module..."
         sudo rmmod hpkv_module || true
     else
-        echo "hpkv_module is not loaded."
+        echo "hpkv_module is not running."
     fi
 
     docker rm hpkv-container || true
@@ -208,69 +208,171 @@ update_in_qemu() {
         fi
         mv hpkv_module.ko hpkv_module_x86_64.ko
 
-        if ! sudo docker ps | grep -q hpkv-container || ! sudo docker exec hpkv-container /bin/bash -c "exit 0"; then
-            echo "Container is not running or unhealthy. Attempting to start a fresh container."
-            sudo docker rm -f hpkv-container 2>/dev/null
-            sudo docker rmi "hpkv-image:${VERSION}-amd64" 2>/dev/null
+        # Function to check available space
+        check_space() {
+            available_space=\$(df / | awk 'NR==2 {print \$4}')
+            echo \$available_space
+        }
+
+        # Function to perform thorough cleanup
+        thorough_cleanup() {
+            echo "Performing thorough cleanup..."
             
-            echo "Downloading Docker image..."
+            # Clean up /tmp
+            sudo find /tmp -type f -atime +7 -delete
+
+            # Clean up user's home directory
+            rm -rf ~/.cache/*
+
+            # Clean up Docker-related directories
+            sudo du -sh /var/lib/docker
+            
+            # Perform initial cleanup
+            echo "Performing initial cleanup..."
+            if [ -n "\$LATEST_IMAGE" ]; then
+                # Remove all images except the latest one
+                sudo docker images --format "{{.Repository}}:{{.Tag}}" | grep "hpkv-image:${VERSION}-amd64" | grep -v "\$LATEST_IMAGE" | xargs -r sudo docker rmi -f
+                
+                # Prune everything except the latest image
+                LATEST_IMAGE_ID=\$(sudo docker images --format "{{.ID}}" "\$LATEST_IMAGE")
+                sudo docker system prune -af --volumes --filter "until=24h" --filter "label!=com.docker.image.id=\$LATEST_IMAGE_ID"
+            else
+                # If no latest image, perform a full prune
+                sudo docker system prune -af --volumes
+            fi
+            
+            sudo rm -rf /var/lib/docker/tmp/*
+            sudo rm -rf /var/lib/docker/builder/*/
+            
+            # Clean up old log files
+            sudo find /var/log -type f -name "*.log" -mtime +30 -delete
+            sudo find /var/log -type f -name "*.gz" -mtime +30 -delete
+
+            # Clean up old kernels
+            sudo apt-get autoremove --purge -y
+
+            # Clean up apt cache
+            sudo apt-get clean
+
+            echo "Thorough cleanup completed."
+        }
+
+        # Stop the container if it's running
+        if sudo docker ps | grep -q hpkv-container; then
+            echo "Stopping existing container..."
+            sudo docker stop hpkv-container
+            sudo docker rm hpkv-container
+        fi
+
+        # Identify the latest image
+        LATEST_IMAGE=\$(sudo docker images --format "{{.Repository}}:{{.Tag}}" | grep "hpkv-image:${VERSION}-amd64" | head -n 1)
+
+        # Check available space after initial cleanup
+        initial_space=\$(check_space)
+        echo "Available space after initial cleanup: \$initial_space KB"
+
+        # If available space is less than 2GB, perform thorough cleanup
+        if [ \$initial_space -lt 2097152 ]; then
+            thorough_cleanup
+            
+            # Check space again after thorough cleanup
+            final_space=\$(check_space)
+            echo "Available space after thorough cleanup: \$final_space KB"
+            
+            # If still not enough space, exit with an error
+            if [ \$final_space -lt 2097152 ]; then
+                echo "Error: Not enough space available even after thorough cleanup."
+                exit 1
+            fi
+        fi
+
+        # Start a fresh container
+        if [ -z "\$LATEST_IMAGE" ]; then
+            echo "No existing image found. Downloading a fresh one..."
             wget "https://github.com/mehrantsi/high-performance-kv-store/releases/download/${VERSION}/hpkv-image-amd64.tar.gz"
-            echo "Loading Docker image..."
             sudo docker load < hpkv-image-amd64.tar.gz
             rm hpkv-image-amd64.tar.gz
-            
-            sudo docker run -d --rm \
-              --name hpkv-container \
-              --privileged \
-              --device /dev/loop-control:/dev/loop-control \
-              -p 3000:3000 \
-              "hpkv-image:${VERSION}-amd64"
+            LATEST_IMAGE="hpkv-image:${VERSION}-amd64"
         fi
 
-        sudo docker cp hpkv_module_x86_64.ko hpkv-container:/app/kernel/
-        sudo docker cp ~/server.js hpkv-container:/app/api/
-        sudo docker cp ~/start.sh hpkv-container:/app/
-        sudo docker exec hpkv-container chmod +x /app/start.sh
-        sudo docker exec hpkv-container /bin/bash -c "cd /app/api && npm install"
-        
-        # Remove old images
-        OLD_IMAGES=\$(sudo docker images -q "hpkv-image:${VERSION}-amd64")
-        sudo docker commit hpkv-container hpkv-image:${VERSION}-amd64
-        for img in \$OLD_IMAGES; do
-            if [ "\$img" != "\$(sudo docker images -q hpkv-image:${VERSION}-amd64)" ]; then
-                sudo docker rmi -f \$img || true
-            fi
-        done
-        # Remove any dangling images
-        sudo docker image prune -f
-        
-        sudo docker stop hpkv-container || true
-        echo "Waiting for container to stop..."
-        while sudo docker ps | grep -q hpkv-container; do
-            sleep 1
-        done
-
-        # Check and remove the kernel module
-        echo "Checking if the kernel module is loaded..."
-        if sudo lsmod | grep -q hpkv_module; then
-            echo "Removing hpkv_module..."
-            sudo rmmod hpkv_module || true
-        else
-            echo "hpkv_module is not loaded."
-        fi
-
-        sudo docker rm hpkv-container || true
-        echo "Waiting for container to be removed..."
-        while sudo docker ps -a | grep -q hpkv-container; do
-            sleep 1
-        done
+        echo "Starting a fresh container..."
         sudo docker run -d --rm \
           --name hpkv-container \
           --privileged \
           --device /dev/loop-control:/dev/loop-control \
           -p 3000:3000 \
-          "hpkv-image:${VERSION}-amd64"
-        echo "New container started."
+          "\$LATEST_IMAGE"
+
+        # Copy files and update container
+        sudo docker cp hpkv_module_x86_64.ko hpkv-container:/app/kernel/
+        sudo docker cp ~/server.js hpkv-container:/app/api/
+        sudo docker cp ~/start.sh hpkv-container:/app/
+        sudo docker exec hpkv-container chmod +x /app/start.sh
+        sudo docker exec hpkv-container /bin/bash -c "cd /app/api && npm install"
+
+        # Commit changes to a new image
+        sudo docker commit hpkv-container "\$LATEST_IMAGE"
+
+        # Restart the container with the updated image
+        sudo docker stop hpkv-container
+        sudo docker rm hpkv-container
+
+        # Check and remove the kernel module
+        echo "Checking if the kernel module is still running..."
+        if lsmod | grep -q hpkv_module; then
+            echo "Removing hpkv_module..."
+            sudo rmmod hpkv_module || true
+        else
+            echo "hpkv_module is not running."
+        fi
+
+        # Wait for the container to be fully removed
+        echo "Waiting for the old container to be fully removed..."
+        for i in {1..30}; do
+            if ! sudo docker ps -a | grep -q hpkv-container; then
+                echo "Old container has been removed."
+                break
+            fi
+            if [ $i -eq 30 ]; then
+                echo "Timeout waiting for the old container to be removed."
+                exit 1
+            fi
+            sleep 1
+        done
+
+        if sudo docker run -d --rm \
+          --name hpkv-container \
+          --privileged \
+          --device /dev/loop-control:/dev/loop-control \
+          -p 3000:3000 \
+          "\$LATEST_IMAGE"; then
+            echo "New container started with updated image."
+            
+            # Wait for the container to be fully up and running
+            echo "Waiting for the new container to be ready..."
+            for i in {1..30}; do
+                if sudo docker exec hpkv-container /bin/bash -c "exit 0" 2>/dev/null; then
+                    echo "New container is ready."
+                    break
+                fi
+                if [ \$i -eq 30 ]; then
+                    echo "Timeout waiting for the new container to be ready."
+                    exit 1
+                fi
+                sleep 1
+            done
+
+            # Final cleanup only if the new container started successfully
+            echo "Performing final cleanup..."
+            sudo docker system prune -af --volumes
+
+            # Check available disk space again
+            echo "Checking available disk space after cleanup..."
+            df -h /
+        else
+            echo "Failed to start the new container. Skipping final cleanup."
+            exit 1
+        fi
 EOF
 }
 
