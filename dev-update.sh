@@ -146,6 +146,16 @@ update_on_linux() {
     while docker ps | grep -q hpkv-container; do
         sleep 1
     done
+
+    # Check and remove the kernel module
+    echo "Checking if the kernel module is loaded..."
+    if lsmod | grep -q hpkv_module; then
+        echo "Removing hpkv_module..."
+        sudo rmmod hpkv_module || true
+    else
+        echo "hpkv_module is not loaded."
+    fi
+
     docker rm hpkv-container || true
     echo "Waiting for container to be removed..."
     while docker ps -a | grep -q hpkv-container; do
@@ -239,6 +249,16 @@ update_in_qemu() {
         while sudo docker ps | grep -q hpkv-container; do
             sleep 1
         done
+
+        # Check and remove the kernel module
+        echo "Checking if the kernel module is loaded..."
+        if sudo lsmod | grep -q hpkv_module; then
+            echo "Removing hpkv_module..."
+            sudo rmmod hpkv_module || true
+        else
+            echo "hpkv_module is not loaded."
+        fi
+
         sudo docker rm hpkv-container || true
         echo "Waiting for container to be removed..."
         while sudo docker ps -a | grep -q hpkv-container; do
