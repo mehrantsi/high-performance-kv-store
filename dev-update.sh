@@ -208,55 +208,6 @@ update_in_qemu() {
         fi
         mv hpkv_module.ko hpkv_module_x86_64.ko
 
-        # Function to check available space
-        check_space() {
-            available_space=\$(df / | awk 'NR==2 {print \$4}')
-            echo \$available_space
-        }
-
-        # Function to perform thorough cleanup
-        thorough_cleanup() {
-            echo "Performing thorough cleanup..."
-            
-            # Clean up /tmp
-            sudo find /tmp -type f -atime +7 -delete
-
-            # Clean up user's home directory
-            rm -rf ~/.cache/*
-
-            # Clean up Docker-related directories
-            sudo du -sh /var/lib/docker
-            
-            # Perform initial cleanup
-            echo "Performing initial cleanup..."
-            if [ -n "\$LATEST_IMAGE" ]; then
-                # Remove all images except the latest one
-                sudo docker images --format "{{.Repository}}:{{.Tag}}" | grep "hpkv-image:${VERSION}-amd64" | grep -v "\$LATEST_IMAGE" | xargs -r sudo docker rmi -f
-                
-                # Prune everything except the latest image
-                LATEST_IMAGE_ID=\$(sudo docker images --format "{{.ID}}" "\$LATEST_IMAGE")
-                sudo docker system prune -af --volumes --filter "until=24h" --filter "label!=com.docker.image.id=\$LATEST_IMAGE_ID"
-            else
-                # If no latest image, perform a full prune
-                sudo docker system prune -af --volumes
-            fi
-            
-            sudo rm -rf /var/lib/docker/tmp/*
-            sudo rm -rf /var/lib/docker/builder/*/
-            
-            # Clean up old log files
-            sudo find /var/log -type f -name "*.log" -mtime +30 -delete
-            sudo find /var/log -type f -name "*.gz" -mtime +30 -delete
-
-            # Clean up old kernels
-            sudo apt-get autoremove --purge -y
-
-            # Clean up apt cache
-            sudo apt-get clean
-
-            echo "Thorough cleanup completed."
-        }
-
         stop_remove_container_and_unload_module() {
             if sudo docker ps | grep -q hpkv-container; then
                 echo "Stopping existing container..."
@@ -290,25 +241,18 @@ update_in_qemu() {
 
         # Identify the latest image
         LATEST_IMAGE=\$(sudo docker images --format "{{.Repository}}:{{.Tag}}" | grep "hpkv-image:${VERSION}-amd64" | head -n 1)
+        
+        # Function to create a new image and remove old ones
+        create_new_image_and_cleanup() {
+            local CONTAINER_NAME=\$1
+            local NEW_IMAGE_TAG=\$2
 
-        # Check available space after initial cleanup
-        initial_space=\$(check_space)
-        echo "Available space after initial cleanup: \$initial_space KB"
+            # Create a new image
+            sudo docker commit \$CONTAINER_NAME \$NEW_IMAGE_TAG
 
-        # If available space is less than 2GB, perform thorough cleanup
-        if [ \$initial_space -lt 2097152 ]; then
-            thorough_cleanup
-            
-            # Check space again after thorough cleanup
-            final_space=\$(check_space)
-            echo "Available space after thorough cleanup: \$final_space KB"
-            
-            # If still not enough space, exit with an error
-            if [ \$final_space -lt 2097152 ]; then
-                echo "Error: Not enough space available even after thorough cleanup."
-                exit 1
-            fi
-        fi
+            # Remove old images, keeping only the latest 2
+            sudo docker images --format "{{.Repository}}:{{.Tag}}" | grep "hpkv-image:${VERSION}-amd64" | sort -r | tail -n +3 | xargs -r sudo docker rmi -f
+        }
 
         # Start a fresh container
         if [ -z "\$LATEST_IMAGE" ]; then
@@ -334,8 +278,12 @@ update_in_qemu() {
         sudo docker exec hpkv-container chmod +x /app/start.sh
         sudo docker exec hpkv-container /bin/bash -c "cd /app/api && npm install"
 
-        # Commit changes to a new image
-        sudo docker commit hpkv-container "\$LATEST_IMAGE"
+        # Create a new image with a timestamp tag
+        NEW_IMAGE_TAG="hpkv-image:${VERSION}-amd64-\$(date +%Y%m%d%H%M%S)"
+        create_new_image_and_cleanup hpkv-container \$NEW_IMAGE_TAG
+
+        # Update LATEST_IMAGE variable
+        LATEST_IMAGE=\$NEW_IMAGE_TAG
 
         # Stop and remove updated container, unload module before restarting
         stop_remove_container_and_unload_module
@@ -364,7 +312,8 @@ update_in_qemu() {
 
             # Final cleanup only if the new container started successfully
             echo "Performing final cleanup..."
-            sudo docker system prune -af --volumes
+            sudo docker system prune -af
+            sudo docker volume prune -f
 
             # Check available disk space again
             echo "Checking available disk space after cleanup..."
