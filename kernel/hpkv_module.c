@@ -290,14 +290,14 @@ static struct cached_record *cache_get(const char *key)
     struct cached_record *cached;
     u32 hash = djb2_hash(key, strlen(key));
 
-    spin_lock(&cache_lock);
+    rcu_read_lock();
     hash_for_each_possible(cache, cached, node, hash) {
         if (strcmp(cached->key, key) == 0) {
-            spin_unlock(&cache_lock);
+            rcu_read_unlock();
             return cached;
         }
     }
-    spin_unlock(&cache_lock);
+    rcu_read_unlock();
     return NULL;
 }
 
