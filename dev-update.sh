@@ -257,12 +257,36 @@ update_in_qemu() {
             echo "Thorough cleanup completed."
         }
 
-        # Stop the container if it's running
-        if sudo docker ps | grep -q hpkv-container; then
-            echo "Stopping existing container..."
-            sudo docker stop hpkv-container
-            sudo docker rm hpkv-container
-        fi
+        stop_remove_container_and_unload_module() {
+            if sudo docker ps | grep -q hpkv-container; then
+                echo "Stopping existing container..."
+                sudo docker stop hpkv-container
+                echo "Waiting for container to stop..."
+                while sudo docker ps | grep -q hpkv-container; do
+                    sleep 1
+                done
+            fi
+
+            if sudo docker ps -a | grep -q hpkv-container; then
+                echo "Removing container..."
+                sudo docker rm hpkv-container
+                echo "Waiting for container to be removed..."
+                while sudo docker ps -a | grep -q hpkv-container; do
+                    sleep 1
+                done
+            fi
+
+            echo "Checking if the kernel module is still running..."
+            if sudo lsmod | grep -q hpkv_module; then
+                echo "Removing hpkv_module..."
+                sudo rmmod hpkv_module || true
+            else
+                echo "hpkv_module is not running."
+            fi
+        }
+
+        # Stop and remove existing container, unload module before cleanup
+        stop_remove_container_and_unload_module
 
         # Identify the latest image
         LATEST_IMAGE=\$(sudo docker images --format "{{.Repository}}:{{.Tag}}" | grep "hpkv-image:${VERSION}-amd64" | head -n 1)
@@ -313,32 +337,8 @@ update_in_qemu() {
         # Commit changes to a new image
         sudo docker commit hpkv-container "\$LATEST_IMAGE"
 
-        # Restart the container with the updated image
-        sudo docker stop hpkv-container
-        sudo docker rm hpkv-container
-
-        # Check and remove the kernel module
-        echo "Checking if the kernel module is still running..."
-        if lsmod | grep -q hpkv_module; then
-            echo "Removing hpkv_module..."
-            sudo rmmod hpkv_module || true
-        else
-            echo "hpkv_module is not running."
-        fi
-
-        # Wait for the container to be fully removed
-        echo "Waiting for the old container to be fully removed..."
-        for i in {1..30}; do
-            if ! sudo docker ps -a | grep -q hpkv-container; then
-                echo "Old container has been removed."
-                break
-            fi
-            if [ $i -eq 30 ]; then
-                echo "Timeout waiting for the old container to be removed."
-                exit 1
-            fi
-            sleep 1
-        done
+        # Stop and remove updated container, unload module before restarting
+        stop_remove_container_and_unload_module
 
         if sudo docker run -d --rm \
           --name hpkv-container \
