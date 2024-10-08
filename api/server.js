@@ -17,6 +17,7 @@ const HPKV_IOCTL_GET = 0;
 const HPKV_IOCTL_DELETE = 1;
 const HPKV_IOCTL_PARTIAL_UPDATE = 5;
 const HPKV_IOCTL_PURGE = 3;
+const HPKV_IOCTL_INSERT = 4;
 
 const MAX_KEY_SIZE = 512;
 const MAX_VALUE_SIZE = 102400;  // 100 KB
@@ -38,6 +39,10 @@ if (cluster.isMaster) {
 } else {
     const app = express();
 
+    // Increase the payload size limit (adjust the limit as needed)
+    app.use(bodyParser.json({ limit: '10mb' }));
+    app.use(bodyParser.urlencoded({ limit: '10mb', extended: true }));
+
     // Load configuration file
     let config;
     try {
@@ -57,8 +62,6 @@ if (cluster.isMaster) {
             process.exit(1);
         }
     }
-
-    app.use(bodyParser.json());
 
     // Rate limiting middleware
     const limiter = rateLimit({
@@ -115,6 +118,7 @@ if (cluster.isMaster) {
                         }
                         break;
                     case HPKV_IOCTL_PARTIAL_UPDATE:
+                    case HPKV_IOCTL_INSERT:
                         buffer = Buffer.alloc(UINT16_SIZE + SIZE_T_SIZE + keyLength + valueLength);
                         buffer.writeUInt16LE(keyLength, 0);
                         buffer.writeBigUInt64LE(BigInt(valueLength), UINT16_SIZE);
@@ -143,6 +147,8 @@ if (cluster.isMaster) {
             } finally {
                 clearTimeout(timer);
                 if (fd) await fd.close();
+                // Explicitly null out the buffer to help with garbage collection
+                buffer = null;
             }
         });
     }
@@ -162,13 +168,9 @@ if (cluster.isMaster) {
         const tenantKey = req.tenantId + key;
 
         try {
-            console.log(`Received request - Key: ${tenantKey}, Value: ${value}, Partial Update: ${partialUpdate}`);
+            console.log(`Received request - Key: ${tenantKey}, Value length: ${value.length}, Partial Update: ${partialUpdate}`);
             
-            if (partialUpdate) {
-                await hpkvIoctl(HPKV_IOCTL_PARTIAL_UPDATE, tenantKey, value);
-            } else {
-                await fs.writeFile('/dev/hpkv', `${tenantKey}:${value}`);
-            }
+            await hpkvIoctl(partialUpdate ? HPKV_IOCTL_PARTIAL_UPDATE : HPKV_IOCTL_INSERT, tenantKey, value);
             res.status(200).json({ success: true, message: 'Record inserted/updated successfully' });
         } catch (error) {
             console.error('Error in POST /record:', error);

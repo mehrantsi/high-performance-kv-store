@@ -52,6 +52,7 @@
 #define HPKV_IOCTL_DELETE 1
 #define HPKV_IOCTL_PARTIAL_UPDATE 5
 #define HPKV_IOCTL_PURGE 3
+#define HPKV_IOCTL_INSERT 4
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Mehran Toosi");
@@ -380,9 +381,10 @@ static int load_record_from_disk(sector_t sector, char **value, size_t *value_le
 {
     struct buffer_head *bh;
     int ret = -EIO;
-    char *key_buffer;
-    uint16_t key_len, total_len, bytes_read = 0;
+    uint16_t key_len;
+    size_t total_len, buffer_size;
     int sectors_to_read, i;
+    char *buffer;
 
     bh = __bread(bdev, sector, HPKV_BLOCK_SIZE);
     if (!bh) {
@@ -393,14 +395,6 @@ static int load_record_from_disk(sector_t sector, char **value, size_t *value_le
     // Read the key length
     memcpy(&key_len, bh->b_data, sizeof(uint16_t));
 
-    // Read the key
-    char *key = kmalloc(key_len, GFP_KERNEL);
-    if (!key) {
-        brelse(bh);
-        return -ENOMEM;
-    }
-    memcpy(key, bh->b_data + sizeof(uint16_t), key_len);
-
     // Read the value length
     memcpy(value_len, bh->b_data + sizeof(uint16_t) + key_len, sizeof(size_t));
 
@@ -408,17 +402,28 @@ static int load_record_from_disk(sector_t sector, char **value, size_t *value_le
     total_len = sizeof(uint16_t) + key_len + sizeof(size_t) + *value_len;
     sectors_to_read = (total_len + HPKV_BLOCK_SIZE - 1) / HPKV_BLOCK_SIZE;
 
-    *value = kmalloc(*value_len, GFP_KERNEL);
-    if (!*value) {
+    // Calculate buffer size
+    buffer_size = sectors_to_read * HPKV_BLOCK_SIZE;
+
+    hpkv_log(HPKV_LOG_DEBUG, "Loading record: key_len=%u, value_len=%zu, total_len=%zu, sectors_to_read=%d, buffer_size=%zu\n",
+             key_len, *value_len, total_len, sectors_to_read, buffer_size);
+
+    // Sanity check to prevent excessive memory allocation
+    if (*value_len > MAX_VALUE_SIZE || key_len > MAX_KEY_SIZE) {
+        hpkv_log(HPKV_LOG_ERR, "Record size exceeds maximum allowed size: key_len=%u, value_len=%zu\n", key_len, *value_len);
         brelse(bh);
-        kfree(key);
+        return -EINVAL;
+    }
+
+    buffer = kmalloc(buffer_size, GFP_KERNEL);
+    if (!buffer) {
+        hpkv_log(HPKV_LOG_ERR, "Failed to allocate buffer for reading record\n");
+        brelse(bh);
         return -ENOMEM;
     }
 
-    // Copy the first part of the value from the first sector
-    bytes_read = min(*value_len, HPKV_BLOCK_SIZE - (sizeof(uint16_t) + key_len + sizeof(size_t)));
-    memcpy(*value, bh->b_data + sizeof(uint16_t) + key_len + sizeof(size_t), bytes_read);
-
+    // Copy the first sector
+    memcpy(buffer, bh->b_data, HPKV_BLOCK_SIZE);
     brelse(bh);
 
     // Read remaining sectors if necessary
@@ -426,21 +431,26 @@ static int load_record_from_disk(sector_t sector, char **value, size_t *value_le
         bh = __bread(bdev, sector + i, HPKV_BLOCK_SIZE);
         if (!bh) {
             hpkv_log(HPKV_LOG_ERR, "Failed to read sector %llu\n", (unsigned long long)(sector + i));
-            kfree(*value);
-            kfree(key);
-            *value = NULL;
+            kfree(buffer);
             return -EIO;
         }
-
-        size_t bytes_to_copy = min(*value_len - bytes_read, (size_t)HPKV_BLOCK_SIZE);
-        memcpy(*value + bytes_read, bh->b_data, bytes_to_copy);
-        bytes_read += bytes_to_copy;
-
+        memcpy(buffer + i * HPKV_BLOCK_SIZE, bh->b_data, HPKV_BLOCK_SIZE);
         brelse(bh);
     }
 
-    kfree(key);  // Don't forget to free the key
+    *value = kmalloc(*value_len, GFP_KERNEL);
+    if (!*value) {
+        hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for value\n");
+        kfree(buffer);
+        return -ENOMEM;
+    }
 
+    // Copy the value from the buffer
+    memcpy(*value, buffer + sizeof(uint16_t) + key_len + sizeof(size_t), *value_len);
+
+    hpkv_log(HPKV_LOG_DEBUG, "Successfully loaded record: value_len=%zu\n", *value_len);
+
+    kfree(buffer);
     return 0;
 }
 
@@ -2133,6 +2143,53 @@ static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     int ret;
 
     switch (cmd) {
+        case HPKV_IOCTL_INSERT:
+            if (!arg || !access_ok((void __user *)arg, sizeof(uint16_t) + sizeof(size_t))) {
+                hpkv_log(HPKV_LOG_ERR, "Invalid user space pointer for INSERT\n");
+                return -EFAULT;
+            }
+            
+            if (copy_from_user(&key_len, (void __user *)arg, sizeof(uint16_t)) ||
+                copy_from_user(&value_len, (void __user *)(arg + sizeof(uint16_t)), sizeof(size_t))) {
+                hpkv_log(HPKV_LOG_ERR, "Failed to copy lengths from user space for INSERT\n");
+                return -EFAULT;
+            }
+
+            hpkv_log(HPKV_LOG_DEBUG, "Received INSERT command - Key length: %u, Value length: %zu\n", key_len, value_len);
+
+            if (key_len == 0 || key_len > MAX_KEY_SIZE || value_len == 0 || value_len > MAX_VALUE_SIZE) {
+                hpkv_log(HPKV_LOG_ERR, "Invalid key length: %u or value length: %zu for INSERT\n", key_len, value_len);
+                return -EINVAL;
+            }
+
+            key = kmalloc(key_len, GFP_KERNEL);
+            value = kmalloc(value_len, GFP_KERNEL);
+            if (!key || !value) {
+                hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for key or value in INSERT\n");
+                kfree(key);
+                kfree(value);
+                return -ENOMEM;
+            }
+
+            if (copy_from_user(key, (char __user *)(arg + sizeof(uint16_t) + sizeof(size_t)), key_len) ||
+                copy_from_user(value, (char __user *)(arg + sizeof(uint16_t) + sizeof(size_t) + key_len), value_len)) {
+                hpkv_log(HPKV_LOG_ERR, "Failed to copy key or value from user space for INSERT\n");
+                kfree(key);
+                kfree(value);
+                return -EFAULT;
+            }
+
+            hpkv_log(HPKV_LOG_INFO, "Received INSERT command for key: %.*s (length: %u)\n", key_len, key, key_len);
+            ret = insert_or_update_record(key, key_len, value, value_len, false);
+            if (ret == 0) {
+                hpkv_log(HPKV_LOG_INFO, "INSERT successful for key: %.*s (length: %u)\n", key_len, key, key_len);
+            } else {
+                hpkv_log(HPKV_LOG_ERR, "INSERT failed for key: %.*s (length: %u), error: %d\n", key_len, key, key_len, ret);
+            }
+            kfree(key);
+            kfree(value);
+            return ret;
+
         case HPKV_IOCTL_GET:  // Get by exact key
             if (!arg || !access_ok((void __user *)arg, sizeof(uint16_t) + sizeof(size_t))) {
                 hpkv_log(HPKV_LOG_ERR, "Invalid user space pointer\n");
