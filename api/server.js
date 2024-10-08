@@ -15,11 +15,13 @@ const PORT = process.env.PORT || 3000;
 // Define ioctl commands
 const HPKV_IOCTL_GET = 0;
 const HPKV_IOCTL_DELETE = 1;
-const HPKV_IOCTL_PARTIAL_UPDATE = 2;
+const HPKV_IOCTL_PARTIAL_UPDATE = 5;
 const HPKV_IOCTL_PURGE = 3;
 
-const MAX_KEY_SIZE = 256;
-const MAX_VALUE_SIZE = 1000;
+const MAX_KEY_SIZE = 512;
+const MAX_VALUE_SIZE = 102400;  // 100 KB
+const UINT16_SIZE = 2; // 2 bytes for uint16
+const SIZE_T_SIZE = 8; // 8 bytes for 64-bit systems
 
 if (cluster.isMaster) {
     console.log(`Master ${process.pid} is running`);
@@ -85,50 +87,69 @@ if (cluster.isMaster) {
                 reject(new Error('Operation timed out'));
             }, timeout);
 
+            let fd = null;
+            let buffer = null;
             try {
-                const fd = await fs.open('/dev/hpkv', 'r+');
+                fd = await fs.open('/dev/hpkv', 'r+');
 
-                let buffer;
+                const keyLength = Buffer.isBuffer(key) ? key.length : Buffer.byteLength(key);
+                const valueLength = Buffer.isBuffer(value) ? value.length : Buffer.byteLength(value);
+
                 switch (cmd) {
                     case HPKV_IOCTL_GET:
+                        buffer = Buffer.alloc(UINT16_SIZE + SIZE_T_SIZE + keyLength + MAX_VALUE_SIZE);
+                        buffer.writeUInt16LE(keyLength, 0);
+                        if (Buffer.isBuffer(key)) {
+                            key.copy(buffer, UINT16_SIZE);
+                        } else {
+                            buffer.write(key, UINT16_SIZE);
+                        }
+                        break;
                     case HPKV_IOCTL_DELETE:
-                        buffer = Buffer.alloc(MAX_KEY_SIZE + 8 + MAX_VALUE_SIZE); // 8 bytes for size_t
-                        buffer.write(key.toString(), 0, MAX_KEY_SIZE);
+                        buffer = Buffer.alloc(UINT16_SIZE + keyLength);
+                        buffer.writeUInt16LE(keyLength, 0);
+                        if (Buffer.isBuffer(key)) {
+                            key.copy(buffer, UINT16_SIZE);
+                        } else {
+                            buffer.write(key, UINT16_SIZE);
+                        }
                         break;
                     case HPKV_IOCTL_PARTIAL_UPDATE:
-                        buffer = Buffer.alloc(MAX_KEY_SIZE + MAX_VALUE_SIZE);
-                        buffer.write(key.toString(), 0, MAX_KEY_SIZE);
-                        buffer.write(value.toString(), MAX_KEY_SIZE);
+                        buffer = Buffer.alloc(UINT16_SIZE + SIZE_T_SIZE + keyLength + valueLength);
+                        buffer.writeUInt16LE(keyLength, 0);
+                        buffer.writeBigUInt64LE(BigInt(valueLength), UINT16_SIZE);
+                        if (Buffer.isBuffer(key)) {
+                            key.copy(buffer, UINT16_SIZE + SIZE_T_SIZE);
+                        } else {
+                            buffer.write(key, UINT16_SIZE + SIZE_T_SIZE);
+                        }
+                        if (Buffer.isBuffer(value)) {
+                            value.copy(buffer, UINT16_SIZE + SIZE_T_SIZE + keyLength);
+                        } else {
+                            buffer.write(value, UINT16_SIZE + SIZE_T_SIZE + keyLength);
+                        }
                         break;
                     case HPKV_IOCTL_PURGE:
                         buffer = Buffer.alloc(0);
                         break;
                     default:
-                        clearTimeout(timer);
-                        await fd.close();
-                        return reject(new Error('Invalid ioctl command'));
+                        throw new Error('Invalid ioctl command');
                 }
 
-                try {
-                    const result = ioctl(fd.fd, cmd, buffer);
-                    clearTimeout(timer);
-                    await fd.close();
-                    resolve(buffer);
-                } catch (ioctlError) {
-                    clearTimeout(timer);
-                    await fd.close();
-                    reject(ioctlError);
-                }
+                ioctl(fd.fd, cmd, buffer);
+                resolve(buffer);
             } catch (err) {
-                clearTimeout(timer);
                 reject(err);
+            } finally {
+                clearTimeout(timer);
+                if (fd) await fd.close();
             }
         });
     }
 
     // Insert/Update Record
     app.post('/record', [
-        body('key').isString().isLength({ min: 1, max: MAX_KEY_SIZE - 4 }).trim().escape(),
+        body('key').isString().isLength({ min: 1, max: MAX_KEY_SIZE }).trim().escape(),
         body('value').isString().isLength({ min: 1, max: MAX_VALUE_SIZE }).trim().escape(),
         body('partialUpdate').optional().isBoolean()
     ], async (req, res) => {
@@ -141,9 +162,10 @@ if (cluster.isMaster) {
         const tenantKey = req.tenantId + key;
 
         try {
+            console.log(`Received request - Key: ${tenantKey}, Value: ${value}, Partial Update: ${partialUpdate}`);
+            
             if (partialUpdate) {
-                const partialUpdateString = `${tenantKey}:+${value}`;
-                await fs.writeFile('/dev/hpkv', partialUpdateString);
+                await hpkvIoctl(HPKV_IOCTL_PARTIAL_UPDATE, tenantKey, value);
             } else {
                 await fs.writeFile('/dev/hpkv', `${tenantKey}:${value}`);
             }
@@ -156,7 +178,7 @@ if (cluster.isMaster) {
 
     // Get Record
     app.get('/record/:key', [
-        param('key').isString().isLength({ min: 1, max: MAX_KEY_SIZE - 4 }).trim().escape()
+        param('key').isString().isLength({ min: 1, max: MAX_KEY_SIZE }).trim().escape()
     ], async (req, res) => {
         const errors = validationResult(req);
         if (!errors.isEmpty()) {
@@ -166,15 +188,21 @@ if (cluster.isMaster) {
         const { key } = req.params;
         const tenantKey = req.tenantId + key;
 
+        let buffer = null;
         try {
-            const buffer = await hpkvIoctl(HPKV_IOCTL_GET, tenantKey);
+            const keyBuffer = Buffer.from(tenantKey);
+            buffer = await hpkvIoctl(HPKV_IOCTL_GET, keyBuffer);
             
-            const valueLength = buffer.readBigUInt64LE(MAX_KEY_SIZE); // Read 8-byte BigInt
-            const value = buffer.toString('utf8', MAX_KEY_SIZE + 8, MAX_KEY_SIZE + 8 + Number(valueLength));
-
-            res.status(200).json({ key: key, value: value.trim() });
+            const valueLength = buffer.readBigUInt64LE(UINT16_SIZE);
+            
+            if (valueLength > 0n) {
+                const value = buffer.toString('utf8', UINT16_SIZE + SIZE_T_SIZE, UINT16_SIZE + SIZE_T_SIZE + Number(valueLength));
+                res.status(200).json({ key: key, value: value.trim() });
+            } else {
+                res.status(404).json({ error: 'Record not found' });
+            }
         } catch (error) {
-            if (error.message.includes('ENOENT')) {
+            if (error.code === 'ENOENT') {
                 res.status(404).json({ error: 'Record not found' });
             } else {
                 console.error('Error in GET /record/:key:', error);
@@ -182,12 +210,17 @@ if (cluster.isMaster) {
                 console.error('Error Stack:', error.stack);
                 res.status(500).json({ error: 'Failed to retrieve record' });
             }
+        } finally {
+            if (buffer) {
+                buffer.fill(0);
+                buffer = null;
+            }
         }
     });
 
     // Delete Record
     app.delete('/record/:key', [
-        param('key').isString().isLength({ min: 1, max: MAX_KEY_SIZE - 4 }).trim().escape()
+        param('key').isString().isLength({ min: 1, max: MAX_KEY_SIZE }).trim().escape()
     ], async (req, res) => {
         const errors = validationResult(req);
         if (!errors.isEmpty()) {
