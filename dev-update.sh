@@ -125,27 +125,78 @@ update_on_linux() {
         docker exec hpkv-container /bin/bash -c "cd /app/api && npm install"
     fi
 
-    # Commit changes to a new image
-    if ! docker commit hpkv-container "hpkv-image:${VERSION}-${ARCH}"; then
-        echo "Failed to commit changes. Exiting."
-        exit 1
-    fi
+    # Function to create a new image and remove old ones
+    create_new_image_and_cleanup() {
+        local CONTAINER_NAME=$1
+        local NEW_IMAGE_TAG=$2
 
-    # Remove old images
-    OLD_IMAGES=$(docker images -q "hpkv-image:${VERSION}-${ARCH}")
-    for img in $OLD_IMAGES; do
-        if [ "$img" != "$(docker images -q hpkv-image:${VERSION}-${ARCH})" ]; then
-            docker rmi -f $img || true
+        # Check disk usage
+        local DISK_USAGE=$(df / | awk 'NR==2 {print $5}' | sed 's/%//')
+
+        if [ $DISK_USAGE -ge 65 ]; then
+            echo "Disk usage is $DISK_USAGE%. Performing full image squash..."
+
+            # Export the container to a tar file
+            docker export $CONTAINER_NAME > temp_container.tar
+
+            # Stop and remove the old container
+            docker stop $CONTAINER_NAME
+            echo "Waiting for container to stop..."
+            while docker ps | grep -q $CONTAINER_NAME; do
+                sleep 1
+            done
+
+            docker rm $CONTAINER_NAME
+            echo "Waiting for container to be removed..."
+            while docker ps -a | grep -q $CONTAINER_NAME; do
+                sleep 1
+            done
+
+            # Remove dangling images
+            docker rmi $(docker images -f "dangling=true" -q)
+
+            # Remove dangling volumes
+            docker volume rm $(docker volume ls -qf dangling=true)
+
+            # Remove all unused objects
+            docker system prune -af
+
+            # Import the tar file as a new image
+            cat temp_container.tar | docker import - $NEW_IMAGE_TAG
+
+            # Remove the temporary tar file
+            rm temp_container.tar
+
+            echo "Cleanup completed. Created new image: $NEW_IMAGE_TAG"
+        else
+            echo "Disk usage is $DISK_USAGE%. Performing regular commit..."
+
+            # Commit the container to a new image
+            docker commit $CONTAINER_NAME $NEW_IMAGE_TAG
+
+            # Stop and remove the old container
+            docker stop $CONTAINER_NAME
+            echo "Waiting for container to stop..."
+            while docker ps | grep -q $CONTAINER_NAME; do
+                sleep 1
+            done
+
+            docker rm $CONTAINER_NAME
+            echo "Waiting for container to be removed..."
+            while docker ps -a | grep -q $CONTAINER_NAME; do
+                sleep 1
+            done
+            
+            echo "Committed new changes to image: $NEW_IMAGE_TAG"
         fi
-    done
-    # Remove any dangling images
-    docker image prune -f
-    
-    docker stop hpkv-container || true
-    echo "Waiting for container to stop..."
-    while docker ps | grep -q hpkv-container; do
-        sleep 1
-    done
+    }
+
+    # Create a new image with a timestamp tag
+    NEW_IMAGE_TAG="hpkv-image:${VERSION}-${ARCH}-$(date +%Y%m%d%H%M%S)"
+    create_new_image_and_cleanup hpkv-container $NEW_IMAGE_TAG
+
+    # Update LATEST_IMAGE variable
+    LATEST_IMAGE=$NEW_IMAGE_TAG
 
     # Check and remove the kernel module
     echo "Checking if the kernel module is still running..."
@@ -155,6 +206,12 @@ update_on_linux() {
     else
         echo "hpkv_module is not running."
     fi
+
+    docker stop hpkv-container || true
+    echo "Waiting for container to stop..."
+    while docker ps | grep -q hpkv-container; do
+        sleep 1
+    done
 
     docker rm hpkv-container || true
     echo "Waiting for container to be removed..."
@@ -236,25 +293,56 @@ update_in_qemu() {
             fi
         }
 
-        # Stop and remove existing container, unload module before cleanup
-        stop_remove_container_and_unload_module
-
-        # Identify the latest image
-        LATEST_IMAGE=\$(sudo docker images --format "{{.Repository}}:{{.Tag}}" | grep "hpkv-image:${VERSION}-amd64" | head -n 1)
-        
         # Function to create a new image and remove old ones
         create_new_image_and_cleanup() {
             local CONTAINER_NAME=\$1
             local NEW_IMAGE_TAG=\$2
 
-            # Create a new image
-            sudo docker commit \$CONTAINER_NAME \$NEW_IMAGE_TAG
+            # Check disk usage
+            local DISK_USAGE=\$(df / | awk 'NR==2 {print \$5}' | sed 's/%//')
 
-            # Remove old images, keeping only the latest 2
-            sudo docker images --format "{{.Repository}}:{{.Tag}}" | grep "hpkv-image:${VERSION}-amd64" | sort -r | tail -n +3 | xargs -r sudo docker rmi -f
+            if [ \$DISK_USAGE -ge 65 ]; then
+                echo "Disk usage is \$DISK_USAGE%. Performing full image squash..."
+
+                # Export the container to a tar file
+                sudo docker export \$CONTAINER_NAME > temp_container.tar
+
+                # Stop and remove the old container
+                stop_remove_container_and_unload_module
+
+                # Remove dangling images
+                sudo docker rmi \$(sudo docker images -f "dangling=true" -q)
+
+                # Remove dangling volumes
+                sudo docker volume rm \$(sudo docker volume ls -qf dangling=true)
+
+                # Remove all unused objects
+                sudo docker system prune -af
+
+                # Import the tar file as a new image
+                cat temp_container.tar | sudo docker import - \$NEW_IMAGE_TAG
+
+                # Remove the temporary tar file
+                rm temp_container.tar
+
+                echo "Cleanup completed. Created new image: \$NEW_IMAGE_TAG"
+            else
+                echo "Disk usage is \$DISK_USAGE%. Performing regular commit..."
+
+                # Commit the container to a new image
+                sudo docker commit \$CONTAINER_NAME \$NEW_IMAGE_TAG
+
+                # Stop and remove the old container
+                stop_remove_container_and_unload_module
+
+                echo "Committed new changes to image: \$NEW_IMAGE_TAG"
+            fi    
         }
 
-        # Start a fresh container
+        # Identify the latest image
+        LATEST_IMAGE=\$(sudo docker images --format "{{.Repository}}:{{.Tag}}" | grep "hpkv-image:${VERSION}-amd64" | head -n 1)
+
+        # get the latest image if not found
         if [ -z "\$LATEST_IMAGE" ]; then
             echo "No existing image found. Downloading a fresh one..."
             wget "https://github.com/mehrantsi/high-performance-kv-store/releases/download/${VERSION}/hpkv-image-amd64.tar.gz"
@@ -263,13 +351,15 @@ update_in_qemu() {
             LATEST_IMAGE="hpkv-image:${VERSION}-amd64"
         fi
 
-        echo "Starting a fresh container..."
-        sudo docker run -d --rm \
-          --name hpkv-container \
-          --privileged \
-          --device /dev/loop-control:/dev/loop-control \
-          -p 3000:3000 \
-          "\$LATEST_IMAGE"
+        echo "Starting a fresh container if not running..."
+        if ! sudo docker ps | grep -q hpkv-container; then
+            sudo docker run -d --rm \
+              --name hpkv-container \
+              --privileged \
+              --device /dev/loop-control:/dev/loop-control \
+              -p 3000:3000 \
+              "\$LATEST_IMAGE"
+        fi
 
         # Copy files and update container
         sudo docker cp hpkv_module_x86_64.ko hpkv-container:/app/kernel/
@@ -284,9 +374,6 @@ update_in_qemu() {
 
         # Update LATEST_IMAGE variable
         LATEST_IMAGE=\$NEW_IMAGE_TAG
-
-        # Stop and remove updated container, unload module before restarting
-        stop_remove_container_and_unload_module
 
         if sudo docker run -d --rm \
           --name hpkv-container \
@@ -309,11 +396,6 @@ update_in_qemu() {
                 fi
                 sleep 1
             done
-
-            # Final cleanup only if the new container started successfully
-            echo "Performing final cleanup..."
-            sudo docker system prune -af
-            sudo docker volume prune -f
 
             # Check available disk space again
             echo "Checking available disk space after cleanup..."

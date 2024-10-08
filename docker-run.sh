@@ -98,7 +98,7 @@ if [ "$HOST_OS" = "Darwin" ]; then
     # Create a larger disk image based on the downloaded image
     DISK_IMAGE="ubuntu-vm-disk.qcow2"
     if [ ! -f "$DISK_IMAGE" ]; then
-        qemu-img create -f qcow2 -F qcow2 -b "$UBUNTU_IMAGE" "$DISK_IMAGE" 10G
+        qemu-img create -f qcow2 -F qcow2 -b "$UBUNTU_IMAGE" "$DISK_IMAGE" 20G
     fi
 
     # Create cloud-init configuration
