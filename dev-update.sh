@@ -186,7 +186,7 @@ update_on_linux() {
             while docker ps -a | grep -q $CONTAINER_NAME; do
                 sleep 1
             done
-            
+
             echo "Committed new changes to image: $NEW_IMAGE_TAG"
         fi
     }
@@ -310,14 +310,23 @@ update_in_qemu() {
                 # Stop and remove the old container
                 stop_remove_container_and_unload_module
 
-                # Remove dangling images
-                sudo docker rmi \$(sudo docker images -f "dangling=true" -q)
-
-                # Remove dangling volumes
-                sudo docker volume rm \$(sudo docker volume ls -qf dangling=true)
-
                 # Remove all unused objects
                 sudo docker system prune -af
+
+                # Stop docker service
+                sudo systemctl stop docker
+
+                # Remove any remaining docker files
+                sudo rm -rf /var/lib/docker/tmp/* || true
+                sudo rm -rf /var/lib/docker/overlay2/* || true
+                sudo rm -rf /var/lib/docker/image/overlay2/* || true
+                sudo rm -rf /var/lib/docker/aufs/* || true
+                sudo rm -rf /var/lib/docker/containers/* || true
+                sudo rm -rf /var/lib/docker/network/* || true
+                sudo rm -rf /var/lib/docker/volumes/* || true
+
+                # Start docker service
+                sudo systemctl start docker
 
                 # Import the tar file as a new image
                 cat temp_container.tar | sudo docker import - \$NEW_IMAGE_TAG
