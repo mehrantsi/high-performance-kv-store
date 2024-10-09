@@ -110,7 +110,6 @@ static size_t calculate_record_size(uint16_t key_len, size_t value_len);
 
 static int major_num;
 static struct kmem_cache *record_cache;
-static DEFINE_PER_CPU(struct llist_head, record_free_list);
 static struct percpu_rw_semaphore rw_sem;
 static atomic_t purge_in_progress = ATOMIC_INIT(0);
 static atomic_t compact_in_progress = ATOMIC_INIT(0);
@@ -338,8 +337,18 @@ static int calculate_cache_size(void)
 
 static void update_lru(struct cached_record *record)
 {
-    list_del(&record->lru_list);
-    list_add(&record->lru_list, &lru_list);
+    if (!record) {
+        hpkv_log(HPKV_LOG_ERR, "Attempted to update LRU for null record\n");
+        return;
+    }
+
+    if (list_empty(&record->lru_list)) {
+        hpkv_log(HPKV_LOG_WARNING, "Record not in LRU list, adding it\n");
+        list_add(&record->lru_list, &lru_list);
+    } else {
+        list_del(&record->lru_list);
+        list_add(&record->lru_list, &lru_list);
+    }
     record->last_access = jiffies;
     hpkv_log(HPKV_LOG_DEBUG, "Updated LRU for key: %.*s, new access time: %lu\n", 
              record->key_len, record->key, record->last_access);
@@ -385,25 +394,38 @@ static void prefetch_adjacent(const char *key, uint16_t key_len)
     struct record *record;
     struct rb_node *node;
     
+    if (!key || key_len == 0) {
+        hpkv_log(HPKV_LOG_ERR, "Invalid input to prefetch_adjacent\n");
+        return;
+    }
+
     rcu_read_lock();
     record = search_record_in_memory(key, key_len);
     if (record) {
         node = rb_next(&record->tree_node);
         if (node) {
             record = rb_entry(node, struct record, tree_node);
+
+            if(atomic_read(&record->refcount) == 0) {
+                // No references to this record, so it's scheduled for deletion
+                rcu_read_unlock();
+                return;
+            }
+
             if (record->value == NULL && record->value_len > 0) {
                 // Load the value from disk
-                char *value = kmalloc(record->value_len, GFP_KERNEL);
-                if (value) {
-                    if (load_record_from_disk(record->sector, &value, &record->value_len) == 0) {
-                        cache_put(record->key, record->key_len, value, record->value_len, record->sector);
+                char *value = NULL;
+                size_t loaded_value_len = 0;
+                if (load_record_from_disk(record->sector, &value, &loaded_value_len) == 0) {
+                    if (value && loaded_value_len > 0) {
+                        cache_put(record->key, record->key_len, value, loaded_value_len, record->sector);
                         hpkv_log(HPKV_LOG_DEBUG, "Prefetched adjacent key: %.*s (length: %u)\n", 
-                                record->key_len, record->key, record->key_len);
+                            record->key_len, record->key, record->key_len);
                     }
-                    kfree(value);
+                    kfree(value);  // Free the loaded value
                 }
             }
-            else if (record->value != NULL) {
+            else if (record->value != NULL && record->value_len > 0) {
                 cache_put(record->key, record->key_len, record->value, record->value_len, record->sector);
                 hpkv_log(HPKV_LOG_DEBUG, "Prefetched adjacent key: %.*s (length: %u)\n", 
                          record->key_len, record->key, record->key_len);
@@ -422,22 +444,34 @@ static void prefetch_adjacent(const char *key, uint16_t key_len)
 static void cache_put(const char *key, uint16_t key_len, const char *value, size_t value_len, sector_t sector)
 {
     struct cached_record *cached;
-    u32 hash = djb2_hash(key, key_len);
+    u32 hash;
+
+    if (!key || !value || key_len == 0 || value_len == 0) {
+        hpkv_log(HPKV_LOG_ERR, "Invalid input to cache_put\n");
+        return;
+    }
+
+    hash = djb2_hash(key, key_len);
 
     spin_lock(&cache_lock);
 
     cached = cache_get(key, key_len);
     if (cached) {
         // Update existing entry
-        kfree(cached->value);
-        cached->value = kmalloc(value_len, GFP_ATOMIC);
-        if (cached->value) {
-            memcpy(cached->value, value, value_len);
+        char *new_value = kmalloc(value_len, GFP_ATOMIC);
+        if (new_value) {
+            memcpy(new_value, value, value_len);
+            if (cached->value) {
+                kfree(cached->value);
+            }
+            cached->value = new_value;
             cached->value_len = value_len;
             cached->sector = sector;
+            update_lru(cached);
+            hpkv_log(HPKV_LOG_DEBUG, "Updated existing cache entry for key: %.*s\n", key_len, key);
+        } else {
+            hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for updated cache value\n");
         }
-        update_lru(cached);
-        hpkv_log(HPKV_LOG_DEBUG, "Updated existing cache entry for key: %.*s\n", key_len, key);
     } else {
         // Add new entry
         if (atomic_read(&cache_count) >= calculate_cache_size()) {
@@ -446,29 +480,26 @@ static void cache_put(const char *key, uint16_t key_len, const char *value, size
         cached = kmalloc(sizeof(*cached), GFP_ATOMIC);
         if (cached) {
             cached->key = kmalloc(key_len, GFP_ATOMIC);
-            if (cached->key) {
+            cached->value = kmalloc(value_len, GFP_ATOMIC);
+            if (cached->key && cached->value) {
                 memcpy(cached->key, key, key_len);
                 cached->key_len = key_len;
-                cached->value = kmalloc(value_len, GFP_ATOMIC);
-                if (cached->value) {
-                    memcpy(cached->value, value, value_len);
-                    cached->value_len = value_len;
-                    cached->sector = sector;
-                    hash_add(cache, &cached->node, hash);
-                    list_add(&cached->lru_list, &lru_list);
-                    atomic_inc(&cache_count);
-                    hpkv_log(HPKV_LOG_DEBUG, "Added new cache entry for key: %.*s\n", key_len, key);
-                } else {
-                    kfree(cached->key);
-                    kfree(cached);
-                    hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for cache value\n");
-                }
+                memcpy(cached->value, value, value_len);
+                cached->value_len = value_len;
+                cached->sector = sector;
+                hash_add(cache, &cached->node, hash);
+                INIT_LIST_HEAD(&cached->lru_list);
+                list_add(&cached->lru_list, &lru_list);
+                atomic_inc(&cache_count);
+                hpkv_log(HPKV_LOG_DEBUG, "Added new cache entry for key: %.*s\n", key_len, key);
             } else {
+                hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for new cache entry\n");
+                if (cached->key) kfree(cached->key);
+                if (cached->value) kfree(cached->value);
                 kfree(cached);
-                hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for cache key\n");
             }
         } else {
-            hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for cache entry\n");
+            hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for new cache record\n");
         }
     }
 
@@ -491,7 +522,6 @@ static size_t calculate_record_size(uint16_t key_len, size_t value_len)
 static int load_record_from_disk(sector_t sector, char **value, size_t *value_len)
 {
     struct buffer_head *bh;
-    int ret = -EIO;
     uint16_t key_len;
     size_t buffer_size;
     int i;
@@ -652,6 +682,12 @@ static int search_record(const char *key, uint16_t key_len, char **value, size_t
     rcu_read_lock();
     record = record_find_rcu(key, key_len);
     if (record) {
+        if(atomic_read(&record->refcount) == 0) {
+            // No references to this record, so it's scheduled for deletion
+            rcu_read_unlock();
+            return -ENOENT;
+        }
+
         smp_rmb();  // Ensure we see the latest value of record->value
         if (record->value) {
             *value = kmalloc(record->value_len, GFP_KERNEL);
@@ -1502,7 +1538,6 @@ static void write_record_work(struct work_struct *work)
 {
     struct write_buffer_entry *entry = container_of(work, struct write_buffer_entry, work);
     unsigned long timeout;
-    int num_sectors;
     
     if (!entry) {
         hpkv_log(HPKV_LOG_ERR, "Invalid entry in write_record_work\n");
@@ -1583,7 +1618,6 @@ static void compact_disk(void)
     flush_write_buffer();
 
     struct record *record;
-    struct rb_node *node;
     sector_t read_sector = 1, write_sector = 1;
     char *buffer;
     struct buffer_head *read_bh, *write_bh;
