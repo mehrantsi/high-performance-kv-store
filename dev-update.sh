@@ -313,10 +313,6 @@ update_in_qemu() {
                 # Remove all unused objects
                 sudo docker system prune -af
 
-                # Stop docker service
-                sudo systemctl stop docker.socket
-                sudo systemctl stop docker
-
                 # Remove any remaining docker files
                 sudo rm -rf /var/lib/docker/tmp || true
                 sudo rm -rf /var/lib/docker/overlay2 || true
@@ -325,10 +321,6 @@ update_in_qemu() {
                 sudo rm -rf /var/lib/docker/containers || true
                 sudo rm -rf /var/lib/docker/network || true
                 sudo rm -rf /var/lib/docker/volumes || true
-
-                # Start docker service
-                sudo systemctl start docker
-                sudo systemctl start docker.socket
 
                 # Import the tar file as a new image
                 cat temp_container.tar | sudo docker import - \$NEW_IMAGE_TAG
