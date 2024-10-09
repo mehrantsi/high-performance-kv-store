@@ -184,7 +184,7 @@ static int cache_size_percentage = 10;  // Cache size as a percentage of total r
 **Cache Size Adjustment:**
 The `adjust_cache_size` function dynamically adjusts the cache size based on available memory and current usage:
 
----mermaid
+```mermaid
 flowchart TD
     A[Start] --> B{Available memory > MEMORY_THRESHOLD_HIGH}
     B -->|Yes| C{Current count * 10 < current cache size * 12}
@@ -201,7 +201,7 @@ flowchart TD
     J --> K
     H --> K
     K --> L[End]
----
+```
 
 This flowchart illustrates the decision-making process for adjusting the cache size based on available memory and current cache usage. The function aims to balance memory usage and cache performance by increasing or decreasing the cache size percentage within defined limits.
 
@@ -209,14 +209,14 @@ This flowchart illustrates the decision-making process for adjusting the cache s
 
 The `update_lru` function moves a recently accessed item to the front of the LRU list:
 
----mermaid
+```mermaid
 flowchart TD
     A[Start] --> B[Remove record from current position in LRU list]
     B --> C[Add record to front of LRU list]
     C --> D[Update record's last_access time]
     D --> E[Log debug information]
     E --> F[End]
----
+```
 
 This operation ensures that frequently accessed records remain in the cache longer.
 
@@ -224,7 +224,7 @@ This operation ensures that frequently accessed records remain in the cache long
 
 The `evict_lru` function removes the least recently used item from the cache when it reaches capacity:
 
----mermaid
+```mermaid
 flowchart TD
     A[Start] --> B[Get last entry from LRU list]
     B --> C[Remove entry from hash table]
@@ -234,7 +234,7 @@ flowchart TD
     F --> G[Decrement cache count]
     G --> H[Log debug information]
     H --> I[End]
----
+```
 
 This operation makes room for new entries when the cache reaches its capacity limit.
 
@@ -242,7 +242,7 @@ This operation makes room for new entries when the cache reaches its capacity li
 
 The `prefetch_adjacent` function loads adjacent records into the cache to improve read performance for sequential access patterns:
 
----mermaid
+```mermaid
 flowchart TD
     A[Start] --> B[Find record in memory]
     B --> C{Record found?}
@@ -261,7 +261,7 @@ flowchart TD
     H --> N
     L --> N
     M --> N
----
+```
 
 This operation improves performance for sequential read patterns by preemptively loading adjacent records into the cache.
 
