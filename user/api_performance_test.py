@@ -1,10 +1,12 @@
-import requests
+import asyncio
+import aiohttp
 import time
 import statistics
 import random
 import string
 import json
 from config import API_URL, API_KEY
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 headers = {
     "Content-Type": "application/json",
@@ -14,86 +16,150 @@ headers = {
 def generate_random_string(length):
     return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
-def insert_record(key, value):
-    start_time = time.time()
-    response = requests.post(f"{API_URL}/record", 
-                             headers=headers,
-                             json={"key": key, "value": value})
-    end_time = time.time()
-    if response.status_code == 200:
-        return (end_time - start_time) * 1000  # Convert to milliseconds
-    else:
-        print(f"Failed to insert record: {response.text}")
-        return None
+async def test_connection():
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{API_URL}/ping", headers=headers) as response:
+                if response.status == 200:
+                    print("Successfully connected to the API.")
+                    return True
+                else:
+                    print(f"API responded with status code: {response.status}")
+                    return False
+    except aiohttp.ClientError as e:
+        print(f"Failed to connect to the API: {e}")
+        return False
 
-def retrieve_record(key):
+async def measure_api_call(session, method, url, **kwargs):
     start_time = time.time()
-    response = requests.get(f"{API_URL}/record/{key}", headers=headers)
-    end_time = time.time()
-    if response.status_code == 200:
-        return (end_time - start_time) * 1000  # Convert to milliseconds
-    else:
-        print(f"Failed to retrieve record: {response.text}")
-        return None
+    async with getattr(session, method)(url, **kwargs) as response:
+        end_time = time.time()
+        if response.status == 200:
+            return (end_time - start_time) * 1000  # Convert to milliseconds
+        else:
+            raise aiohttp.ClientError(f"API call failed: {await response.text()}")
 
-def delete_record(key):
-    start_time = time.time()
-    response = requests.delete(f"{API_URL}/record/{key}", headers=headers)
-    end_time = time.time()
-    if response.status_code == 200:
-        return (end_time - start_time) * 1000  # Convert to milliseconds
-    else:
-        print(f"Failed to delete record: {response.text}")
-        return None
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10),
+       retry=retry_if_exception_type(aiohttp.ClientError))
+async def insert_record(session, key, value):
+    return await measure_api_call(session, 'post', f"{API_URL}/record", 
+                                  headers=headers, json={"key": key, "value": value})
 
-def run_test(num_records):
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10),
+       retry=retry_if_exception_type(aiohttp.ClientError))
+async def retrieve_record(session, key):
+    return await measure_api_call(session, 'get', f"{API_URL}/record/{key}", headers=headers)
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10),
+       retry=retry_if_exception_type(aiohttp.ClientError))
+async def delete_record(session, key):
+    return await measure_api_call(session, 'delete', f"{API_URL}/record/{key}", headers=headers)
+
+async def run_test(num_records, parallel=True, concurrency_limit=100):
     write_latencies = []
     read_latencies = []
     delete_latencies = []
     
-    print(f"Running test with {num_records} records...")
+    print(f"Running {'parallel' if parallel else 'sequential'} test with {num_records} records...")
     
-    # Insert records
-    for i in range(num_records):
-        key = f"key_{num_records}_{i}"
-        value = generate_random_string(50)  # Generate a random 50-character string
-        latency = insert_record(key, value)
-        if latency is not None:
-            write_latencies.append(latency)
+    async with aiohttp.ClientSession() as session:
+        # Insert records
+        tasks = []
+        for i in range(num_records):
+            key = f"key_{num_records}_{i}"
+            value = generate_random_string(50)  # Generate a random 50-character string
+            tasks.append(insert_record(session, key, value))
+        
+        if parallel:
+            semaphore = asyncio.Semaphore(concurrency_limit)
+            async def bounded_insert(task):
+                async with semaphore:
+                    return await task
+            write_latencies = await asyncio.gather(*[bounded_insert(task) for task in tasks], return_exceptions=True)
+        else:
+            write_latencies = []
+            for task in tasks:
+                latency = await task
+                write_latencies.append(latency)
+        
+        write_latencies = [lat for lat in write_latencies if isinstance(lat, (int, float))]
+        
+        # Read records
+        tasks = []
+        for i in range(num_records):
+            key = f"key_{num_records}_{i}"
+            tasks.append(retrieve_record(session, key))
+        
+        if parallel:
+            async def bounded_retrieve(task):
+                async with semaphore:
+                    return await task
+            read_latencies = await asyncio.gather(*[bounded_retrieve(task) for task in tasks], return_exceptions=True)
+        else:
+            read_latencies = []
+            for task in tasks:
+                latency = await task
+                read_latencies.append(latency)
+        
+        read_latencies = [lat for lat in read_latencies if isinstance(lat, (int, float))]
+        
+        # Delete records
+        tasks = []
+        for i in range(num_records):
+            key = f"key_{num_records}_{i}"
+            tasks.append(delete_record(session, key))
+        
+        if parallel:
+            async def bounded_delete(task):
+                async with semaphore:
+                    return await task
+            delete_latencies = await asyncio.gather(*[bounded_delete(task) for task in tasks], return_exceptions=True)
+        else:
+            delete_latencies = []
+            for task in tasks:
+                latency = await task
+                delete_latencies.append(latency)
+        
+        delete_latencies = [lat for lat in delete_latencies if isinstance(lat, (int, float))]
     
-    # Read records
-    for i in range(num_records):
-        key = f"key_{num_records}_{i}"
-        latency = retrieve_record(key)
-        if latency is not None:
-            read_latencies.append(latency)
-    
-    # Delete records
-    for i in range(num_records):
-        key = f"key_{num_records}_{i}"
-        latency = delete_record(key)
-        if latency is not None:
-            delete_latencies.append(latency)
-    
+    if not write_latencies or not read_latencies or not delete_latencies:
+        print("Test failed due to errors. Please check the API connection and try again.")
+        return
+
     # Calculate statistics
-    write_median = statistics.median(write_latencies)
-    read_median = statistics.median(read_latencies)
-    delete_median = statistics.median(delete_latencies)
-    write_std_dev = statistics.stdev(write_latencies)
-    read_std_dev = statistics.stdev(read_latencies)
-    delete_std_dev = statistics.stdev(delete_latencies)
+    def calculate_stats(latencies):
+        return {
+            "median": statistics.median(latencies),
+            "mean": statistics.mean(latencies),
+            "std_dev": statistics.stdev(latencies),
+            "min": min(latencies),
+            "max": max(latencies),
+            "p95": sorted(latencies)[int(len(latencies) * 0.95)],
+            "p99": sorted(latencies)[int(len(latencies) * 0.99)]
+        }
+
+    write_stats = calculate_stats(write_latencies)
+    read_stats = calculate_stats(read_latencies)
+    delete_stats = calculate_stats(delete_latencies)
     
     print(f"Results for {num_records} records:")
-    print(f"Write         - Median Latency: {write_median:.3f} ms, Std Dev: {write_std_dev:.3f} ms")
-    print(f"Read          - Median Latency: {read_median:.3f} ms, Std Dev: {read_std_dev:.3f} ms")
-    print(f"Delete        - Median Latency: {delete_median:.3f} ms, Std Dev: {delete_std_dev:.3f} ms")
+    for op, stats in [("Write", write_stats), ("Read", read_stats), ("Delete", delete_stats)]:
+        print(f"{op:<12} - Median: {stats['median']:.3f} ms, Mean: {stats['mean']:.3f} ms, "
+              f"Std Dev: {stats['std_dev']:.3f} ms, Min: {stats['min']:.3f} ms, Max: {stats['max']:.3f} ms, "
+              f"P95: {stats['p95']:.3f} ms, P99: {stats['p99']:.3f} ms")
 
-def main():
+async def main():
+    if not await test_connection():
+        print("Failed to connect to the API. Please check if the server is running and the API_URL is correct.")
+        return
+
     sample_sizes = [100, 1000, 10000]
     
     for size in sample_sizes:
-        run_test(size)
+        await run_test(size, parallel=True, concurrency_limit=100)
+        print()
+        await run_test(size, parallel=False)
         print()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

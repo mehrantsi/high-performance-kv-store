@@ -167,9 +167,7 @@ if (cluster.isMaster) {
         const { key, value, partialUpdate } = req.body;
         const tenantKey = req.tenantId + key;
 
-        try {
-            console.log(`Received request - Key: ${tenantKey}, Value length: ${value.length}, Partial Update: ${partialUpdate}`);
-            
+        try {            
             await hpkvIoctl(partialUpdate ? HPKV_IOCTL_PARTIAL_UPDATE : HPKV_IOCTL_INSERT, tenantKey, value);
             res.status(200).json({ success: true, message: 'Record inserted/updated successfully' });
         } catch (error) {

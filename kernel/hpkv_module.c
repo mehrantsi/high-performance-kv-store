@@ -37,7 +37,9 @@
 #define MAX_DISK_USAGE (1UL << 40) // 1 TB max disk usage
 #define HPKV_BLOCK_SIZE 4096
 #define PROC_ENTRY "hpkv_stats"
-#define CACHE_SIZE 1000
+#define MEMORY_THRESHOLD_HIGH (totalram_pages() * PAGE_SIZE * 30 / 100)  // 30% of total RAM
+#define MEMORY_THRESHOLD_LOW (totalram_pages() * PAGE_SIZE * 10 / 100)   // 10% of total RAM
+#define CACHE_ADJUST_INTERVAL (5 * 60 * HZ)  // 5 minutes
 #define COMPACT_INTERVAL (1800 * HZ) // Run compaction every 30 minutes
 #define HPKV_SIGNATURE "HPKV_V2"
 #define HPKV_SIGNATURE_SIZE 8
@@ -96,8 +98,15 @@ static int extend_device(loff_t new_size);
 static void flush_work_handler(struct work_struct *work);
 static void write_record_work(struct work_struct *work);
 static void metadata_update_work_func(struct work_struct *work);
-static void release_sectors(sector_t start_sector, size_t size);
-static bool flush_workqueue_timeout(struct workqueue_struct *wq, unsigned long timeout);
+static void release_sectors(sector_t start_sector, int num_sectors);
+static int calculate_cache_size(void);
+static void update_lru(struct cached_record *record);
+static void evict_lru(void);
+static void adjust_cache_size(void);
+static void prefetch_adjacent(const char *key, uint16_t key_len);
+static void cache_adjust_work_handler(struct work_struct *work);
+static void mark_sectors_as_deleted(sector_t start_sector, int num_sectors);
+static size_t calculate_record_size(uint16_t key_len, size_t value_len);
 
 static int major_num;
 static struct kmem_cache *record_cache;
@@ -136,6 +145,8 @@ struct cached_record {
     size_t value_len;
     sector_t sector;
     struct hlist_node node;
+    struct list_head lru_list;
+    unsigned long last_access;
 };
 
 enum operation_type {
@@ -166,8 +177,10 @@ static atomic_long_t total_disk_usage = ATOMIC_LONG_INIT(0);
 static atomic_t record_count = ATOMIC_INIT(0);
 
 static DEFINE_HASHTABLE(cache, 10);  // 1024 buckets
-static int cache_count = 0;
+static atomic_t cache_count = ATOMIC_INIT(0);
 static DEFINE_SPINLOCK(cache_lock);
+static LIST_HEAD(lru_list);
+static int cache_size_percentage = 10;  // Cache size as a percentage of total records
 
 static DECLARE_BITMAP(allocated_sectors, SECTORS_BITMAP_SIZE);
 static DEFINE_SPINLOCK(sector_allocation_lock);
@@ -197,6 +210,7 @@ static struct delayed_work compact_work;
 static struct workqueue_struct *flush_wq;
 static struct work_struct hpkv_flush_work;
 static DECLARE_WORK(metadata_update_work, metadata_update_work_func);
+static DECLARE_DELAYED_WORK(cache_adjust_work, cache_adjust_work_handler);
 
 
 #define HPKV_LOG_EMERG   0
@@ -313,6 +327,98 @@ static struct cached_record *cache_get(const char *key, uint16_t key_len)
     return NULL;
 }
 
+static int calculate_cache_size(void)
+{
+    int total_records = atomic_read(&record_count);
+    int cache_size = max(1000, (total_records * cache_size_percentage) / 100);
+    hpkv_log(HPKV_LOG_DEBUG, "Calculated cache size: %d (total records: %d, percentage: %d%%)\n", 
+             cache_size, total_records, cache_size_percentage);
+    return cache_size;
+}
+
+static void update_lru(struct cached_record *record)
+{
+    list_del(&record->lru_list);
+    list_add(&record->lru_list, &lru_list);
+    record->last_access = jiffies;
+    hpkv_log(HPKV_LOG_DEBUG, "Updated LRU for key: %.*s, new access time: %lu\n", 
+             record->key_len, record->key, record->last_access);
+}
+
+static void evict_lru(void)
+{
+    struct cached_record *victim;
+    victim = list_last_entry(&lru_list, struct cached_record, lru_list);
+    hash_del(&victim->node);
+    list_del(&victim->lru_list);
+    hpkv_log(HPKV_LOG_DEBUG, "Evicted LRU entry for key: %.*s, last access time: %lu\n", 
+             victim->key_len, victim->key, victim->last_access);
+    kfree(victim->key);
+    kfree(victim->value);
+    kfree(victim);
+    atomic_dec(&cache_count);
+}
+
+static void adjust_cache_size(void)
+{
+    unsigned long available_memory = si_mem_available() * PAGE_SIZE;
+    int current_cache_size = calculate_cache_size();
+    int old_percentage = cache_size_percentage;
+    int current_count = atomic_read(&cache_count);
+    
+    if (available_memory > MEMORY_THRESHOLD_HIGH && current_count * 10 < current_cache_size * 12) {
+        // Increase cache size
+        cache_size_percentage = min(cache_size_percentage + 5, 30);
+    } else if (available_memory < MEMORY_THRESHOLD_LOW || current_count * 10 > current_cache_size * 9) {
+        // Decrease cache size
+        cache_size_percentage = max(cache_size_percentage - 5, 5);
+    }
+
+    if (old_percentage != cache_size_percentage) {
+        hpkv_log(HPKV_LOG_INFO, "Adjusted cache size percentage from %d%% to %d%%. Current count: %d, Target size: %d, Available memory: %lu bytes\n", 
+                 old_percentage, cache_size_percentage, current_count, current_cache_size, available_memory);
+    }
+}
+
+static void prefetch_adjacent(const char *key, uint16_t key_len)
+{
+    struct record *record;
+    struct rb_node *node;
+    
+    rcu_read_lock();
+    record = search_record_in_memory(key, key_len);
+    if (record) {
+        node = rb_next(&record->tree_node);
+        if (node) {
+            record = rb_entry(node, struct record, tree_node);
+            if (record->value == NULL && record->value_len > 0) {
+                // Load the value from disk
+                char *value = kmalloc(record->value_len, GFP_KERNEL);
+                if (value) {
+                    if (load_record_from_disk(record->sector, &value, &record->value_len) == 0) {
+                        cache_put(record->key, record->key_len, value, record->value_len, record->sector);
+                        hpkv_log(HPKV_LOG_DEBUG, "Prefetched adjacent key: %.*s (length: %u)\n", 
+                                record->key_len, record->key, record->key_len);
+                    }
+                    kfree(value);
+                }
+            }
+            else if (record->value != NULL) {
+                cache_put(record->key, record->key_len, record->value, record->value_len, record->sector);
+                hpkv_log(HPKV_LOG_DEBUG, "Prefetched adjacent key: %.*s (length: %u)\n", 
+                         record->key_len, record->key, record->key_len);
+            }
+        } else {
+            hpkv_log(HPKV_LOG_DEBUG, "No adjacent key found for prefetching after key: %.*s\n", 
+                     key_len, key);
+        }
+    } else {
+        hpkv_log(HPKV_LOG_DEBUG, "Unable to prefetch: key not found in memory: %.*s\n", 
+                 key_len, key);
+    }
+    rcu_read_unlock();
+}
+
 static void cache_put(const char *key, uint16_t key_len, const char *value, size_t value_len, sector_t sector)
 {
     struct cached_record *cached;
@@ -320,61 +426,66 @@ static void cache_put(const char *key, uint16_t key_len, const char *value, size
 
     spin_lock(&cache_lock);
 
-    // Check if the key already exists in the cache
-    hash_for_each_possible(cache, cached, node, hash) {
-        if (cached->key_len == key_len && memcmp(cached->key, key, key_len) == 0) {
-            // Update existing cache entry
-            kfree(cached->value);
-            cached->value = kmalloc(value_len, GFP_ATOMIC);
-            if (cached->value) {
-                memcpy(cached->value, value, value_len);
-                cached->value_len = value_len;
-                cached->sector = sector;
-            }
-            spin_unlock(&cache_lock);
-            return;
-        }
-    }
-
-    // If the cache is full, remove the first entry we find
-    if (cache_count >= CACHE_SIZE) {
-        int i;
-        struct hlist_node *tmp;
-        for (i = 0; i < HASH_SIZE(cache); i++) {
-            hlist_for_each_entry_safe(cached, tmp, &cache[i], node) {
-                hash_del(&cached->node);
-                kfree(cached->value);
-                kfree(cached);
-                cache_count--;
-                goto add_new_entry;
-            }
-        }
-    }
-
-add_new_entry:
-    cached = kmalloc(sizeof(*cached), GFP_ATOMIC);
+    cached = cache_get(key, key_len);
     if (cached) {
-        cached->key = kmalloc(key_len, GFP_ATOMIC);
-        if (cached->key) {
-            memcpy(cached->key, key, key_len);
-            cached->key_len = key_len;
-            cached->value = kmalloc(value_len, GFP_ATOMIC);
-            if (cached->value) {
-                memcpy(cached->value, value, value_len);
-                cached->value_len = value_len;
-                cached->sector = sector;
-                hash_add(cache, &cached->node, hash);
-                cache_count++;
+        // Update existing entry
+        kfree(cached->value);
+        cached->value = kmalloc(value_len, GFP_ATOMIC);
+        if (cached->value) {
+            memcpy(cached->value, value, value_len);
+            cached->value_len = value_len;
+            cached->sector = sector;
+        }
+        update_lru(cached);
+        hpkv_log(HPKV_LOG_DEBUG, "Updated existing cache entry for key: %.*s\n", key_len, key);
+    } else {
+        // Add new entry
+        if (atomic_read(&cache_count) >= calculate_cache_size()) {
+            evict_lru();
+        }
+        cached = kmalloc(sizeof(*cached), GFP_ATOMIC);
+        if (cached) {
+            cached->key = kmalloc(key_len, GFP_ATOMIC);
+            if (cached->key) {
+                memcpy(cached->key, key, key_len);
+                cached->key_len = key_len;
+                cached->value = kmalloc(value_len, GFP_ATOMIC);
+                if (cached->value) {
+                    memcpy(cached->value, value, value_len);
+                    cached->value_len = value_len;
+                    cached->sector = sector;
+                    hash_add(cache, &cached->node, hash);
+                    list_add(&cached->lru_list, &lru_list);
+                    atomic_inc(&cache_count);
+                    hpkv_log(HPKV_LOG_DEBUG, "Added new cache entry for key: %.*s\n", key_len, key);
+                } else {
+                    kfree(cached->key);
+                    kfree(cached);
+                    hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for cache value\n");
+                }
             } else {
-                kfree(cached->key);
                 kfree(cached);
+                hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for cache key\n");
             }
         } else {
-            kfree(cached);
+            hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for cache entry\n");
         }
     }
 
     spin_unlock(&cache_lock);
+}
+
+static void cache_adjust_work_handler(struct work_struct *work)
+{
+    hpkv_log(HPKV_LOG_DEBUG, "Starting cache size adjustment\n");
+    adjust_cache_size();
+    queue_delayed_work(system_wq, &cache_adjust_work, CACHE_ADJUST_INTERVAL);
+    hpkv_log(HPKV_LOG_DEBUG, "Finished cache size adjustment, next adjustment scheduled\n");
+}
+
+static size_t calculate_record_size(uint16_t key_len, size_t value_len)
+{
+    return sizeof(uint16_t) + key_len + sizeof(size_t) + value_len;
 }
 
 static int load_record_from_disk(sector_t sector, char **value, size_t *value_len)
@@ -382,8 +493,8 @@ static int load_record_from_disk(sector_t sector, char **value, size_t *value_le
     struct buffer_head *bh;
     int ret = -EIO;
     uint16_t key_len;
-    size_t total_len, buffer_size;
-    int sectors_to_read, i;
+    size_t buffer_size;
+    int i;
     char *buffer;
 
     bh = __bread(bdev, sector, HPKV_BLOCK_SIZE);
@@ -399,14 +510,14 @@ static int load_record_from_disk(sector_t sector, char **value, size_t *value_le
     memcpy(value_len, bh->b_data + sizeof(uint16_t) + key_len, sizeof(size_t));
 
     // Calculate total length and number of sectors to read
-    total_len = sizeof(uint16_t) + key_len + sizeof(size_t) + *value_len;
-    sectors_to_read = (total_len + HPKV_BLOCK_SIZE - 1) / HPKV_BLOCK_SIZE;
+    size_t total_record_size = calculate_record_size(key_len, *value_len);
+    int sectors_to_read = DIV_ROUND_UP(total_record_size, HPKV_BLOCK_SIZE);
 
     // Calculate buffer size
     buffer_size = sectors_to_read * HPKV_BLOCK_SIZE;
 
     hpkv_log(HPKV_LOG_DEBUG, "Loading record: key_len=%u, value_len=%zu, total_len=%zu, sectors_to_read=%d, buffer_size=%zu\n",
-             key_len, *value_len, total_len, sectors_to_read, buffer_size);
+             key_len, *value_len, total_record_size, sectors_to_read, buffer_size);
 
     // Sanity check to prevent excessive memory allocation
     if (*value_len > MAX_VALUE_SIZE || key_len > MAX_KEY_SIZE) {
@@ -532,6 +643,8 @@ static int search_record(const char *key, uint16_t key_len, char **value, size_t
         memcpy(*value, cached->value, cached->value_len);
         *value_len = cached->value_len;
         hpkv_log(HPKV_LOG_DEBUG, "Found key %.*s in cache\n", key_len, key);
+        update_lru(cached);
+        prefetch_adjacent(key, key_len);
         return 0;
     }
 
@@ -569,6 +682,10 @@ static int search_record(const char *key, uint16_t key_len, char **value, size_t
     }
     rcu_read_unlock();
 
+    if (ret == 0) {
+        prefetch_adjacent(key, key_len);
+    }
+
     return ret;
 }
 
@@ -594,7 +711,7 @@ static sector_t find_free_sector(size_t required_size)
     loff_t device_size;
     sector_t first_free_sector = 0;
     sector_t first_deleted_sector = 0;
-    int required_sectors = (required_size + HPKV_BLOCK_SIZE - 1) / HPKV_BLOCK_SIZE;
+    int required_sectors = DIV_ROUND_UP(required_size, HPKV_BLOCK_SIZE);
     int contiguous_free_sectors = 0;
     int contiguous_deleted_sectors = 0;
     sector_t device_sectors = i_size_read(bdev->bd_inode) / HPKV_BLOCK_SIZE;
@@ -707,19 +824,17 @@ static sector_t find_free_sector(size_t required_size)
     return -ENOSPC;
 }
 
-static void release_sectors(sector_t start_sector, size_t size)
+static void release_sectors(sector_t start_sector, int num_sectors)
 {
-    int sectors_to_release = (size + HPKV_BLOCK_SIZE - 1) / HPKV_BLOCK_SIZE;
-
     spin_lock(&sector_allocation_lock);
-    for (int i = 0; i < sectors_to_release; i++) {
+    for (int i = 0; i < num_sectors; i++) {
         clear_bit(start_sector + i, allocated_sectors);
     }
     smp_mb();  // Memory barrier after bit operations
     spin_unlock(&sector_allocation_lock);
 
     hpkv_log(HPKV_LOG_INFO, "Released %d sectors starting at %llu\n", 
-             sectors_to_release, (unsigned long long)start_sector);
+             num_sectors, (unsigned long long)start_sector);
 }
 
 static int update_metadata(void)
@@ -981,9 +1096,6 @@ static int insert_or_update_record(const char *key, uint16_t key_len, const char
     
     wake_up(&write_buffer_wait);
 
-    // Update cache with the new value
-    cache_put(key, key_len, new_record->value, new_record->value_len, 0);
-
     hpkv_log(HPKV_LOG_INFO, "Successfully queued %s operation for key: %.*s\n", 
              old_record ? (is_partial_update ? "partial update" : "update") : "insert", key_len, key);
     return ret;
@@ -1044,9 +1156,11 @@ static int delete_record(const char *key, uint16_t key_len)
     hash_for_each_possible(cache, cached, node, djb2_hash(key, key_len)) {
         if (cached->key_len == key_len && memcmp(cached->key, key, key_len) == 0) {
             hash_del(&cached->node);
+            list_del(&cached->lru_list);
+            kfree(cached->key);
             kfree(cached->value);
             kfree(cached);
-            cache_count--;
+            atomic_dec(&cache_count);
             break;
         }
     }
@@ -1155,7 +1269,8 @@ static void write_record_to_disk(struct record *record)
     device_size = i_size_read(bdev->bd_inode);
 
     // Calculate how many sectors we need for this record
-    required_sectors = (record->key_len + sizeof(uint16_t) + sizeof(size_t) + record->value_len + HPKV_BLOCK_SIZE - 1) / HPKV_BLOCK_SIZE;
+    size_t total_record_size = calculate_record_size(record->key_len, record->value_len);
+    required_sectors = DIV_ROUND_UP(total_record_size, HPKV_BLOCK_SIZE);
 
     // Find free sectors
     record->sector = find_free_sector(required_sectors * HPKV_BLOCK_SIZE);
@@ -1247,18 +1362,23 @@ static void write_record_to_disk(struct record *record)
     spin_unlock(&sector_allocation_lock);
 }
 
-static void mark_sector_as_deleted(sector_t sector)
+static void mark_sectors_as_deleted(sector_t start_sector, int num_sectors)
 {
-    struct buffer_head *bh = __getblk(bdev, sector, HPKV_BLOCK_SIZE);
-    if (bh) {
-        lock_buffer(bh);
-        memset(bh->b_data, 0, HPKV_BLOCK_SIZE);
-        memcpy(bh->b_data, "\0DELETED", 8);
-        set_buffer_uptodate(bh);
-        mark_buffer_dirty(bh);
-        unlock_buffer(bh);
-        sync_dirty_buffer(bh);
-        brelse(bh);
+    struct buffer_head *bh;
+    int i;
+
+    for (i = 0; i < num_sectors; i++) {
+        bh = __getblk(bdev, start_sector + i, HPKV_BLOCK_SIZE);
+        if (bh) {
+            lock_buffer(bh);
+            memset(bh->b_data, 0, HPKV_BLOCK_SIZE);
+            memcpy(bh->b_data, "\0DELETED", 8);
+            set_buffer_uptodate(bh);
+            mark_buffer_dirty(bh);
+            unlock_buffer(bh);
+            sync_dirty_buffer(bh);
+            brelse(bh);
+        }
     }
 }
 
@@ -1334,31 +1454,6 @@ static void flush_write_buffer(void)
     hpkv_log(HPKV_LOG_INFO, "Finished flush operations\n");
 }
 
-static bool flush_workqueue_timeout(struct workqueue_struct *wq, unsigned long timeout)
-{
-    unsigned long expire = jiffies + timeout;
-    bool all_completed = false;
-
-    while (time_before(jiffies, expire)) {
-        if (work_busy(&hpkv_flush_work) == 0) {
-            all_completed = true;
-            break;
-        }
-
-        if (signal_pending(current))
-            break;
-
-        schedule_timeout_interruptible(HZ/10);  // Sleep for 100ms
-    }
-
-    if (!all_completed) {
-        // Timeout occurred, attempt to cancel remaining work
-        cancel_work_sync(&hpkv_flush_work);
-    }
-
-    return all_completed;
-}
-
 static int write_buffer_worker(void *data)
 {
     unsigned long next_flush = jiffies + WRITE_BUFFER_FLUSH_INTERVAL;
@@ -1407,6 +1502,7 @@ static void write_record_work(struct work_struct *work)
 {
     struct write_buffer_entry *entry = container_of(work, struct write_buffer_entry, work);
     unsigned long timeout;
+    int num_sectors;
     
     if (!entry) {
         hpkv_log(HPKV_LOG_ERR, "Invalid entry in write_record_work\n");
@@ -1435,10 +1531,12 @@ static void write_record_work(struct work_struct *work)
             break;
         case OP_DELETE:
             if (entry->record->sector != 0) {
-                mark_sector_as_deleted(entry->record->sector);
-                // Release the sectors used by this record
-                release_sectors(entry->record->sector, entry->old_value_len);
-                hpkv_log(HPKV_LOG_INFO, "Marked sector as deleted for key: %.*s\n", entry->record->key_len, entry->record->key);
+                size_t total_record_size = calculate_record_size(entry->record->key_len, entry->old_value_len);
+                int num_sectors = DIV_ROUND_UP(total_record_size, HPKV_BLOCK_SIZE);
+                mark_sectors_as_deleted(entry->record->sector, num_sectors);
+                release_sectors(entry->record->sector, num_sectors);
+                hpkv_log(HPKV_LOG_INFO, "Marked %d sectors as deleted for key: %.*s\n", 
+                         num_sectors, entry->record->key_len, entry->record->key);
             }
             // Free the record
             call_rcu(&entry->record->rcu, record_free_rcu);
@@ -1859,7 +1957,7 @@ static int purge_data(void)
             }
             kfree(cached);
         }
-        cache_count = 0;
+        atomic_set(&cache_count, 0);
     }
     spin_unlock_irqrestore(&cache_lock, flags);
 
@@ -2127,11 +2225,6 @@ static int load_indexes(void)
 out:
     percpu_up_write(&rw_sem);
     return ret;
-}
-
-static void sync_work_func(struct work_struct *work)
-{
-    sync_blockdev(bdev);
 }
 
 static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
@@ -2632,6 +2725,8 @@ static int __init hpkv_init(void)
 
     init_completion(&flush_completion);
 
+    queue_delayed_work(system_wq, &cache_adjust_work, CACHE_ADJUST_INTERVAL);
+
     hpkv_log(HPKV_LOG_INFO, "Module loaded successfully\n");
     hpkv_log(HPKV_LOG_WARNING, "Registered with major number %d\n", major_num);
     return 0;
@@ -2744,7 +2839,7 @@ static void __exit hpkv_exit(void)
         }
         kfree(cached);
     }
-    cache_count = 0;
+    atomic_set(&cache_count, 0);
     spin_unlock(&cache_lock);
 
     percpu_up_write(&rw_sem);
@@ -2772,6 +2867,8 @@ static void __exit hpkv_exit(void)
     unregister_chrdev(major_num, DEVICE_NAME);
     percpu_free_rwsem(&rw_sem);
    
+    cancel_delayed_work_sync(&cache_adjust_work);
+
     hpkv_log(HPKV_LOG_INFO, "Module unloaded successfully\n");
 }
 
