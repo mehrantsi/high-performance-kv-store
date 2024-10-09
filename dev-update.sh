@@ -314,6 +314,7 @@ update_in_qemu() {
                 sudo docker system prune -af
 
                 # Stop docker service
+                sudo systemctl stop docker.socket
                 sudo systemctl stop docker
 
                 # Remove any remaining docker files
@@ -327,6 +328,7 @@ update_in_qemu() {
 
                 # Start docker service
                 sudo systemctl start docker
+                sudo systemctl start docker.socket
 
                 # Import the tar file as a new image
                 cat temp_container.tar | sudo docker import - \$NEW_IMAGE_TAG
@@ -389,7 +391,8 @@ update_in_qemu() {
           --privileged \
           --device /dev/loop-control:/dev/loop-control \
           -p 3000:3000 \
-          "\$LATEST_IMAGE"; then
+          "\$LATEST_IMAGE" \
+          /app/start.sh; then
             echo "New container started with updated image."
             
             # Wait for the container to be fully up and running
