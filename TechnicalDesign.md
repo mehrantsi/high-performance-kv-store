@@ -48,6 +48,8 @@ The HPKV module consists of several key components that work together to provide
 6. **Workqueues**: Separate workqueues for flushing the write buffer and performing disk compaction.
 7. **Bitmap**: A bitmap to track allocated sectors on the disk.
 8. **Red-Black Tree**: An in-memory red-black tree for efficient key-based lookups.
+9. **Per-CPU Read-Write Semaphore**: Used for synchronization between readers and writers.
+10. **Logging System**: A custom logging system with configurable log levels for debugging and monitoring.
 
 The following diagram provides a high-level overview of the HPKV module's architecture:
 
@@ -64,6 +66,8 @@ graph TD
     B --> I[Compact Workqueue]
     B --> J[Sector Bitmap]
     B --> K[Red-Black Tree]
+    B --> L[Per-CPU RW Semaphore]
+    B --> M[Logging System]
     C -->|Allocate/Free| B
     D -->|Buffer Writes| B
     E -->|Cache Access| B
@@ -73,6 +77,8 @@ graph TD
     I -->|Optimize Disk| F
     J -->|Track Sectors| F
     K -->|Efficient Lookup| B
+    L -->|Synchronization| B
+    M -->|Debug/Monitor| B
 ```
 
 ## Data Structures
@@ -143,6 +149,8 @@ struct hpkv_metadata {
 };
 ```
 
+These data structures form the core of the HPKV module, providing efficient storage and retrieval of key-value pairs both in memory and on disk.
+
 ## Memory Management
 
 ### Record Cache
@@ -164,7 +172,7 @@ init_waitqueue_head(&write_buffer_wait);
 ```
 
 ### Cache
-The cache implementation has been updated to include an LRU (Least Recently Used) mechanism:
+The cache implementation includes an LRU (Least Recently Used) mechanism:
 
 **Initialization:**
 ```c
@@ -207,36 +215,11 @@ This flowchart illustrates the decision-making process for adjusting the cache s
 
 #### Update LRU
 
-The `update_lru` function moves a recently accessed item to the front of the LRU list:
-
-```mermaid
-flowchart TD
-    A[Start] --> B[Remove record from current position in LRU list]
-    B --> C[Add record to front of LRU list]
-    C --> D[Update record's last_access time]
-    D --> E[Log debug information]
-    E --> F[End]
-```
-
-This operation ensures that frequently accessed records remain in the cache longer.
+The `update_lru` function moves a recently accessed item to the front of the LRU list. This operation ensures that frequently accessed records remain in the cache longer.
 
 #### Evict LRU
 
-The `evict_lru` function removes the least recently used item from the cache when it reaches capacity:
-
-```mermaid
-flowchart TD
-    A[Start] --> B[Get last entry from LRU list]
-    B --> C[Remove entry from hash table]
-    C --> D[Remove entry from LRU list]
-    D --> E[Free memory for key and value]
-    E --> F[Free cached_record structure]
-    F --> G[Decrement cache count]
-    G --> H[Log debug information]
-    H --> I[End]
-```
-
-This operation makes room for new entries when the cache reaches its capacity limit.
+The `evict_lru` function removes the least recently used item from the cache when it reaches capacity. This operation makes room for new entries when the cache reaches its capacity limit.
 
 #### Prefetch Adjacent Keys
 
@@ -555,7 +538,6 @@ sequenceDiagram
     participant HPKV as HPKV Module
     participant M as Memory Structures
     participant WB as Write Buffer
-    participant Cache
 
     C->>HPKV: insert_or_update_record(key, value, is_partial)
     HPKV->>M: Check if key exists
@@ -586,7 +568,6 @@ sequenceDiagram
         HPKV->>WB: Create and add delete entry for old record
     end
     HPKV->>WB: Wake up write buffer thread
-    HPKV->>Cache: Update cache
     HPKV-->>C: Return success
 ```
 
