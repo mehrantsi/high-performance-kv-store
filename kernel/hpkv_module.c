@@ -337,8 +337,18 @@ static int calculate_cache_size(void)
 
 static void update_lru(struct cached_record *record)
 {
-    list_del(&record->lru_list);
-    list_add(&record->lru_list, &lru_list);
+    if (!record) {
+        hpkv_log(HPKV_LOG_ERR, "Attempted to update LRU for null record\n");
+        return;
+    }
+
+    if (list_empty(&record->lru_list)) {
+        hpkv_log(HPKV_LOG_WARNING, "Record not in LRU list, adding it\n");
+        list_add(&record->lru_list, &lru_list);
+    } else {
+        list_del(&record->lru_list);
+        list_add(&record->lru_list, &lru_list);
+    }
     record->last_access = jiffies;
     hpkv_log(HPKV_LOG_DEBUG, "Updated LRU for key: %.*s, new access time: %lu\n", 
              record->key_len, record->key, record->last_access);
@@ -451,7 +461,9 @@ static void cache_put(const char *key, uint16_t key_len, const char *value, size
         char *new_value = kmalloc(value_len, GFP_ATOMIC);
         if (new_value) {
             memcpy(new_value, value, value_len);
-            kfree(cached->value);
+            if (cached->value) {
+                kfree(cached->value);
+            }
             cached->value = new_value;
             cached->value_len = value_len;
             cached->sector = sector;
@@ -476,6 +488,7 @@ static void cache_put(const char *key, uint16_t key_len, const char *value, size
                 cached->value_len = value_len;
                 cached->sector = sector;
                 hash_add(cache, &cached->node, hash);
+                INIT_LIST_HEAD(&cached->lru_list);
                 list_add(&cached->lru_list, &lru_list);
                 atomic_inc(&cache_count);
                 hpkv_log(HPKV_LOG_DEBUG, "Added new cache entry for key: %.*s\n", key_len, key);
