@@ -13,3 +13,4 @@ ubuntu*
 qemu_output.log
 output.log
 user/__pycache__/config.cpython-312.pyc
+/.vscode
