@@ -220,20 +220,20 @@ EOF
                     ;;
             esac
 
-            # Check if the correct version of the image already exists
-            if sudo docker image inspect "hpkv-image:${VERSION}-\${DOCKER_ARCH}" &> /dev/null; then
-                echo "Docker image hpkv-image:${VERSION}-\${DOCKER_ARCH} exists locally."
+            # Find the latest local image for the specified version
+            LATEST_LOCAL_IMAGE=\$(sudo docker images --format "{{.Repository}}:{{.Tag}}" | grep "hpkv-image:${VERSION}-\${DOCKER_ARCH}" | sort -r | head -n 1)
+
+            if [ -n "\$LATEST_LOCAL_IMAGE" ]; then
+                echo "Found latest local image: \$LATEST_LOCAL_IMAGE"
             else
-                echo "Downloading Docker image..."
+                echo "No local image found. Downloading Docker image..."
                 wget "https://github.com/mehrantsi/high-performance-kv-store/releases/download/${VERSION}/hpkv-image-\${DOCKER_ARCH}.tar.gz"
                 echo "Loading Docker image..."
                 sudo docker load < hpkv-image-\${DOCKER_ARCH}.tar.gz
                 rm hpkv-image-\${DOCKER_ARCH}.tar.gz
+                LATEST_LOCAL_IMAGE="hpkv-image:${VERSION}-\${DOCKER_ARCH}"
             fi
 
-            # Always use the latest local image for the specified version
-            LATEST_IMAGE_ID=\$(sudo docker images "hpkv-image:${VERSION}-\${DOCKER_ARCH}" --format "{{.ID}}" | head -n 1)
-            
             # Stop existing container if running
             sudo docker stop hpkv-container || true
             echo "Waiting for container to stop..."
@@ -252,7 +252,8 @@ EOF
               --privileged \
               --device /dev/loop-control:/dev/loop-control \
               -p 3000:3000 \
-              "\$LATEST_IMAGE_ID"
+              "\$LATEST_LOCAL_IMAGE" \
+              /app/start.sh
             
             echo "Waiting for container to start..."
             while ! sudo docker ps | grep -q hpkv-container; do
