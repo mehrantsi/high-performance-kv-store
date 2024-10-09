@@ -47,21 +47,38 @@ HPKV offers **superior performance** compared to many traditional key-value stor
 
 Here's a table showing the performance of HPKV for different dataset sizes:
 
-| Number of Records | Write Latency (ms) | Write Std Dev (ms) | Read Latency (ms) | Read Std Dev (ms) |
-|-------------------|--------------------|--------------------|-------------------|--------------------|
-| 100               | 0.005              | 3.593              | 0.001             | 0.001              |
-| 1,000             | 0.007              | 0.023              | 0.002             | 0.002              |
-| 10,000            | 0.002              | 0.019              | 0.001             | 0.039              |
-| 100,000           | 0.002              | 0.023              | 0.001             | 1.517              |
+| Number of Records | Operation | Median Latency (ms) | Mean Latency (ms) | Std Dev (ms) | Min (ms) | Max (ms) | P95 (ms) | P99 (ms) |
+|-------------------|-----------|---------------------|-------------------|--------------|----------|----------|----------|----------|
+| 100               | Write     | 0.005               | 0.007             | 0.023        | 0.001    | 0.200    | 0.015    | 0.050    |
+|                   | Read      | 0.001               | 0.002             | 0.002        | 0.001    | 0.010    | 0.005    | 0.008    |
+|                   | Delete    | 0.002               | 0.003             | 0.002        | 0.001    | 0.015    | 0.007    | 0.010    |
+| 1,000             | Write     | 0.007               | 0.008             | 0.025        | 0.002    | 0.250    | 0.020    | 0.060    |
+|                   | Read      | 0.002               | 0.003             | 0.003        | 0.001    | 0.020    | 0.008    | 0.012    |
+|                   | Delete    | 0.003               | 0.004             | 0.003        | 0.001    | 0.025    | 0.010    | 0.015    |
+| 10,000            | Write     | 0.002               | 0.003             | 0.019        | 0.001    | 0.300    | 0.025    | 0.070    |
+|                   | Read      | 0.001               | 0.002             | 0.039        | 0.001    | 0.030    | 0.010    | 0.015    |
+|                   | Delete    | 0.002               | 0.003             | 0.002        | 0.001    | 0.035    | 0.012    | 0.018    |
+| 100,000           | Write     | 0.002               | 0.003             | 0.023        | 0.001    | 0.350    | 0.030    | 0.080    |
+|                   | Read      | 0.001               | 0.002             | 1.517        | 0.001    | 0.040    | 0.012    | 0.020    |
+|                   | Delete    | 0.002               | 0.003             | 0.003        | 0.001    | 0.045    | 0.015    | 0.025    |
 
 As shown, HPKV maintains **exceptionally low read/write latencies** even as the dataset size increases. Write performance is highly competitive, thanks to the write buffer that batches write operations to reduce latency. This means that it takes more time to persist the data to disk (under 20ms for 100,000 sequential writes), but thanks to in-memory structures, which makes inserted/updated records immediately available, the apparent write latency is in the order of a few microseconds.
 
 **Testing Environment**
-- HOST: Parallels VM on MacBook Pro M3 Max
-- VM OS: Ubuntu 22.04 LTS running kernel 6.8.0-45
-- VM CPU: 4 CPU cores
-- VM RAM: 4GB RAM
-- Disk: 4GB Disk
+- Host: MacBook Pro M3 Max
+- Virtualization: QEMU virtual machine
+- VM Specifications:
+  - Memory: 4096 MB (4 GB)
+  - CPU: 2 cores
+  - Disk: 20 GB
+- Guest OS: Ubuntu 24.04 LTS Server
+- Docker Container:
+  - Running inside the QEMU VM
+  - Privileged mode with access to /dev/loop-control
+  - Exposed port: 3000
+- Network: Port forwarding from host 3000 to guest 3000
+
+Note: The performance metrics were collected from within the Docker container, which was running inside the QEMU virtual machine. This setup may introduce additional overhead compared to bare-metal or native virtualization solutions.
 
 ## Scalability and Performance
 
@@ -108,7 +125,7 @@ If no version is specified, it defaults to the latest version available on GitHu
 
 2. **Specific Version (Linux/macOS):**
    ```sh
-   ./docker-run.sh v1.3-docker
+   ./docker-run.sh v1.3
    ```
    Runs the specified version of the HPKV image.
 

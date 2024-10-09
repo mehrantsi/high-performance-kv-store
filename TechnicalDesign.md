@@ -21,14 +21,15 @@
 6. [Code Flows](#code-flows)
     - [Initialization](#initialization)
     - [Record Insertion/Update](#record-insertionupdate)
+    - [Record Retrieval](#record-retrieval)
     - [Record Deletion](#record-deletion)
     - [Write Buffer Flush](#write-buffer-flush)
     - [Disk Compaction](#disk-compaction)
-    - [Purge Operation](#purge-operation)
     - [Device IOCTL](#device-ioctl)
 7. [Logging and Debugging](#logging-and-debugging)
 8. [Module Parameters](#module-parameters)
-9. [Diagrams](#diagrams)
+9. [Performance Metrics](#performance-metrics)
+10. [Diagrams](#diagrams)
     - [Sequence Diagrams](#sequence-diagrams)
     - [Flowcharts](#flowcharts)
     - [SVG Visualizations](#svg-visualizations)
@@ -47,6 +48,8 @@ The HPKV module consists of several key components that work together to provide
 6. **Workqueues**: Separate workqueues for flushing the write buffer and performing disk compaction.
 7. **Bitmap**: A bitmap to track allocated sectors on the disk.
 8. **Red-Black Tree**: An in-memory red-black tree for efficient key-based lookups.
+9. **Per-CPU Read-Write Semaphore**: Used for synchronization between readers and writers.
+10. **Logging System**: A custom logging system with configurable log levels for debugging and monitoring.
 
 The following diagram provides a high-level overview of the HPKV module's architecture:
 
@@ -63,6 +66,8 @@ graph TD
     B --> I[Compact Workqueue]
     B --> J[Sector Bitmap]
     B --> K[Red-Black Tree]
+    B --> L[Per-CPU RW Semaphore]
+    B --> M[Logging System]
     C -->|Allocate/Free| B
     D -->|Buffer Writes| B
     E -->|Cache Access| B
@@ -72,18 +77,21 @@ graph TD
     I -->|Optimize Disk| F
     J -->|Track Sectors| F
     K -->|Efficient Lookup| B
+    L -->|Synchronization| B
+    M -->|Debug/Monitor| B
 ```
 
 ## Data Structures
 
 ### Record Structure
-The `record` structure represents a key-value pair stored in memory and on disk. It includes fields for the key, value, value length, and various pointers for hash table and red-black tree management. The `tree_node` field is particularly important for maintaining the red-black tree structure for efficient key-based lookups.
+The `record` structure represents a key-value pair stored in memory and on disk. It includes fields for the key, value, value length, and various pointers for hash table and red-black tree management.
 
 **Structure Definition:**
 ```c
 struct record {
-    char key[MAX_KEY_SIZE];
-    char value;
+    char *key;
+    uint16_t key_len;
+    char *value;
     size_t value_len;
     struct hlist_node hash_node;
     struct rb_node tree_node;
@@ -95,16 +103,19 @@ struct record {
 ```
 
 ### Cached Record Structure
-The `cached_record` structure represents a key-value pair stored in the in-memory cache. It includes fields for the key, value, value length, and sector.
+The `cached_record` structure represents a key-value pair stored in the in-memory cache.
 
 **Structure Definition:**
 ```c
 struct cached_record {
-    char key[MAX_KEY_SIZE];
+    char *key;
+    uint16_t key_len;
     char *value;
     size_t value_len;
     sector_t sector;
     struct hlist_node node;
+    struct list_head lru_list;
+    unsigned long last_access;
 };
 ```
 
@@ -138,6 +149,8 @@ struct hpkv_metadata {
 };
 ```
 
+These data structures form the core of the HPKV module, providing efficient storage and retrieval of key-value pairs both in memory and on disk.
+
 ## Memory Management
 
 ### Record Cache
@@ -159,14 +172,83 @@ init_waitqueue_head(&write_buffer_wait);
 ```
 
 ### Cache
-The cache is a hash table of `cached_record` structures. It is protected by a spinlock and has a maximum size defined by `CACHE_SIZE`.
+The cache implementation includes an LRU (Least Recently Used) mechanism:
 
 **Initialization:**
 ```c
 DEFINE_HASHTABLE(cache, 10);  // 1024 buckets
-static int cache_count = 0;
+static atomic_t cache_count = ATOMIC_INIT(0);
 static DEFINE_SPINLOCK(cache_lock);
+static LIST_HEAD(lru_list);
+static int cache_size_percentage = 10;  // Cache size as a percentage of total records
 ```
+
+**Cache Operations:**
+1. `cache_get`: Retrieves a record from the cache.
+2. `cache_put`: Adds or updates a record in the cache, managing the LRU list.
+3. `evict_lru`: Removes the least recently used item from the cache when it reaches capacity.
+4. `update_lru`: Moves a recently accessed item to the front of the LRU list.
+
+**Cache Size Adjustment:**
+The `adjust_cache_size` function dynamically adjusts the cache size based on available memory and current usage:
+
+```mermaid
+flowchart TD
+    A[Start] --> B{Available memory > MEMORY_THRESHOLD_HIGH}
+    B -->|Yes| C{Current count * 10 < current cache size * 12}
+    B -->|No| D{Available memory < MEMORY_THRESHOLD_LOW}
+    C -->|Yes| E[Increase cache_size_percentage]
+    C -->|No| D
+    D -->|Yes| F[Decrease cache_size_percentage]
+    D -->|No| G{Current count * 10 > current cache size * 9}
+    G -->|Yes| F
+    G -->|No| H[No change to cache_size_percentage]
+    E --> I[Limit cache_size_percentage to max 30%]
+    F --> J[Limit cache_size_percentage to min 5%]
+    I --> K[Log cache size adjustment]
+    J --> K
+    H --> K
+    K --> L[End]
+```
+
+This flowchart illustrates the decision-making process for adjusting the cache size based on available memory and current cache usage. The function aims to balance memory usage and cache performance by increasing or decreasing the cache size percentage within defined limits.
+
+#### Update LRU
+
+The `update_lru` function moves a recently accessed item to the front of the LRU list. This operation ensures that frequently accessed records remain in the cache longer.
+
+#### Evict LRU
+
+The `evict_lru` function removes the least recently used item from the cache when it reaches capacity. This operation makes room for new entries when the cache reaches its capacity limit.
+
+#### Prefetch Adjacent Keys
+
+The `prefetch_adjacent` function loads adjacent records into the cache to improve read performance for sequential access patterns:
+
+```mermaid
+flowchart TD
+    A[Start] --> B[Find record in memory]
+    B --> C{Record found?}
+    C -->|Yes| D[Get next record in red-black tree]
+    C -->|No| E[Log debug: Key not found]
+    D --> F{Next record exists?}
+    F -->|Yes| G{Value in memory?}
+    F -->|No| H[Log debug: No adjacent key]
+    G -->|No| I[Load value from disk]
+    G -->|Yes| J[Add to cache]
+    I --> K{Load successful?}
+    K -->|Yes| J
+    K -->|No| L[Log error: Failed to load]
+    J --> M[Log debug: Prefetched adjacent key]
+    E --> N[End]
+    H --> N
+    L --> N
+    M --> N
+```
+
+This operation improves performance for sequential read patterns by preemptively loading adjacent records into the cache.
+
+These cache operations work together to maintain an efficient and effective caching mechanism, balancing memory usage with performance optimization.
 
 ### Memory Allocation Techniques
 The HPKV module uses various memory allocation techniques to manage memory efficiently. These techniques include slab allocation, kmalloc, and vmalloc.
@@ -456,7 +538,6 @@ sequenceDiagram
     participant HPKV as HPKV Module
     participant M as Memory Structures
     participant WB as Write Buffer
-    participant Cache
 
     C->>HPKV: insert_or_update_record(key, value, is_partial)
     HPKV->>M: Check if key exists
@@ -487,15 +568,12 @@ sequenceDiagram
         HPKV->>WB: Create and add delete entry for old record
     end
     HPKV->>WB: Wake up write buffer thread
-    HPKV->>Cache: Update cache
     HPKV-->>C: Return success
 ```
 
 ### Record Retrieval
 
-The record retrieval process in HPKV is optimized for performance and memory efficiency. It involves a multi-tiered approach to find the requested key-value pair.
-
-**Record Retrieval Sequence Diagram:**
+The record retrieval process has been optimized to use the cache more effectively:
 
 ```mermaid
 sequenceDiagram
@@ -509,17 +587,21 @@ sequenceDiagram
     HPKV->>Cache: Check cache
     alt Found in cache
         Cache-->>HPKV: Return cached value
+        HPKV->>HPKV: Update LRU
+        HPKV->>HPKV: Prefetch adjacent records
         HPKV-->>C: Return value
     else Not in cache
         HPKV->>M: Search in-memory structures
         alt Record found
             M-->>HPKV: Record found
             alt Value in memory
+                HPKV->>Cache: Update cache
                 HPKV-->>C: Return in-memory value
             else Value not in memory
                 HPKV->>D: Load from disk
                 D-->>HPKV: Value loaded
                 HPKV->>Cache: Update cache
+                HPKV->>HPKV: Prefetch adjacent records
                 HPKV-->>C: Return value
             end
         else Record not found
@@ -668,53 +750,27 @@ flowchart TD
     L --> M[End]
 ```
 
-### Purge Operation
-The purge operation flow involves clearing in-memory structures, clearing the write buffer, clearing the disk, and resetting the sector bitmap.
-
-**Purge Operation Sequence Diagram:**
-```mermaid
-sequenceDiagram
-    participant User
-    participant HPKVModule
-    participant WriteBuffer
-    participant InMemoryStructures
-    participant Disk
-    participant SectorBitmap
-    participant Metadata
-
-    User->>HPKVModule: IOCTL Purge Command
-    HPKVModule->>WriteBuffer: Clear Write Buffer
-    WriteBuffer-->>HPKVModule: Write Buffer Cleared
-    HPKVModule->>InMemoryStructures: Clear In-Memory Structures
-    InMemoryStructures-->>HPKVModule: In-Memory Structures Cleared
-    HPKVModule->>Disk: Clear Disk Sectors
-    Disk-->>HPKVModule: Disk Cleared
-    HPKVModule->>SectorBitmap: Reset Sector Bitmap
-    SectorBitmap-->>HPKVModule: Sector Bitmap Reset
-    HPKVModule->>Metadata: Update Metadata
-    Metadata-->>HPKVModule: Metadata Updated
-    HPKVModule-->>User: Purge Complete
-```
-
 ### Device IOCTL
-The device IOCTL flow involves handling various commands such as get by key, delete by key, partial update, and purge.
+The device IOCTL now includes a new command for partial updates:
 
-**Device IOCTL Flowchart:**
 ```mermaid
 flowchart TD
     A[Start] --> B[IOCTL Command]
     B -->|Get by Key| C[Search Record]
     B -->|Delete by Key| D[Delete Record]
     B -->|Partial Update| E[Partial Update Record]
-    B -->|Purge| F[Purge Data]
-    C --> G[Return Record]
-    D --> H[Return Status]
-    E --> I[Return Status]
-    F --> J[Return Status]
-    G --> K[End]
-    H --> K
-    I --> K
-    J --> K
+    B -->|Insert| F[Insert Record]
+    B -->|Purge| G[Purge Data]
+    C --> H[Return Record]
+    D --> I[Return Status]
+    E --> J[Return Status]
+    F --> K[Return Status]
+    G --> L[Return Status]
+    H --> M[End]
+    I --> M
+    J --> M
+    K --> M
+    L --> M
 ```
 
 ## Logging and Debugging
