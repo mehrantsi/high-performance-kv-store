@@ -194,7 +194,7 @@ async def main():
         print("Failed to connect to the API. Please check if the server is running and the API_URL is correct.")
         return
 
-    sample_sizes = [100, 1000, 10000, 100000, 1000000]
+    sample_sizes = [1000, 10000, 100000, 1000000]
     
     for size in sample_sizes:
         await run_test(size, parallel=True, concurrency_limit=1000)

@@ -70,7 +70,7 @@ if (cluster.isMaster) {
         message: { error: 'Too many requests, please try again later.' }
     });
 
-    app.use(limiter);
+    //app.use(limiter);
 
     // Middleware for API key validation and tenant ID extraction
     app.use((req, res, next) => {
