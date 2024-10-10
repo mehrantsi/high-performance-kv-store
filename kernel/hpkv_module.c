@@ -365,49 +365,24 @@ static void update_lru(struct cached_record *record)
 static void evict_lru(void)
 {
     struct cached_record *victim = NULL;
-    struct hlist_node *tmp;
-    int bkt;
-    unsigned int random_bucket;
-
-    if (atomic_read(&cache_count) == 0) {
-        hpkv_log(HPKV_LOG_WARNING, "Attempted to evict from empty cache\n");
-        return;
-    }
-
-    // Choose a random bucket
-    random_bucket = get_random_u32() % HASH_SIZE(cache);
 
     rcu_read_lock();
-    hash_for_each_possible_safe(cache, victim, tmp, node, random_bucket) {
+    if (!list_empty(&lru_list)) {
+        victim = list_last_entry(&lru_list, struct cached_record, lru_list);
         if (victim) {
             hash_del_rcu(&victim->node);
-            rcu_read_unlock();
-            
-            // Free the victim outside of the RCU read-side critical section
-            call_rcu(&victim->rcu, free_cached_record_rcu);
-            atomic_dec(&cache_count);
-            
-            hpkv_log(HPKV_LOG_DEBUG, "Evicted random entry from cache\n");
-            return;
+            list_del_rcu(&victim->lru_list);
         }
     }
     rcu_read_unlock();
 
-    // If we didn't find an entry in the random bucket, try the next non-empty bucket
-    rcu_read_lock();
-    hash_for_each_safe(cache, bkt, tmp, victim, node) {
-        hash_del_rcu(&victim->node);
-        rcu_read_unlock();
-        
+    if (victim) {
+        hpkv_log(HPKV_LOG_DEBUG, "Evicting LRU entry for key: %.*s\n", victim->key_len, victim->key);
         call_rcu(&victim->rcu, free_cached_record_rcu);
         atomic_dec(&cache_count);
-        
-        hpkv_log(HPKV_LOG_DEBUG, "Evicted entry from cache after searching\n");
-        return;
+    } else {
+        hpkv_log(HPKV_LOG_WARNING, "Attempted to evict from empty LRU list\n");
     }
-    rcu_read_unlock();
-
-    hpkv_log(HPKV_LOG_WARNING, "Failed to evict any entry from cache\n");
 }
 
 static void free_cached_record_rcu(struct rcu_head *head)
@@ -572,7 +547,7 @@ static void cache_put(const char *key, uint16_t key_len, const char *value, size
 static void cache_adjust_work_handler(struct work_struct *work)
 {
     hpkv_log(HPKV_LOG_DEBUG, "Starting cache size adjustment\n");
-    adjust_cache_size();
+    //adjust_cache_size();
     queue_delayed_work(system_wq, &cache_adjust_work, CACHE_ADJUST_INTERVAL);
     hpkv_log(HPKV_LOG_DEBUG, "Finished cache size adjustment, next adjustment scheduled\n");
 }
