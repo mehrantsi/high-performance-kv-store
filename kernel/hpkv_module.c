@@ -321,7 +321,7 @@ static struct cached_record *cache_get(const char *key, uint16_t key_len)
         if (cached->key_len == key_len && memcmp(cached->key, key, key_len) == 0) {
             if (cached) {
                 rcu_read_unlock();
-                update_lru(cached);
+                //update_lru(cached);
                 return cached;
             }
         }
