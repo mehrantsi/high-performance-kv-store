@@ -364,7 +364,7 @@ static void update_lru(struct cached_record *record)
 
 static void evict_lru(void)
 {
-    struct cached_record *victim;
+    struct cached_record *victim = NULL;
 
     rcu_read_lock();
     if (!list_empty(&lru_list)) {
@@ -377,13 +377,15 @@ static void evict_lru(void)
     rcu_read_unlock();
 
     if (victim) {
-        call_rcu(&victim->rcu, free_cached_record_rcu);
+        synchronize_rcu();  // Ensure all RCU readers are done
+        hpkv_log(HPKV_LOG_DEBUG, "Evicting LRU entry for key: %.*s\n", victim->key_len, victim->key);
+        kfree(victim->key);
+        kfree(victim->value);
+        kfree(victim);
         atomic_dec(&cache_count);
-        hpkv_log(HPKV_LOG_DEBUG, "Evicted LRU entry for key: %.*s\n", victim->key_len, victim->key);
     } else {
         hpkv_log(HPKV_LOG_WARNING, "Attempted to evict from empty LRU list\n");
     }
-
 }
 
 static void free_cached_record_rcu(struct rcu_head *head)
