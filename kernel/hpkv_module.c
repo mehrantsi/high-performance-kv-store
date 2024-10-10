@@ -345,12 +345,11 @@ static void update_lru(struct cached_record *record)
         return;
     }
 
-    // Acquire the cache lock to ensure thread-safety
-    spin_lock(&cache_lock);
+    rcu_read_lock();
 
     // Check if the record is still in the cache
     struct cached_record *existing = NULL;
-    hash_for_each_possible(cache, existing, node, djb2_hash(record->key, record->key_len)) {
+    hash_for_each_possible_rcu(cache, existing, node, djb2_hash(record->key, record->key_len)) {
         if (existing == record) {
             break;
         }
@@ -358,22 +357,22 @@ static void update_lru(struct cached_record *record)
 
     if (existing != record) {
         hpkv_log(HPKV_LOG_WARNING, "Record not found in cache during LRU update\n");
-        spin_unlock(&cache_lock);
+        rcu_read_unlock();
         return;
     }
 
     // Now we're sure the record is still in the cache
     if (list_empty(&record->lru_list)) {
         hpkv_log(HPKV_LOG_WARNING, "Record not in LRU list, adding it\n");
-        list_add(&record->lru_list, &lru_list);
+        list_add_rcu(&record->lru_list, &lru_list);
     } else {
-        list_del(&record->lru_list);
-        list_add(&record->lru_list, &lru_list);
+        list_del_rcu(&record->lru_list);
+        list_add_rcu(&record->lru_list, &lru_list);
     }
 
     record->last_access = jiffies;
 
-    spin_unlock(&cache_lock);
+    rcu_read_unlock();
 
     hpkv_log(HPKV_LOG_DEBUG, "Updated LRU for key: %.*s, new access time: %lu\n", 
              record->key_len, record->key, record->last_access);
@@ -383,28 +382,29 @@ static void evict_lru(void)
 {
     struct cached_record *victim;
     
-    spin_lock(&cache_lock);
+    rcu_read_lock();
 
     if (list_empty(&lru_list)) {
         hpkv_log(HPKV_LOG_WARNING, "Attempted to evict from empty LRU list\n");
-        spin_unlock(&cache_lock);
+        rcu_read_unlock();
         return;
     }
 
     victim = list_last_entry(&lru_list, struct cached_record, lru_list);
     if (!victim) {
         hpkv_log(HPKV_LOG_ERR, "Failed to get last entry from LRU list\n");
-        spin_unlock(&cache_lock);
+        rcu_read_unlock();
         return;
     }
 
-    // Remove from hash table
-    hash_del(&victim->node);
+    // Remove from hash table and LRU list
+    hash_del_rcu(&victim->node);
+    list_del_rcu(&victim->lru_list);
 
-    // Remove from LRU list
-    list_del(&victim->lru_list);
+    rcu_read_unlock();
 
-    spin_unlock(&cache_lock);
+    // Ensure all readers have finished before freeing
+    synchronize_rcu();
 
     if (victim->key && victim->key_len > 0) {
         hpkv_log(HPKV_LOG_DEBUG, "Evicted LRU entry for key: %.*s, last access time: %lu\n", 
