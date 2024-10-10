@@ -107,7 +107,7 @@ static void prefetch_adjacent(const char *key, uint16_t key_len);
 static void cache_adjust_work_handler(struct work_struct *work);
 static void mark_sectors_as_deleted(sector_t start_sector, int num_sectors);
 static size_t calculate_record_size(uint16_t key_len, size_t value_len);
-static void free_cached_record_rcu(struct rcu_head *head)
+static void free_cached_record_rcu(struct rcu_head *head);
 
 static int major_num;
 static struct kmem_cache *record_cache;
