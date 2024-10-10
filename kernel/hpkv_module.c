@@ -313,7 +313,6 @@ static void insert_rb_tree(struct record *record)
 
 static struct cached_record *cache_get(const char *key, uint16_t key_len)
 {
-    return NULL;
     struct cached_record *cached;
     u32 hash = djb2_hash(key, key_len);
 
@@ -469,7 +468,6 @@ static void prefetch_adjacent(const char *key, uint16_t key_len)
 
 static void cache_put(const char *key, uint16_t key_len, const char *value, size_t value_len, sector_t sector)
 {
-    return;
     struct cached_record *cached, *new_cached;
     u32 hash;
 
