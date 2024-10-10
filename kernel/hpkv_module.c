@@ -320,13 +320,14 @@ static struct cached_record *cache_get(const char *key, uint16_t key_len)
     hash_for_each_possible_rcu(cache, cached, node, hash) {
         if (cached->key_len == key_len && memcmp(cached->key, key, key_len) == 0) {
             if (cached) {
+                rcu_read_unlock();
                 update_lru(cached);
+                return cached;
             }
-            rcu_read_unlock();
-            return cached;
         }
     }
     rcu_read_unlock();
+    hpkv_log(HPKV_LOG_DEBUG, "Cache miss for key: %.*s\n", key_len, key);
     return NULL;
 }
 
