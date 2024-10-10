@@ -316,8 +316,11 @@ static struct cached_record *cache_get(const char *key, uint16_t key_len)
     u32 hash = djb2_hash(key, key_len);
 
     rcu_read_lock();
-    hash_for_each_possible(cache, cached, node, hash) {
+    hash_for_each_possible_rcu(cache, cached, node, hash) {
         if (cached->key_len == key_len && memcmp(cached->key, key, key_len) == 0) {
+            if (cached) {
+                update_lru(cached);
+            }
             rcu_read_unlock();
             return cached;
         }
@@ -342,6 +345,24 @@ static void update_lru(struct cached_record *record)
         return;
     }
 
+    // Acquire the cache lock to ensure thread-safety
+    spin_lock(&cache_lock);
+
+    // Check if the record is still in the cache
+    struct cached_record *existing = NULL;
+    hash_for_each_possible(cache, existing, node, djb2_hash(record->key, record->key_len)) {
+        if (existing == record) {
+            break;
+        }
+    }
+
+    if (existing != record) {
+        hpkv_log(HPKV_LOG_WARNING, "Record not found in cache during LRU update\n");
+        spin_unlock(&cache_lock);
+        return;
+    }
+
+    // Now we're sure the record is still in the cache
     if (list_empty(&record->lru_list)) {
         hpkv_log(HPKV_LOG_WARNING, "Record not in LRU list, adding it\n");
         list_add(&record->lru_list, &lru_list);
@@ -349,7 +370,11 @@ static void update_lru(struct cached_record *record)
         list_del(&record->lru_list);
         list_add(&record->lru_list, &lru_list);
     }
+
     record->last_access = jiffies;
+
+    spin_unlock(&cache_lock);
+
     hpkv_log(HPKV_LOG_DEBUG, "Updated LRU for key: %.*s, new access time: %lu\n", 
              record->key_len, record->key, record->last_access);
 }
@@ -357,13 +382,43 @@ static void update_lru(struct cached_record *record)
 static void evict_lru(void)
 {
     struct cached_record *victim;
+    
+    spin_lock(&cache_lock);
+
+    if (list_empty(&lru_list)) {
+        hpkv_log(HPKV_LOG_WARNING, "Attempted to evict from empty LRU list\n");
+        spin_unlock(&cache_lock);
+        return;
+    }
+
     victim = list_last_entry(&lru_list, struct cached_record, lru_list);
+    if (!victim) {
+        hpkv_log(HPKV_LOG_ERR, "Failed to get last entry from LRU list\n");
+        spin_unlock(&cache_lock);
+        return;
+    }
+
+    // Remove from hash table
     hash_del(&victim->node);
+
+    // Remove from LRU list
     list_del(&victim->lru_list);
-    hpkv_log(HPKV_LOG_DEBUG, "Evicted LRU entry for key: %.*s, last access time: %lu\n", 
-             victim->key_len, victim->key, victim->last_access);
-    kfree(victim->key);
-    kfree(victim->value);
+
+    spin_unlock(&cache_lock);
+
+    if (victim->key && victim->key_len > 0) {
+        hpkv_log(HPKV_LOG_DEBUG, "Evicted LRU entry for key: %.*s, last access time: %lu\n", 
+                 victim->key_len, victim->key, victim->last_access);
+    } else {
+        hpkv_log(HPKV_LOG_WARNING, "Evicted LRU entry with invalid key\n");
+    }
+
+    if (victim->key) {
+        kfree(victim->key);
+    }
+    if (victim->value) {
+        kfree(victim->value);
+    }
     kfree(victim);
     atomic_dec(&cache_count);
 }
@@ -662,7 +717,6 @@ static int search_record(const char *key, uint16_t key_len, char **value, size_t
         memcpy(*value, cached->value, cached->value_len);
         *value_len = cached->value_len;
         hpkv_log(HPKV_LOG_DEBUG, "Found key %.*s in cache\n", key_len, key);
-        update_lru(cached);
         prefetch_adjacent(key, key_len);
         return 0;
     }
