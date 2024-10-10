@@ -711,7 +711,6 @@ static int search_record(const char *key, uint16_t key_len, char **value, size_t
         memcpy(*value, cached->value, cached->value_len);
         *value_len = cached->value_len;
         hpkv_log(HPKV_LOG_DEBUG, "Found key %.*s in cache\n", key_len, key);
-        prefetch_adjacent(key, key_len);
         return 0;
     }
 
