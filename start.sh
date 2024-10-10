@@ -19,12 +19,12 @@ case ${ARCH} in
 esac
 
 # Create a file to use as a block device if it doesn't exist
-if [ ! -f /app/hpkv_disk.img ]; then
-    dd if=/dev/zero of=/app/hpkv_disk.img bs=1M count=1024
+if [ ! -f /app/persistent_storage/hpkv_disk.img ]; then
+    dd if=/dev/zero of=/app/persistent_storage/hpkv_disk.img bs=1M count=1024
 fi
 
 # Detach any existing loop devices associated with our disk image
-EXISTING_LOOP=$(losetup -j /app/hpkv_disk.img | cut -d ':' -f 1)
+EXISTING_LOOP=$(losetup -j /app/persistent_storage/hpkv_disk.img | cut -d ':' -f 1)
 if [ ! -z "$EXISTING_LOOP" ]; then
     losetup -d $EXISTING_LOOP
 fi
@@ -37,7 +37,7 @@ LOOP_DEVICE=$(losetup -f)
 echo "Using loop device: $LOOP_DEVICE"
 
 # Set up the loop device
-losetup $LOOP_DEVICE /app/hpkv_disk.img
+losetup $LOOP_DEVICE /app/persistent_storage/hpkv_disk.img
 
 # Load the kernel module
 cd /app/kernel
