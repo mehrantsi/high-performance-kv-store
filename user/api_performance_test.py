@@ -59,11 +59,17 @@ async def run_test(num_records, parallel=True, concurrency_limit=100):
     write_latencies = []
     read_latencies = []
     delete_latencies = []
+    write_failures = 0
+    read_failures = 0
+    delete_failures = 0
     
     print(f"Running {'parallel' if parallel else 'sequential'} test with {num_records} records...")
     
     async with aiohttp.ClientSession() as session:
+        overall_start_time = time.time()
+
         # Insert records
+        insert_start_time = time.time()
         tasks = []
         for i in range(num_records):
             key = f"key_{num_records}_{i}"
@@ -75,16 +81,23 @@ async def run_test(num_records, parallel=True, concurrency_limit=100):
             async def bounded_insert(task):
                 async with semaphore:
                     return await task
-            write_latencies = await asyncio.gather(*[bounded_insert(task) for task in tasks], return_exceptions=True)
+            write_results = await asyncio.gather(*[bounded_insert(task) for task in tasks], return_exceptions=True)
         else:
-            write_latencies = []
+            write_results = []
             for task in tasks:
-                latency = await task
-                write_latencies.append(latency)
+                try:
+                    latency = await task
+                    write_results.append(latency)
+                except Exception as e:
+                    write_results.append(e)
         
-        write_latencies = [lat for lat in write_latencies if isinstance(lat, (int, float))]
+        insert_end_time = time.time()
+        insert_total_time = insert_end_time - insert_start_time
+        write_latencies = [lat for lat in write_results if isinstance(lat, (int, float))]
+        write_failures = len(write_results) - len(write_latencies)
         
         # Read records
+        read_start_time = time.time()
         tasks = []
         for i in range(num_records):
             key = f"key_{num_records}_{i}"
@@ -94,16 +107,23 @@ async def run_test(num_records, parallel=True, concurrency_limit=100):
             async def bounded_retrieve(task):
                 async with semaphore:
                     return await task
-            read_latencies = await asyncio.gather(*[bounded_retrieve(task) for task in tasks], return_exceptions=True)
+            read_results = await asyncio.gather(*[bounded_retrieve(task) for task in tasks], return_exceptions=True)
         else:
-            read_latencies = []
+            read_results = []
             for task in tasks:
-                latency = await task
-                read_latencies.append(latency)
+                try:
+                    latency = await task
+                    read_results.append(latency)
+                except Exception as e:
+                    read_results.append(e)
         
-        read_latencies = [lat for lat in read_latencies if isinstance(lat, (int, float))]
+        read_end_time = time.time()
+        read_total_time = read_end_time - read_start_time
+        read_latencies = [lat for lat in read_results if isinstance(lat, (int, float))]
+        read_failures = len(read_results) - len(read_latencies)
         
         # Delete records
+        delete_start_time = time.time()
         tasks = []
         for i in range(num_records):
             key = f"key_{num_records}_{i}"
@@ -113,17 +133,26 @@ async def run_test(num_records, parallel=True, concurrency_limit=100):
             async def bounded_delete(task):
                 async with semaphore:
                     return await task
-            delete_latencies = await asyncio.gather(*[bounded_delete(task) for task in tasks], return_exceptions=True)
+            delete_results = await asyncio.gather(*[bounded_delete(task) for task in tasks], return_exceptions=True)
         else:
-            delete_latencies = []
+            delete_results = []
             for task in tasks:
-                latency = await task
-                delete_latencies.append(latency)
+                try:
+                    latency = await task
+                    delete_results.append(latency)
+                except Exception as e:
+                    delete_results.append(e)
         
-        delete_latencies = [lat for lat in delete_latencies if isinstance(lat, (int, float))]
+        delete_end_time = time.time()
+        delete_total_time = delete_end_time - delete_start_time
+        delete_latencies = [lat for lat in delete_results if isinstance(lat, (int, float))]
+        delete_failures = len(delete_results) - len(delete_latencies)
+
+        overall_end_time = time.time()
+        overall_total_time = overall_end_time - overall_start_time
     
-    if not write_latencies or not read_latencies or not delete_latencies:
-        print("Test failed due to errors. Please check the API connection and try again.")
+    if not write_latencies and not read_latencies and not delete_latencies:
+        print("All operations failed. Please check the API connection and try again.")
         return
 
     # Calculate statistics
@@ -143,22 +172,32 @@ async def run_test(num_records, parallel=True, concurrency_limit=100):
     delete_stats = calculate_stats(delete_latencies)
     
     print(f"Results for {num_records} records:")
-    for op, stats in [("Write", write_stats), ("Read", read_stats), ("Delete", delete_stats)]:
-        print(f"{op:<12} - Median: {stats['median']:.3f} ms, Mean: {stats['mean']:.3f} ms, "
-              f"Std Dev: {stats['std_dev']:.3f} ms, Min: {stats['min']:.3f} ms, Max: {stats['max']:.3f} ms, "
-              f"P95: {stats['p95']:.3f} ms, P99: {stats['p99']:.3f} ms")
+    print(f"Overall time: {overall_total_time:.3f} seconds")
+    for op, stats, total_time, latencies, failures in [
+        ("Write", write_stats, insert_total_time, write_latencies, write_failures), 
+        ("Read", read_stats, read_total_time, read_latencies, read_failures), 
+        ("Delete", delete_stats, delete_total_time, delete_latencies, delete_failures)
+    ]:
+        success_rate = (len(latencies) / num_records) * 100
+        print(f"{op:<12} - Total time: {total_time:.3f} s, Throughput: {len(latencies)/total_time:.2f} ops/s")
+        print(f"           Successful: {len(latencies)}, Failed: {failures}, Success Rate: {success_rate:.2f}%")
+        if latencies:
+            print(f"           Individual request stats:")
+            print(f"           Median: {stats['median']:.3f} ms, Mean: {stats['mean']:.3f} ms, "
+                  f"Std Dev: {stats['std_dev']:.3f} ms, Min: {stats['min']:.3f} ms, Max: {stats['max']:.3f} ms, "
+                  f"P95: {stats['p95']:.3f} ms, P99: {stats['p99']:.3f} ms")
+        else:
+            print(f"           No successful requests to report statistics.")
 
 async def main():
     if not await test_connection():
         print("Failed to connect to the API. Please check if the server is running and the API_URL is correct.")
         return
 
-    sample_sizes = [100, 1000, 10000]
+    sample_sizes = [1000, 10000, 100000, 1000000]
     
     for size in sample_sizes:
-        await run_test(size, parallel=True, concurrency_limit=100)
-        print()
-        await run_test(size, parallel=False)
+        await run_test(size, parallel=True, concurrency_limit=1000)
         print()
 
 if __name__ == "__main__":
