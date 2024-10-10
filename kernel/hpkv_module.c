@@ -613,12 +613,6 @@ static int load_record_from_disk(sector_t sector, char **value, size_t *value_le
             kfree(buffer);
             return -EIO;
         }
-        if (i * HPKV_BLOCK_SIZE + HPKV_BLOCK_SIZE > buffer_size) {
-            hpkv_log(HPKV_LOG_ERR, "Buffer overflow detected\n");
-            kfree(buffer);
-            brelse(bh);
-            return -EINVAL;
-        }
         memcpy(buffer + i * HPKV_BLOCK_SIZE, bh->b_data, HPKV_BLOCK_SIZE);
         brelse(bh);
     }
@@ -631,12 +625,6 @@ static int load_record_from_disk(sector_t sector, char **value, size_t *value_le
     }
 
     // Copy the value from the buffer
-    if (sizeof(uint16_t) + key_len + sizeof(size_t) + *value_len > buffer_size) {
-        hpkv_log(HPKV_LOG_ERR, "Value size exceeds buffer size\n");
-        kfree(*value);
-        kfree(buffer);
-        return -EINVAL;
-    }
     memcpy(*value, buffer + sizeof(uint16_t) + key_len + sizeof(size_t), *value_len);
 
     hpkv_log(HPKV_LOG_DEBUG, "Successfully loaded record: value_len=%zu\n", *value_len);
@@ -2677,6 +2665,9 @@ static int __init hpkv_init(void)
 
     hash_init(kv_store);
     hpkv_log(HPKV_LOG_INFO, "Hash table initialized\n");
+    
+    INIT_LIST_HEAD(&lru_list);
+    hpkv_log(HPKV_LOG_INFO, "LRU list initialized\n");
 
     // Initialize rw_sem before opening the block device
     ret = percpu_init_rwsem(&rw_sem);
