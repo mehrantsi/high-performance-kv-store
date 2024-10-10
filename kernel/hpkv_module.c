@@ -345,25 +345,8 @@ static void update_lru(struct cached_record *record)
         return;
     }
 
-    rcu_read_lock();
-
-    // Check if the record is still in the cache
-    struct cached_record *existing = NULL;
-    hash_for_each_possible_rcu(cache, existing, node, djb2_hash(record->key, record->key_len)) {
-        if (existing == record) {
-            break;
-        }
-    }
-
-    if (existing != record) {
-        hpkv_log(HPKV_LOG_WARNING, "Record not found in cache during LRU update\n");
-        rcu_read_unlock();
-        return;
-    }
-
-    // Now we're sure the record is still in the cache
+    // We're already in an RCU read-side critical section from cache_get
     if (list_empty(&record->lru_list)) {
-        hpkv_log(HPKV_LOG_WARNING, "Record not in LRU list, adding it\n");
         list_add_rcu(&record->lru_list, &lru_list);
     } else {
         list_del_rcu(&record->lru_list);
@@ -372,8 +355,6 @@ static void update_lru(struct cached_record *record)
 
     record->last_access = jiffies;
 
-    rcu_read_unlock();
-
     hpkv_log(HPKV_LOG_DEBUG, "Updated LRU for key: %.*s, new access time: %lu\n", 
              record->key_len, record->key, record->last_access);
 }
@@ -381,30 +362,21 @@ static void update_lru(struct cached_record *record)
 static void evict_lru(void)
 {
     struct cached_record *victim;
-    
-    rcu_read_lock();
 
     if (list_empty(&lru_list)) {
         hpkv_log(HPKV_LOG_WARNING, "Attempted to evict from empty LRU list\n");
-        rcu_read_unlock();
         return;
     }
 
     victim = list_last_entry(&lru_list, struct cached_record, lru_list);
     if (!victim) {
         hpkv_log(HPKV_LOG_ERR, "Failed to get last entry from LRU list\n");
-        rcu_read_unlock();
         return;
     }
 
     // Remove from hash table and LRU list
-    hash_del_rcu(&victim->node);
-    list_del_rcu(&victim->lru_list);
-
-    rcu_read_unlock();
-
-    // Ensure all readers have finished before freeing
-    synchronize_rcu();
+    hash_del(&victim->node);
+    list_del(&victim->lru_list);
 
     if (victim->key && victim->key_len > 0) {
         hpkv_log(HPKV_LOG_DEBUG, "Evicted LRU entry for key: %.*s, last access time: %lu\n", 
@@ -511,7 +483,6 @@ static void cache_put(const char *key, uint16_t key_len, const char *value, size
             cached->value = new_value;
             cached->value_len = value_len;
             cached->sector = sector;
-            update_lru(cached);
             hpkv_log(HPKV_LOG_DEBUG, "Updated existing cache entry for key: %.*s\n", key_len, key);
         } else {
             hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for updated cache value\n");
