@@ -400,23 +400,13 @@ static void prefetch_adjacent(const char *key, uint16_t key_len)
     }
 
     rcu_read_lock();
-    record = search_record_in_memory(key, key_len);
-    if (record) {
-        if(atomic_read(&record->refcount) == 0) {
-            hpkv_log(HPKV_LOG_DEBUG, "Key %.*s is scheduled for deletion, skipping prefetch\n", key_len, key);
-            rcu_read_unlock();
-            return;
-        }
+    record = rcu_dereference(search_record_in_memory(key, key_len));
+    if (record && atomic_read(&record->refcount) > 0) {
         node = rb_next(&record->tree_node);
         if (node) {
-            record = rb_entry(node, struct record, tree_node);
-            if (record) {
-                if(atomic_read(&record->refcount) == 0) {
-                    hpkv_log(HPKV_LOG_DEBUG, "Key %.*s is scheduled for deletion, skipping prefetch\n", key_len, key);
-                    rcu_read_unlock();
-                    return;
-                }
-                if (record->value == NULL && record->value_len > 0) {
+            record = rcu_dereference(rb_entry(node, struct record, tree_node));
+            if (record && atomic_read(&record->refcount) > 0) {
+                if (record->value == NULL && record->value_len > 0 && record->sector != 0) {
                     // Load the value from disk
                     char *value = NULL;
                     size_t loaded_value_len = 0;
@@ -435,13 +425,7 @@ static void prefetch_adjacent(const char *key, uint16_t key_len)
                              record->key_len, record->key, record->key_len);
                 }
             }
-        } else {
-            hpkv_log(HPKV_LOG_DEBUG, "No adjacent key found for prefetching after key: %.*s\n", 
-                     key_len, key);
         }
-    } else {
-        hpkv_log(HPKV_LOG_DEBUG, "Unable to prefetch: key not found in memory: %.*s\n", 
-                 key_len, key);
     }
     rcu_read_unlock();
 }
