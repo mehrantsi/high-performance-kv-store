@@ -405,23 +405,25 @@ static void prefetch_adjacent(const char *key, uint16_t key_len)
         node = rb_next(&record->tree_node);
         if (node) {
             record = rb_entry(node, struct record, tree_node);
-            if (record->value == NULL && record->value_len > 0) {
-                // Load the value from disk
-                char *value = NULL;
-                size_t loaded_value_len = 0;
-                if (load_record_from_disk(record->sector, &value, &loaded_value_len) == 0) {
-                    if (value && loaded_value_len > 0) {
-                        cache_put(record->key, record->key_len, value, loaded_value_len, record->sector);
-                        hpkv_log(HPKV_LOG_DEBUG, "Prefetched adjacent key: %.*s (length: %u)\n", 
-                            record->key_len, record->key, record->key_len);
+            if (record) {
+                if (record->value == NULL && record->value_len > 0) {
+                    // Load the value from disk
+                    char *value = NULL;
+                    size_t loaded_value_len = 0;
+                    if (load_record_from_disk(record->sector, &value, &loaded_value_len) == 0) {
+                        if (value && loaded_value_len > 0) {
+                            cache_put(record->key, record->key_len, value, loaded_value_len, record->sector);
+                            hpkv_log(HPKV_LOG_DEBUG, "Prefetched adjacent key: %.*s (length: %u)\n", 
+                                record->key_len, record->key, record->key_len);
+                        }
+                        kfree(value);  // Free the loaded value
                     }
-                    kfree(value);  // Free the loaded value
                 }
-            }
-            else if (record->value != NULL && record->value_len > 0) {
-                cache_put(record->key, record->key_len, record->value, record->value_len, record->sector);
-                hpkv_log(HPKV_LOG_DEBUG, "Prefetched adjacent key: %.*s (length: %u)\n", 
-                         record->key_len, record->key, record->key_len);
+                else if (record->value != NULL && record->value_len > 0) {
+                    cache_put(record->key, record->key_len, record->value, record->value_len, record->sector);
+                    hpkv_log(HPKV_LOG_DEBUG, "Prefetched adjacent key: %.*s (length: %u)\n", 
+                             record->key_len, record->key, record->key_len);
+                }
             }
         } else {
             hpkv_log(HPKV_LOG_DEBUG, "No adjacent key found for prefetching after key: %.*s\n", 
