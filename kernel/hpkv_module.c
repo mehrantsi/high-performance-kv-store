@@ -342,7 +342,6 @@ static int calculate_cache_size(void)
 
 static void update_lru(struct cached_record *record)
 {
-    return;
     if (!record) {
         hpkv_log(HPKV_LOG_ERR, "Attempted to update LRU for null record\n");
         return;
@@ -378,11 +377,8 @@ static void evict_lru(void)
     rcu_read_unlock();
 
     if (victim) {
-        synchronize_rcu();  // Ensure all RCU readers are done
         hpkv_log(HPKV_LOG_DEBUG, "Evicting LRU entry for key: %.*s\n", victim->key_len, victim->key);
-        kfree(victim->key);
-        kfree(victim->value);
-        kfree(victim);
+        call_rcu(&victim->rcu, free_cached_record_rcu);
         atomic_dec(&cache_count);
     } else {
         hpkv_log(HPKV_LOG_WARNING, "Attempted to evict from empty LRU list\n");
@@ -430,6 +426,7 @@ static void adjust_cache_size(void)
 
 static void prefetch_adjacent(const char *key, uint16_t key_len)
 {
+    return;
     struct record *record;
     struct rb_node *node;
     
