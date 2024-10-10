@@ -223,8 +223,9 @@ update_on_linux() {
       --privileged \
       --device /dev/loop-control:/dev/loop-control \
       -p 3000:3000 \
+      -v ${HOME}/hpkv_persistent_storage:/app/persistent_storage \
       "hpkv-image:${VERSION}-${ARCH}"
-    echo "New container started."
+    echo "New container started with persistent storage."
 }
 
 update_in_qemu() {
@@ -313,17 +314,8 @@ update_in_qemu() {
                 # Remove all unused objects
                 sudo docker system prune -af
 
-                # Remove any remaining docker files
-                sudo rm -rf /var/lib/docker/tmp || true
-                sudo rm -rf /var/lib/docker/overlay2 || true
-                sudo rm -rf /var/lib/docker/image/overlay2 || true
-                sudo rm -rf /var/lib/docker/aufs || true
-                sudo rm -rf /var/lib/docker/containers || true
-                sudo rm -rf /var/lib/docker/network || true
-                sudo rm -rf /var/lib/docker/volumes || true
-
                 # Import the tar file as a new image
-                cat temp_container.tar | sudo docker import - \$NEW_IMAGE_TAG
+                sudo docker import temp_container.tar - \$NEW_IMAGE_TAG
 
                 # Remove the temporary tar file
                 rm temp_container.tar
@@ -378,14 +370,19 @@ update_in_qemu() {
         # Update LATEST_IMAGE variable
         LATEST_IMAGE=\$NEW_IMAGE_TAG
 
+        # Create persistent storage directory
+        mkdir -p ~/hpkv_persistent_storage
+
+        # Modify the docker run command to include the volume mount
         if sudo docker run -d --rm \
           --name hpkv-container \
           --privileged \
           --device /dev/loop-control:/dev/loop-control \
           -p 3000:3000 \
+          -v ~/hpkv_persistent_storage:/app/persistent_storage \
           "\$LATEST_IMAGE" \
           /app/start.sh; then
-            echo "New container started with updated image."
+            echo "New container started with updated image and persistent storage."
             
             # Wait for the container to be fully up and running
             echo "Waiting for the new container to be ready..."

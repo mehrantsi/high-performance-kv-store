@@ -405,13 +405,6 @@ static void prefetch_adjacent(const char *key, uint16_t key_len)
         node = rb_next(&record->tree_node);
         if (node) {
             record = rb_entry(node, struct record, tree_node);
-
-            if(atomic_read(&record->refcount) == 0) {
-                // No references to this record, so it's scheduled for deletion
-                rcu_read_unlock();
-                return;
-            }
-
             if (record->value == NULL && record->value_len > 0) {
                 // Load the value from disk
                 char *value = NULL;
@@ -2080,7 +2073,6 @@ static int load_indexes(void)
     sector_t sector = 1;  // Start from sector 1, as sector 0 is reserved for metadata
     char *buffer;
     loff_t device_size, read_size;
-    bool corruption_detected = false;
     int ret = 0;
 
     percpu_down_write(&rw_sem);
@@ -2127,7 +2119,7 @@ static int load_indexes(void)
     }
 
     while (sector * HPKV_BLOCK_SIZE < read_size) {
-        hpkv_log(HPKV_LOG_INFO, "Reading sector %llu\n", (unsigned long long)sector);
+        hpkv_log(HPKV_LOG_DEBUG, "Reading sector %llu\n", (unsigned long long)sector);
         
         bh = __bread(bdev, sector, HPKV_BLOCK_SIZE);
         if (!bh) {
@@ -2142,13 +2134,29 @@ static int load_indexes(void)
         uint16_t key_len;
         memcpy(&key_len, buffer, sizeof(uint16_t));
 
+        // Sanity check on key length
+        if (key_len == 0 || key_len > MAX_KEY_SIZE) {
+            hpkv_log(HPKV_LOG_WARNING, "Invalid or zero key length %u at sector %llu, skipping\n", key_len, (unsigned long long)sector);
+            brelse(bh);
+            sector++;
+            continue;
+        }
+
+        // Ensure there's enough data in the buffer for the key and value length
+        if (sizeof(uint16_t) + key_len + sizeof(size_t) > HPKV_BLOCK_SIZE) {
+            hpkv_log(HPKV_LOG_WARNING, "Invalid record structure at sector %llu, skipping\n", (unsigned long long)sector);
+            brelse(bh);
+            sector++;
+            continue;
+        }
+
         // Read the key
         char *key = kmalloc(key_len, GFP_KERNEL);
         if (!key) {
+            hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for key at sector %llu\n", (unsigned long long)sector);
             brelse(bh);
-            vfree(buffer);
-            ret = -ENOMEM;
-            goto out;
+            sector++;
+            continue;
         }
         memcpy(key, buffer + sizeof(uint16_t), key_len);
 
@@ -2156,18 +2164,18 @@ static int load_indexes(void)
         size_t value_len;
         memcpy(&value_len, buffer + sizeof(uint16_t) + key_len, sizeof(size_t));
 
-        hpkv_log(HPKV_LOG_INFO, "Processing key: %.*s, value length: %zu\n", key_len, key, value_len);
+        hpkv_log(HPKV_LOG_DEBUG, "Processing key: %.*s, key length: %u, value length: %zu\n", key_len, key, key_len, value_len);
 
-        if (key[0] != '\0' && value_len > 0 && value_len <= MAX_VALUE_SIZE) {
+        if (value_len > 0 && value_len <= MAX_VALUE_SIZE) {
             struct record *record = kmem_cache_alloc(record_cache, GFP_KERNEL);
             if (record) {
                 record->key = kmalloc(key_len, GFP_KERNEL);
                 if (!record->key) {
                     kmem_cache_free(record_cache, record);
                     hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for key\n");
-                    sector++;
-                    brelse(bh);
                     kfree(key);
+                    brelse(bh);
+                    sector++;
                     continue;
                 }
                 memcpy(record->key, key, key_len);
@@ -2198,61 +2206,35 @@ static int load_indexes(void)
             } else {
                 hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for record\n");
             }
-        } else if (key[0] == '\0') {
-            // This is a deleted or empty record, skip it
-            hpkv_log(HPKV_LOG_INFO, "Skipping deleted or empty record at sector %llu\n", (unsigned long long)sector);
         } else {
-            hpkv_log(HPKV_LOG_WARNING, "Invalid record found at sector %llu. Key: %.*s, Value length: %zu\n", 
-                   (unsigned long long)sector, key_len, key, value_len);
-            corruption_detected = true;
-            break;  // Stop processing further to avoid potential issues with corrupted data
+            hpkv_log(HPKV_LOG_WARNING, "Invalid value length %zu for key %.*s at sector %llu, skipping\n", 
+                     value_len, key_len, key, (unsigned long long)sector);
         }
 
-        brelse(bh);
         kfree(key);
+        brelse(bh);
         sector++;
     }
 
     vfree(buffer);
 
-    // After loading all records from disk, process any pending write buffer entries
-    struct write_buffer_entry *entry, *tmp;
-    spin_lock(&write_buffer_lock);
-    list_for_each_entry_safe(entry, tmp, &write_buffer, list) {
-        // Update in-memory structures with the buffered record
-        hash_add_rcu(kv_store, &entry->record->hash_node, djb2_hash(entry->record->key, entry->record->key_len));
-        insert_rb_tree(entry->record);
-        atomic_long_add(entry->record->value_len, &total_disk_usage);
-        atomic_inc(&record_count);
+    hpkv_log(HPKV_LOG_INFO, "Finished loading indexes. Processed %llu sectors and loaded %d records\n", 
+           (unsigned long long)sector, atomic_read(&record_count));
+    
+    // Verify loaded data against metadata
+    if (atomic_read(&record_count) != metadata.total_records ||
+        atomic_long_read(&total_disk_usage) != metadata.total_size) {
+        hpkv_log(HPKV_LOG_WARNING, "Mismatch between loaded data and metadata. "
+               "Loaded records: %d, Metadata records: %llu, "
+               "Loaded size: %ld, Metadata size: %llu\n",
+               atomic_read(&record_count), metadata.total_records,
+               atomic_long_read(&total_disk_usage), metadata.total_size);
 
-        // Remove from write buffer
-        list_del(&entry->list);
-        kfree(entry);
-    }
-    spin_unlock(&write_buffer_lock);
-
-    if (corruption_detected) {
-        hpkv_log(HPKV_LOG_WARNING, "Corruption detected. Consider running a repair operation.\n");
-        ret = -EUCLEAN;  // File system requires cleaning
-    } else {
-        hpkv_log(HPKV_LOG_INFO, "Finished loading indexes. Processed %llu sectors\n", (unsigned long long)sector);
-        
-        // Verify loaded data against metadata
-        if (atomic_read(&record_count) != metadata.total_records ||
-            atomic_long_read(&total_disk_usage) != metadata.total_size) {
-            hpkv_log(HPKV_LOG_WARNING, "Mismatch between loaded data and metadata. "
-                   "Loaded records: %d, Metadata records: %llu, "
-                   "Loaded size: %ld, Metadata size: %llu\n",
-                   atomic_read(&record_count), metadata.total_records,
-                   atomic_long_read(&total_disk_usage), metadata.total_size);
-
-            ret = update_metadata();
-            if (ret < 0) {
-                hpkv_log(HPKV_LOG_ERR, "Failed to update metadata after detected mismatch\n");
-            }
-            else{
-                hpkv_log(HPKV_LOG_INFO, "Metadata updated successfully after detected mismatch\n");
-            }
+        ret = update_metadata();
+        if (ret < 0) {
+            hpkv_log(HPKV_LOG_ERR, "Failed to update metadata after detected mismatch\n");
+        } else {
+            hpkv_log(HPKV_LOG_INFO, "Metadata updated successfully after detected mismatch\n");
         }
     }
 
@@ -2707,11 +2689,7 @@ static int __init hpkv_init(void)
         } else {
             hpkv_log(HPKV_LOG_INFO, "Device contains data. Loading indexes.\n");
             ret = load_indexes();
-            if (ret == -EUCLEAN) {
-                hpkv_log(HPKV_LOG_WARNING, "Device requires cleaning or repair. Consider running a repair operation.\n");
-                // For now, we'll continue loading but with a warning
-                // TODO: Trigger a repair operation here
-            } else if (ret < 0) {
+            if (ret < 0) {
                 hpkv_log(HPKV_LOG_ERR, "Failed to load indexes\n");
                 goto error_stop_thread;
             }

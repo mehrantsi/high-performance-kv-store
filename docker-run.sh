@@ -246,12 +246,16 @@ EOF
                 sleep 1
             done
 
+            # Create persistent storage directory
+            mkdir -p ${HOME}/hpkv_persistent_storage
+
             echo "Running Docker container with the latest image..."
             sudo docker run -d --rm \
               --name hpkv-container \
               --privileged \
               --device /dev/loop-control:/dev/loop-control \
               -p 3000:3000 \
+              -v ${HOME}/hpkv_persistent_storage:/app/persistent_storage \
               "\$LATEST_LOCAL_IMAGE" \
               /app/start.sh
             
@@ -292,7 +296,7 @@ EOF
     fi
 
 else
-    # Original Linux script
+    # Linux-specific code
     ARCH=$(uname -m)
     case ${ARCH} in
         x86_64)
@@ -339,12 +343,16 @@ else
         sleep 1
     done
 
+    # Create persistent storage directory
+    mkdir -p ${HOME}/hpkv_persistent_storage
+
     echo "Running Docker container..."
     docker run --rm \
       --name hpkv-container \
       --privileged \
       --device /dev/loop-control:/dev/loop-control \
       -p 3000:3000 \
+      -v ${HOME}/hpkv_persistent_storage:/app/persistent_storage \
       "hpkv-image:${VERSION}-${DOCKER_ARCH}"
 
     echo "Container has exited and been removed."
