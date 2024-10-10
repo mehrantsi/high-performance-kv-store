@@ -107,6 +107,7 @@ static void prefetch_adjacent(const char *key, uint16_t key_len);
 static void cache_adjust_work_handler(struct work_struct *work);
 static void mark_sectors_as_deleted(sector_t start_sector, int num_sectors);
 static size_t calculate_record_size(uint16_t key_len, size_t value_len);
+static void free_cached_record_rcu(struct rcu_head *head)
 
 static int major_num;
 static struct kmem_cache *record_cache;
@@ -177,7 +178,6 @@ static atomic_t record_count = ATOMIC_INIT(0);
 
 static DEFINE_HASHTABLE(cache, 10);  // 1024 buckets
 static atomic_t cache_count = ATOMIC_INIT(0);
-static DEFINE_SPINLOCK(cache_lock);
 static LIST_HEAD(lru_list);
 static int cache_size_percentage = 10;  // Cache size as a percentage of total records
 
@@ -345,7 +345,8 @@ static void update_lru(struct cached_record *record)
         return;
     }
 
-    // We're already in an RCU read-side critical section from cache_get
+    rcu_read_lock();
+    
     if (list_empty(&record->lru_list)) {
         list_add_rcu(&record->lru_list, &lru_list);
     } else {
@@ -355,6 +356,8 @@ static void update_lru(struct cached_record *record)
 
     record->last_access = jiffies;
 
+    rcu_read_unlock();
+
     hpkv_log(HPKV_LOG_DEBUG, "Updated LRU for key: %.*s, new access time: %lu\n", 
              record->key_len, record->key, record->last_access);
 }
@@ -363,56 +366,68 @@ static void evict_lru(void)
 {
     struct cached_record *victim;
 
+    rcu_read_lock();
     if (list_empty(&lru_list)) {
+        rcu_read_unlock();
         hpkv_log(HPKV_LOG_WARNING, "Attempted to evict from empty LRU list\n");
         return;
     }
 
     victim = list_last_entry(&lru_list, struct cached_record, lru_list);
     if (!victim) {
+        rcu_read_unlock();
         hpkv_log(HPKV_LOG_ERR, "Failed to get last entry from LRU list\n");
         return;
     }
 
     // Remove from hash table and LRU list
-    hash_del(&victim->node);
-    list_del(&victim->lru_list);
+    hash_del_rcu(&victim->node);
+    list_del_rcu(&victim->lru_list);
+    rcu_read_unlock();
 
-    if (victim->key && victim->key_len > 0) {
-        hpkv_log(HPKV_LOG_DEBUG, "Evicted LRU entry for key: %.*s, last access time: %lu\n", 
-                 victim->key_len, victim->key, victim->last_access);
-    } else {
-        hpkv_log(HPKV_LOG_WARNING, "Evicted LRU entry with invalid key\n");
-    }
-
-    if (victim->key) {
-        kfree(victim->key);
-    }
-    if (victim->value) {
-        kfree(victim->value);
-    }
-    kfree(victim);
+    // Free after a grace period
+    call_rcu(&victim->rcu, free_cached_record_rcu);
     atomic_dec(&cache_count);
+
+    hpkv_log(HPKV_LOG_DEBUG, "Evicted LRU entry for key: %.*s\n", victim->key_len, victim->key);
+}
+
+static void free_cached_record_rcu(struct rcu_head *head)
+{
+    struct cached_record *victim = container_of(head, struct cached_record, rcu);
+    if (victim->key) kfree(victim->key);
+    if (victim->value) kfree(victim->value);
+    kfree(victim);
 }
 
 static void adjust_cache_size(void)
 {
     unsigned long available_memory = si_mem_available() * PAGE_SIZE;
-    int current_cache_size = calculate_cache_size();
+    int current_cache_size = atomic_read(&cache_count);
+    int target_cache_size = calculate_cache_size();
     int old_percentage = cache_size_percentage;
-    int current_count = atomic_read(&cache_count);
     
-    if (available_memory > MEMORY_THRESHOLD_HIGH && current_count * 10 < current_cache_size * 12) {
+    if (available_memory > MEMORY_THRESHOLD_HIGH && current_cache_size < target_cache_size) {
         // Increase cache size
         cache_size_percentage = min(cache_size_percentage + 5, 30);
-    } else if (available_memory < MEMORY_THRESHOLD_LOW || current_count * 10 > current_cache_size * 9) {
+        target_cache_size = calculate_cache_size();
+    } else if (available_memory < MEMORY_THRESHOLD_LOW || current_cache_size > target_cache_size) {
         // Decrease cache size
         cache_size_percentage = max(cache_size_percentage - 5, 5);
+        target_cache_size = calculate_cache_size();
     }
 
     if (old_percentage != cache_size_percentage) {
         hpkv_log(HPKV_LOG_INFO, "Adjusted cache size percentage from %d%% to %d%%. Current count: %d, Target size: %d, Available memory: %lu bytes\n", 
-                 old_percentage, cache_size_percentage, current_count, current_cache_size, available_memory);
+                 old_percentage, cache_size_percentage, current_cache_size, target_cache_size, available_memory);
+    }
+
+    if (current_cache_size > target_cache_size) {
+        int to_evict = current_cache_size - target_cache_size;
+        for (int i = 0; i < to_evict; i++) {
+            evict_lru();
+        }
+        hpkv_log(HPKV_LOG_INFO, "Evicted %d entries from cache\n", to_evict);
     }
 }
 
@@ -459,7 +474,7 @@ static void prefetch_adjacent(const char *key, uint16_t key_len)
 
 static void cache_put(const char *key, uint16_t key_len, const char *value, size_t value_len, sector_t sector)
 {
-    struct cached_record *cached;
+    struct cached_record *cached, *new_cached;
     u32 hash;
 
     if (!key || !value || key_len == 0 || value_len == 0) {
@@ -469,56 +484,71 @@ static void cache_put(const char *key, uint16_t key_len, const char *value, size
 
     hash = djb2_hash(key, key_len);
 
-    spin_lock(&cache_lock);
-
-    cached = cache_get(key, key_len);
-    if (cached) {
-        // Update existing entry
-        char *new_value = kmalloc(value_len, GFP_ATOMIC);
-        if (new_value) {
-            memcpy(new_value, value, value_len);
-            if (cached->value) {
-                kfree(cached->value);
-            }
-            cached->value = new_value;
-            cached->value_len = value_len;
-            cached->sector = sector;
-            hpkv_log(HPKV_LOG_DEBUG, "Updated existing cache entry for key: %.*s\n", key_len, key);
-        } else {
-            hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for updated cache value\n");
-        }
-    } else {
-        // Add new entry
-        if (atomic_read(&cache_count) >= calculate_cache_size()) {
-            evict_lru();
-        }
-        cached = kmalloc(sizeof(*cached), GFP_ATOMIC);
-        if (cached) {
-            cached->key = kmalloc(key_len, GFP_ATOMIC);
-            cached->value = kmalloc(value_len, GFP_ATOMIC);
-            if (cached->key && cached->value) {
-                memcpy(cached->key, key, key_len);
-                cached->key_len = key_len;
-                memcpy(cached->value, value, value_len);
+    rcu_read_lock();
+    
+    // Check if the entry already exists
+    hash_for_each_possible_rcu(cache, cached, node, hash) {
+        if (cached->key_len == key_len && memcmp(cached->key, key, key_len) == 0) {
+            // Entry exists, try to update it
+            char *new_value = kmalloc(value_len, GFP_ATOMIC);
+            if (new_value) {
+                memcpy(new_value, value, value_len);
+                char *old_value = rcu_dereference(cached->value);
+                rcu_assign_pointer(cached->value, new_value);
                 cached->value_len = value_len;
                 cached->sector = sector;
-                hash_add(cache, &cached->node, hash);
-                INIT_LIST_HEAD(&cached->lru_list);
-                list_add(&cached->lru_list, &lru_list);
-                atomic_inc(&cache_count);
-                hpkv_log(HPKV_LOG_DEBUG, "Added new cache entry for key: %.*s\n", key_len, key);
+                rcu_read_unlock();
+                if (old_value)
+                    kfree_rcu(old_value, rcu);
+                update_lru(cached);
+                hpkv_log(HPKV_LOG_DEBUG, "Updated existing cache entry for key: %.*s\n", key_len, key);
+                return;
             } else {
-                hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for new cache entry\n");
-                if (cached->key) kfree(cached->key);
-                if (cached->value) kfree(cached->value);
-                kfree(cached);
+                hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for updated cache value\n");
+                rcu_read_unlock();
+                return;
             }
-        } else {
-            hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for new cache record\n");
         }
     }
 
-    spin_unlock(&cache_lock);
+    rcu_read_unlock();
+
+    // Entry doesn't exist, add new entry
+    if (atomic_read(&cache_count) >= calculate_cache_size()) {
+        evict_lru();
+    }
+
+    new_cached = kmalloc(sizeof(*new_cached), GFP_KERNEL);
+    if (!new_cached) {
+        hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for new cache record\n");
+        return;
+    }
+
+    new_cached->key = kmalloc(key_len, GFP_KERNEL);
+    new_cached->value = kmalloc(value_len, GFP_KERNEL);
+    if (new_cached->key && new_cached->value) {
+        memcpy(new_cached->key, key, key_len);
+        new_cached->key_len = key_len;
+        memcpy(new_cached->value, value, value_len);
+        new_cached->value_len = value_len;
+        new_cached->sector = sector;
+        INIT_LIST_HEAD(&new_cached->lru_list);
+
+        // Use RCU to add the new entry
+        rcu_read_lock();
+        hash_add_rcu(cache, &new_cached->node, hash);
+        list_add_rcu(&new_cached->lru_list, &lru_list);
+        rcu_read_unlock();
+
+        atomic_inc(&cache_count);
+
+        hpkv_log(HPKV_LOG_DEBUG, "Added new cache entry for key: %.*s\n", key_len, key);
+    } else {
+        hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for new cache entry\n");
+        if (new_cached->key) kfree(new_cached->key);
+        if (new_cached->value) kfree(new_cached->value);
+        kfree(new_cached);
+    }
 }
 
 static void cache_adjust_work_handler(struct work_struct *work)
@@ -1199,23 +1229,20 @@ static int delete_record(const char *key, uint16_t key_len)
     spin_unlock(&write_buffer_lock);
 
     wake_up(&write_buffer_wait);
-
     // Remove from cache
-    spin_lock(&cache_lock);
+    rcu_read_lock();
     struct cached_record *cached;
-    hash_for_each_possible(cache, cached, node, djb2_hash(key, key_len)) {
+    hash_for_each_possible_rcu(cache, cached, node, djb2_hash(key, key_len)) {
         if (cached->key_len == key_len && memcmp(cached->key, key, key_len) == 0) {
-            hash_del(&cached->node);
-            list_del(&cached->lru_list);
-            kfree(cached->key);
-            kfree(cached->value);
-            kfree(cached);
+            hash_del_rcu(&cached->node);
+            list_del_rcu(&cached->lru_list);
+            call_rcu(&cached->rcu, free_cached_record_rcu);
             atomic_dec(&cache_count);
             break;
         }
     }
-    spin_unlock(&cache_lock);
-
+    rcu_read_unlock();
+    
     // Release sectors and free the record in write_record_work
 
     hpkv_log(HPKV_LOG_INFO, "Successfully queued delete operation for key: %.*s\n", key_len, key);
@@ -1954,7 +1981,6 @@ static int purge_data(void)
     struct buffer_head *bh;
     int ret = 0;
     char *empty_buffer;
-    unsigned long flags;
     struct rb_node *node, *next;
     struct record *record;
     struct write_buffer_entry *entry, *tmp;
@@ -1991,23 +2017,18 @@ static int purge_data(void)
     atomic_set(&record_count, 0);
 
     // Clear cache
-    spin_lock_irqsave(&cache_lock, flags);
-    {
-        int bkt;
-        struct hlist_node *tmp;
-        struct cached_record *cached;
+    rcu_read_lock();
+    struct hlist_node *tmp_node;
+    struct cached_record *cached;
+    int bkt;
 
-        hash_for_each_safe(cache, bkt, tmp, cached, node) {
-            hash_del(&cached->node);
-            if (cached->value) {
-                kfree(cached->value);
-                cached->value = NULL;
-            }
-            kfree(cached);
-        }
-        atomic_set(&cache_count, 0);
+    hash_for_each_safe(cache, bkt, tmp_node, cached, node) {
+        hash_del_rcu(&cached->node);
+        list_del_rcu(&cached->lru_list);
+        call_rcu(&cached->rcu, free_cached_record_rcu);
     }
-    spin_unlock_irqrestore(&cache_lock, flags);
+    atomic_set(&cache_count, 0);
+    rcu_read_unlock();
 
     hpkv_log(HPKV_LOG_INFO, "In-memory structures cleared\n");
 
@@ -2860,20 +2881,17 @@ static void __exit hpkv_exit(void)
     }
 
     // Ensure all RCU callbacks have completed
-    rcu_barrier();
+    synchronize_rcu();
 
     // Clear cache
-    spin_lock(&cache_lock);
+    rcu_read_lock();
     hash_for_each_safe(cache, bkt, tmp, cached, node) {
-        hash_del(&cached->node);
-        if (cached->value) {
-            kfree(cached->value);
-            cached->value = NULL;
-        }
-        kfree(cached);
+        hash_del_rcu(&cached->node);
+        list_del_rcu(&cached->lru_list);
+        call_rcu(&cached->rcu, free_cached_record_rcu);
     }
     atomic_set(&cache_count, 0);
-    spin_unlock(&cache_lock);
+    rcu_read_unlock();
 
     percpu_up_write(&rw_sem);
 
