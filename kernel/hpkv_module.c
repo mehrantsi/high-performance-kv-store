@@ -435,7 +435,6 @@ static void prefetch_adjacent(const char *key, uint16_t key_len)
     }
 
     record = search_record_in_memory(key, key_len);
-    rcu_read_lock();
     if (record) {
         node = rb_next(&record->tree_node);
         if (node) {
@@ -462,7 +461,6 @@ static void prefetch_adjacent(const char *key, uint16_t key_len)
             }
         }
     }
-    rcu_read_unlock();
 }
 
 static void cache_put(const char *key, uint16_t key_len, const char *value, size_t value_len, sector_t sector)
@@ -530,7 +528,6 @@ static void cache_put(const char *key, uint16_t key_len, const char *value, size
         // Use RCU to add the new entry
         rcu_read_lock();
         hash_add_rcu(cache, &new_cached->node, hash);
-        list_add_rcu(&new_cached->lru_list, &lru_list);
         rcu_read_unlock();
 
         atomic_inc(&cache_count);
@@ -547,7 +544,7 @@ static void cache_put(const char *key, uint16_t key_len, const char *value, size
 static void cache_adjust_work_handler(struct work_struct *work)
 {
     hpkv_log(HPKV_LOG_DEBUG, "Starting cache size adjustment\n");
-    //adjust_cache_size();
+    adjust_cache_size();
     queue_delayed_work(system_wq, &cache_adjust_work, CACHE_ADJUST_INTERVAL);
     hpkv_log(HPKV_LOG_DEBUG, "Finished cache size adjustment, next adjustment scheduled\n");
 }
