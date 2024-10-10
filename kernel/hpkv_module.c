@@ -147,6 +147,7 @@ struct cached_record {
     struct hlist_node node;
     struct list_head lru_list;
     unsigned long last_access;
+    struct rcu_head rcu;
 };
 
 enum operation_type {
@@ -1186,7 +1187,8 @@ static int delete_record(const char *key, uint16_t key_len)
     struct record *record;
     struct write_buffer_entry *wb_entry;
     int ret = 0;
-
+    bool found = false;
+    
     percpu_down_write(&rw_sem);
 
     record = record_find_rcu(key, key_len);
@@ -1229,6 +1231,7 @@ static int delete_record(const char *key, uint16_t key_len)
     spin_unlock(&write_buffer_lock);
 
     wake_up(&write_buffer_wait);
+
     // Remove from cache
     rcu_read_lock();
     struct cached_record *cached;
@@ -1236,12 +1239,17 @@ static int delete_record(const char *key, uint16_t key_len)
         if (cached->key_len == key_len && memcmp(cached->key, key, key_len) == 0) {
             hash_del_rcu(&cached->node);
             list_del_rcu(&cached->lru_list);
-            call_rcu(&cached->rcu, free_cached_record_rcu);
-            atomic_dec(&cache_count);
+            rcu_read_unlock();
+            found = true;
             break;
         }
     }
     rcu_read_unlock();
+
+    if(found) {
+        call_rcu(&cached->rcu, free_cached_record_rcu);
+        atomic_dec(&cache_count);
+    }
     
     // Release sectors and free the record in write_record_work
 
@@ -2022,13 +2030,20 @@ static int purge_data(void)
     struct cached_record *cached;
     int bkt;
 
+    rcu_read_lock();
     hash_for_each_safe(cache, bkt, tmp_node, cached, node) {
         hash_del_rcu(&cached->node);
         list_del_rcu(&cached->lru_list);
+    }
+    rcu_read_unlock();
+
+    // Now call_rcu outside the RCU read-side critical section
+    hash_for_each_safe(cache, bkt, tmp_node, cached, node) {
         call_rcu(&cached->rcu, free_cached_record_rcu);
     }
+
     atomic_set(&cache_count, 0);
-    rcu_read_unlock();
+    synchronize_rcu();
 
     hpkv_log(HPKV_LOG_INFO, "In-memory structures cleared\n");
 
@@ -2874,24 +2889,27 @@ static void __exit hpkv_exit(void)
     spin_unlock(&write_buffer_lock);
 
     // Clear the hash table and schedule records for deletion
+    rcu_read_lock();
     hash_for_each_safe(kv_store, bkt, tmp, record, hash_node) {
         hash_del_rcu(&record->hash_node);
         rb_erase(&record->tree_node, &records_tree);
+    }
+    hash_for_each_safe(cache, bkt, tmp, cached, node) {
+        hash_del_rcu(&cached->node);
+        list_del_rcu(&cached->lru_list);
+    }
+    rcu_read_unlock();
+
+    // Now call_rcu outside the RCU read-side critical section
+    hash_for_each_safe(kv_store, bkt, tmp, record, hash_node) {
         call_rcu(&record->rcu, record_free_rcu);
+    }
+    hash_for_each_safe(cache, bkt, tmp, cached, node) {
+        call_rcu(&cached->rcu, free_cached_record_rcu);
     }
 
     // Ensure all RCU callbacks have completed
     synchronize_rcu();
-
-    // Clear cache
-    rcu_read_lock();
-    hash_for_each_safe(cache, bkt, tmp, cached, node) {
-        hash_del_rcu(&cached->node);
-        list_del_rcu(&cached->lru_list);
-        call_rcu(&cached->rcu, free_cached_record_rcu);
-    }
-    atomic_set(&cache_count, 0);
-    rcu_read_unlock();
 
     percpu_up_write(&rw_sem);
 
