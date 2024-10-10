@@ -402,10 +402,20 @@ static void prefetch_adjacent(const char *key, uint16_t key_len)
     rcu_read_lock();
     record = search_record_in_memory(key, key_len);
     if (record) {
+        if(atomic_read(&record->ref_count) == 0) {
+            hpkv_log(HPKV_LOG_DEBUG, "Key %.*s is scheduled for deletion, skipping prefetch\n", key_len, key);
+            rcu_read_unlock();
+            return;
+        }
         node = rb_next(&record->tree_node);
         if (node) {
             record = rb_entry(node, struct record, tree_node);
             if (record) {
+                if(atomic_read(&record->ref_count) == 0) {
+                    hpkv_log(HPKV_LOG_DEBUG, "Key %.*s is scheduled for deletion, skipping prefetch\n", key_len, key);
+                    rcu_read_unlock();
+                    return;
+                }
                 if (record->value == NULL && record->value_len > 0) {
                     // Load the value from disk
                     char *value = NULL;
