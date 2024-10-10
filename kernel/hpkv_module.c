@@ -426,7 +426,6 @@ static void adjust_cache_size(void)
 
 static void prefetch_adjacent(const char *key, uint16_t key_len)
 {
-    return;
     struct record *record;
     struct rb_node *node;
     
