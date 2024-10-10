@@ -348,12 +348,10 @@ static void update_lru(struct cached_record *record)
 
     rcu_read_lock();
     
-    if (list_empty(&record->lru_list)) {
-        list_add_rcu(&record->lru_list, &lru_list);
-    } else {
+    if (!list_empty(&record->lru_list)) {
         list_del_rcu(&record->lru_list);
-        list_add_rcu(&record->lru_list, &lru_list);
     }
+    list_add_rcu(&record->lru_list, &lru_list);
 
     record->last_access = jiffies;
 
@@ -368,29 +366,23 @@ static void evict_lru(void)
     struct cached_record *victim;
 
     rcu_read_lock();
-    if (list_empty(&lru_list)) {
-        rcu_read_unlock();
-        hpkv_log(HPKV_LOG_WARNING, "Attempted to evict from empty LRU list\n");
-        return;
+    if (!list_empty(&lru_list)) {
+        victim = list_last_entry(&lru_list, struct cached_record, lru_list);
+        if (victim) {
+            hash_del_rcu(&victim->node);
+            list_del_rcu(&victim->lru_list);
+        }
     }
-
-    victim = list_last_entry(&lru_list, struct cached_record, lru_list);
-    if (!victim) {
-        rcu_read_unlock();
-        hpkv_log(HPKV_LOG_ERR, "Failed to get last entry from LRU list\n");
-        return;
-    }
-
-    // Remove from hash table and LRU list
-    hash_del_rcu(&victim->node);
-    list_del_rcu(&victim->lru_list);
     rcu_read_unlock();
 
-    // Free after a grace period
-    call_rcu(&victim->rcu, free_cached_record_rcu);
-    atomic_dec(&cache_count);
+    if (victim) {
+        call_rcu(&victim->rcu, free_cached_record_rcu);
+        atomic_dec(&cache_count);
+        hpkv_log(HPKV_LOG_DEBUG, "Evicted LRU entry for key: %.*s\n", victim->key_len, victim->key);
+    } else {
+        hpkv_log(HPKV_LOG_WARNING, "Attempted to evict from empty LRU list\n");
+    }
 
-    hpkv_log(HPKV_LOG_DEBUG, "Evicted LRU entry for key: %.*s\n", victim->key_len, victim->key);
 }
 
 static void free_cached_record_rcu(struct rcu_head *head)
