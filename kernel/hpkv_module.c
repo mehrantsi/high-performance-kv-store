@@ -532,6 +532,9 @@ static void cache_put(const char *key, uint16_t key_len, const char *value, size
 
         atomic_inc(&cache_count);
 
+        // Update LRU for the new entry
+        update_lru(new_cached);
+
         hpkv_log(HPKV_LOG_DEBUG, "Added new cache entry for key: %.*s\n", key_len, key);
     } else {
         hpkv_log(HPKV_LOG_ERR, "Failed to allocate memory for new cache entry\n");
