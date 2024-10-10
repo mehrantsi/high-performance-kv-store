@@ -321,7 +321,7 @@ static struct cached_record *cache_get(const char *key, uint16_t key_len)
         if (cached->key_len == key_len && memcmp(cached->key, key, key_len) == 0) {
             if (cached) {
                 rcu_read_unlock();
-                //update_lru(cached);
+                update_lru(cached);
                 return cached;
             }
         }
@@ -342,6 +342,7 @@ static int calculate_cache_size(void)
 
 static void update_lru(struct cached_record *record)
 {
+    return;
     if (!record) {
         hpkv_log(HPKV_LOG_ERR, "Attempted to update LRU for null record\n");
         return;
