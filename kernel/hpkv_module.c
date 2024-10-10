@@ -401,11 +401,11 @@ static void prefetch_adjacent(const char *key, uint16_t key_len)
 
     rcu_read_lock();
     record = rcu_dereference(search_record_in_memory(key, key_len));
-    if (record && atomic_read(&record->refcount) > 0) {
+    if (record != NULL && atomic_read(&record->refcount) > 0) {
         node = rb_next(&record->tree_node);
         if (node) {
             record = rcu_dereference(rb_entry(node, struct record, tree_node));
-            if (record && atomic_read(&record->refcount) > 0) {
+            if (record != NULL && atomic_read(&record->refcount) > 0) {
                 if (record->value == NULL && record->value_len > 0 && record->sector != 0) {
                     // Load the value from disk
                     char *value = NULL;
