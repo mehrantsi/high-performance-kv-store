@@ -500,7 +500,7 @@ static void cache_put(const char *key, uint16_t key_len, const char *value, size
                 cached->sector = sector;
                 rcu_read_unlock();
                 if (old_value)
-                    kfree_rcu(old_value, rcu);
+                    kfree(old_value);
                 update_lru(cached);
                 hpkv_log(HPKV_LOG_DEBUG, "Updated existing cache entry for key: %.*s\n", key_len, key);
                 return;
@@ -1188,7 +1188,7 @@ static int delete_record(const char *key, uint16_t key_len)
     struct write_buffer_entry *wb_entry;
     int ret = 0;
     bool found = false;
-    
+
     percpu_down_write(&rw_sem);
 
     record = record_find_rcu(key, key_len);
